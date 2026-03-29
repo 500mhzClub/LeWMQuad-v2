@@ -15,8 +15,9 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 
+import h5py
 import numpy as np
-from PIL import ImageFont
+from PIL import Image, ImageFont
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
@@ -97,6 +98,44 @@ def build_scene(gs, layout: ObstacleLayout, beacon_layout: BeaconLayout, img_res
     return scene, robot, cam, act_dofs
 
 
+def resize_frame(frame_hwc: np.ndarray, target_res: int) -> np.ndarray:
+    if frame_hwc.shape[0] == target_res and frame_hwc.shape[1] == target_res:
+        return frame_hwc
+    return np.asarray(Image.fromarray(frame_hwc).resize((target_res, target_res), Image.Resampling.BILINEAR))
+
+
+def matching_first_person_file(first_person_dir: str, raw_file_path: str) -> str:
+    basename = os.path.splitext(os.path.basename(raw_file_path))[0]
+    return os.path.join(first_person_dir, f"{basename}_rgb.h5")
+
+
+def load_first_person_frames(
+    first_person_dir: str,
+    raw_file_path: str,
+    env_idx: int,
+    clip_start: int,
+    clip_end: int,
+    target_res: int,
+) -> list[np.ndarray]:
+    h5_path = matching_first_person_file(first_person_dir, raw_file_path)
+    if not os.path.isfile(h5_path):
+        raise FileNotFoundError(f"Matching rendered HDF5 not found for {raw_file_path}: {h5_path}")
+
+    with h5py.File(h5_path, "r") as h5f:
+        clip_frames = np.asarray(h5f["vision"][env_idx, clip_start:clip_end], dtype=np.uint8)
+
+    frames_hwc: list[np.ndarray] = []
+    for frame_chw in clip_frames:
+        frame_hwc = np.transpose(frame_chw, (1, 2, 0))
+        frames_hwc.append(resize_frame(frame_hwc, target_res))
+    return frames_hwc
+
+
+def build_side_by_side_frame(first_person_hwc: np.ndarray, third_person_hwc: np.ndarray) -> np.ndarray:
+    divider = np.full((third_person_hwc.shape[0], 8, 3), 12, dtype=np.uint8)
+    return np.concatenate([first_person_hwc, divider, third_person_hwc], axis=1)
+
+
 def render_clip(
     gs,
     torch,
@@ -107,11 +146,13 @@ def render_clip(
     run: CollisionRun,
     pre_frames: int,
     post_frames: int,
+    img_res: int,
     chase_dist: float,
     chase_height: float,
     side_offset: float,
     lookahead: float,
     font: ImageFont.ImageFont,
+    first_person_dir: str | None,
 ) -> tuple[list[np.ndarray], dict[str, int]]:
     base_pos = arrays["base_pos"]
     base_quat = arrays["base_quat"]
@@ -121,6 +162,16 @@ def render_clip(
     total_steps = int(base_pos.shape[1])
     clip_start = max(0, run.start - pre_frames)
     clip_end = min(total_steps, run.end + post_frames)
+    first_person_frames = None
+    if first_person_dir:
+        first_person_frames = load_first_person_frames(
+            first_person_dir=first_person_dir,
+            raw_file_path=run.file_path,
+            env_idx=run.env_idx,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            target_res=img_res,
+        )
 
     frames_hwc: list[np.ndarray] = []
     for absolute_step in range(clip_start, clip_end):
@@ -160,9 +211,26 @@ def render_clip(
             f"{os.path.basename(run.file_path)} env={run.env_idx}",
             f"t={absolute_step} rel={rel:+d}",
             f"collision={'yes' if collisions[run.env_idx, absolute_step] else 'no'}",
-            f"run={run.start}:{run.end} len={run.length}",
+            f"run={run.start}:{run.end} len={run.length} third-person",
         ]
-        frames_hwc.append(annotate_frame(np.transpose(rgb, (2, 0, 1)), font, lines))
+        third_person_frame = annotate_frame(np.transpose(rgb, (2, 0, 1)), font, lines)
+        if first_person_frames is None:
+            frames_hwc.append(third_person_frame)
+            continue
+
+        fp_lines = [
+            f"{os.path.basename(run.file_path)} env={run.env_idx}",
+            f"t={absolute_step} rel={rel:+d}",
+            f"collision={'yes' if collisions[run.env_idx, absolute_step] else 'no'}",
+            f"run={run.start}:{run.end} len={run.length} first-person",
+        ]
+        fp_idx = absolute_step - clip_start
+        first_person_frame = annotate_frame(
+            np.transpose(first_person_frames[fp_idx], (2, 0, 1)),
+            font,
+            fp_lines,
+        )
+        frames_hwc.append(build_side_by_side_frame(first_person_frame, third_person_frame))
 
     meta = {
         "clip_start": clip_start,
@@ -178,6 +246,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export third-person collision spot-check clips.")
     parser.add_argument("--raw_dir", type=str, required=True, help="Directory containing raw chunk_*.npz files.")
     parser.add_argument("--out_dir", type=str, required=True, help="Directory for output clips.")
+    parser.add_argument("--first_person_dir", type=str, default="",
+                        help="Optional directory containing rendered *_rgb.h5 files for side-by-side export.")
     parser.add_argument("--max_clips", type=int, default=8, help="Maximum number of clips to export.")
     parser.add_argument("--pre_frames", type=int, default=20, help="Frames before collision onset.")
     parser.add_argument("--post_frames", type=int, default=40, help="Frames after the collision run.")
@@ -194,6 +264,9 @@ def main() -> None:
 
     output_format, extension = resolve_output_format(args.format)
     os.makedirs(args.out_dir, exist_ok=True)
+    first_person_dir = args.first_person_dir.strip() or None
+    if first_person_dir is not None and not os.path.isdir(first_person_dir):
+        raise FileNotFoundError(f"First-person render dir not found: {first_person_dir}")
 
     files = discover_raw_files(args.raw_dir)
     candidates = collect_candidates(files)
@@ -213,6 +286,10 @@ def main() -> None:
     font = ImageFont.load_default()
     manifest_path = os.path.join(args.out_dir, "clips_manifest.csv")
     print(f"Clip output format: {output_format}")
+    if first_person_dir:
+        print(f"Export mode: side-by-side (first-person + third-person)")
+    else:
+        print(f"Export mode: third-person only")
 
     exported: list[dict[str, object]] = []
     clip_idx = 0
@@ -244,16 +321,19 @@ def main() -> None:
                         run=run,
                         pre_frames=args.pre_frames,
                         post_frames=args.post_frames,
+                        img_res=args.img_res,
                         chase_dist=args.chase_dist,
                         chase_height=args.chase_height,
                         side_offset=args.side_offset,
                         lookahead=args.lookahead,
                         font=font,
+                        first_person_dir=first_person_dir,
                     )
 
                     basename = os.path.splitext(os.path.basename(run.file_path))[0]
+                    prefix = "side_by_side" if first_person_dir else "third_person"
                     clip_name = (
-                        f"third_person_{clip_idx:03d}_{basename}_env{run.env_idx:03d}"
+                        f"{prefix}_{clip_idx:03d}_{basename}_env{run.env_idx:03d}"
                         f"_t{run.start:04d}_len{run.length:03d}{extension}"
                     )
                     out_path = os.path.join(args.out_dir, clip_name)
@@ -266,6 +346,7 @@ def main() -> None:
                         "clip_path": out_path,
                         "source_file": run.file_path,
                         "env_idx": run.env_idx,
+                        "first_person_file": matching_first_person_file(first_person_dir, run.file_path) if first_person_dir else "",
                     })
                     exported.append(meta)
                     print(
@@ -290,12 +371,16 @@ def main() -> None:
                 "collision_start",
                 "collision_end",
                 "collision_len",
+                "first_person_file",
             ],
         )
         writer.writeheader()
         writer.writerows(exported)
 
-    print(f"Exported {len(exported)} third-person clip(s) to {args.out_dir}")
+    if first_person_dir:
+        print(f"Exported {len(exported)} side-by-side clip(s) to {args.out_dir}")
+    else:
+        print(f"Exported {len(exported)} third-person clip(s) to {args.out_dir}")
     print(f"Manifest: {manifest_path}")
 
 
