@@ -57,7 +57,7 @@ from lewm.camera_utils import (
 # Constants
 # --------------------------------------------------------------------------- #
 
-URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
+URDF_PATH = "assets/mini_pupper/mini_pupper_render.urdf"
 
 JOINTS_ACTUATED = [
     "lf_hip_joint", "lh_hip_joint", "rf_hip_joint", "rh_hip_joint",

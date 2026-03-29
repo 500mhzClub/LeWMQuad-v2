@@ -6,7 +6,7 @@ wall, renders the egocentric camera view, and reports whether the camera
 sees through the wall or correctly renders its surface.
 
 Three layers of protection are tested:
-  1. Camera mount pulled back into the body envelope
+  1. Camera placed at the actual front camera mount
   2. Small near-plane so nearby wall surfaces are still rendered
   3. Unsafe-frame detector catches any remaining edge cases
 
@@ -37,6 +37,7 @@ from lewm.camera_utils import (
     camera_safety_metrics,
     ego_camera_config_from_args,
     egocentric_camera_pose,
+    quat_to_rotmat_wxyz,
 )
 
 
@@ -47,60 +48,77 @@ from lewm.camera_utils import (
 IMG_RES = 224
 WALL_THICKNESS = 0.20
 WALL_HEIGHT = 0.30
+URDF_PATH = "assets/mini_pupper/mini_pupper_render.urdf"
+Q0 = [0.06, 0.06, -0.06, -0.06, 0.85, 0.85, 0.85, 0.85, -1.75, -1.75, -1.75, -1.75]
 
 
 # --------------------------------------------------------------------------- #
 # Test configurations
 # --------------------------------------------------------------------------- #
 
-def build_test_cases():
+def base_pose_for_camera_xy(
+    desired_cam_xy: tuple[float, float],
+    yaw_rad: float,
+    base_z: float,
+    camera_cfg,
+) -> np.ndarray:
+    """Solve for base position that places the camera at a desired XY point."""
+    quat_np = yaw_to_quat(yaw_rad)
+    body_rot = quat_to_rotmat_wxyz(quat_np)
+    mount_world = body_rot @ np.asarray(camera_cfg.mount_pos_body, dtype=np.float32)
+    return np.array([
+        float(desired_cam_xy[0]) - float(mount_world[0]),
+        float(desired_cam_xy[1]) - float(mount_world[1]),
+        base_z,
+    ], dtype=np.float32)
+
+
+def build_test_cases(camera_cfg):
     """Generate robot poses at various distances/angles from a wall.
 
-    Wall is at x=0.5, running along Y, facing -X.
-    Robot faces +X (toward the wall) from various standoff distances.
+    Distances are specified in terms of camera standoff to keep the test
+    meaningful regardless of where the camera is mounted on the robot body.
     """
     wall = ObstacleSpec(
         pos=(0.5, 0.0, WALL_HEIGHT / 2.0),
         size=(WALL_THICKNESS, 2.0, WALL_HEIGHT),
-        color=(0.6, 0.6, 0.6),
+        color=(0.85, 0.15, 0.15),
     )
     layout = ObstacleLayout([wall])
 
     cases = []
-    # Vary robot distance from wall surface
+    base_z = 0.10
+    # Vary camera distance from wall surface
     # Wall front face is at x = 0.5 - WALL_THICKNESS/2 = 0.4
     wall_face_x = 0.5 - WALL_THICKNESS / 2.0
 
     for standoff in [0.50, 0.30, 0.20, 0.15, 0.10, 0.05, 0.02, 0.00, -0.02]:
-        robot_x = wall_face_x - standoff
         label = f"standoff_{standoff:+.2f}m"
-        # Robot facing +X (yaw=0)
+        yaw_rad = 0.0
         cases.append({
             "name": f"{label}_facing_wall",
-            "robot_pos": np.array([robot_x, 0.0, 0.10], dtype=np.float32),
-            "robot_yaw": 0.0,
+            "robot_pos": base_pose_for_camera_xy((wall_face_x - standoff, 0.0), yaw_rad, base_z, camera_cfg),
+            "robot_yaw": yaw_rad,
             "standoff": standoff,
         })
 
     # Angled approaches
     for angle_deg in [30, 45, 60]:
-        robot_x = wall_face_x - 0.10
-        robot_y = 0.3
         yaw_rad = math.radians(-angle_deg)
         cases.append({
             "name": f"angle_{angle_deg}deg_10cm",
-            "robot_pos": np.array([robot_x, robot_y, 0.10], dtype=np.float32),
+            "robot_pos": base_pose_for_camera_xy((wall_face_x - 0.10, 0.3), yaw_rad, base_z, camera_cfg),
             "robot_yaw": yaw_rad,
             "standoff": 0.10,
         })
 
     # Parallel to wall (wall-following)
     for standoff in [0.15, 0.05]:
-        robot_x = wall_face_x - standoff
+        yaw_rad = math.pi / 2.0
         cases.append({
             "name": f"parallel_{standoff:.2f}m",
-            "robot_pos": np.array([robot_x, 0.0, 0.10], dtype=np.float32),
-            "robot_yaw": math.pi / 2.0,  # facing +Y, parallel to wall
+            "robot_pos": base_pose_for_camera_xy((wall_face_x - standoff, 0.0), yaw_rad, base_z, camera_cfg),
+            "robot_yaw": yaw_rad,  # facing +Y, parallel to wall
             "standoff": standoff,
         })
 
@@ -111,7 +129,7 @@ def build_test_cases():
 # Rendering
 # --------------------------------------------------------------------------- #
 
-def render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout, camera_cfg):
+def render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, camera_cfg):
     """Render a single test case and return frame + safety metrics."""
     pos = torch.tensor(case["robot_pos"], device=gs.device, dtype=torch.float32).unsqueeze(0)
     quat_np = yaw_to_quat(case["robot_yaw"])
@@ -119,6 +137,7 @@ def render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout, camer
 
     robot.set_pos(pos)
     robot.set_quat(quat)
+    robot.set_dofs_position(q0.unsqueeze(0), act_dofs)
 
     cam_pos, cam_lookat, cam_up, cam_forward = egocentric_camera_pose(case["robot_pos"], quat_np, camera_cfg)
     safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg)
@@ -179,11 +198,14 @@ def main():
 
     init_genesis_once(args.sim_backend)
 
-    layout, cases = build_test_cases()
+    layout, cases = build_test_cases(camera_cfg)
 
     # Build scene
     scene = gs.Scene(show_viewer=False)
-    scene.add_entity(morph=gs.morphs.Plane())
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        surface=gs.surfaces.Rough(color=(0.55, 0.55, 0.55)),
+    )
 
     for obs in layout.obstacles:
         scene.add_entity(
@@ -192,7 +214,7 @@ def main():
         )
 
     robot = scene.add_entity(
-        gs.morphs.URDF(file="assets/mini_pupper/mini_pupper.urdf", fixed=False, merge_fixed_links=False),
+        gs.morphs.URDF(file=URDF_PATH, fixed=False, merge_fixed_links=False),
     )
     cam = scene.add_camera(res=(IMG_RES, IMG_RES), fov=camera_cfg.fov_deg, near=camera_cfg.near_plane, GUI=False)
     scene.build(n_envs=1)
@@ -205,6 +227,7 @@ def main():
     name_to_joint = {j.name: j for j in robot.joints}
     dof_idx = [list(name_to_joint[jn].dofs_idx_local)[0] for jn in JOINTS_ACTUATED]
     act_dofs = torch.tensor(dof_idx, device=gs.device, dtype=torch.int64)
+    q0 = torch.tensor(Q0, device=gs.device, dtype=torch.float32)
 
     # Run tests
     print(f"\n{'='*80}")
@@ -228,7 +251,7 @@ def main():
     fail_count = 0
 
     for case in cases:
-        rgb, safety, cam_pos = render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout, camera_cfg)
+        rgb, safety, cam_pos = render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, camera_cfg)
         stats = analyse_frame(rgb)
 
         # Save image

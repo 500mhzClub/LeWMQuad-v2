@@ -8,10 +8,9 @@ import math
 import numpy as np
 
 
-# The URDF camera mount sits farther forward (x=0.09055), which is too close to
-# obstacle faces during collision-heavy rollouts. Keep the URDF-like height and
-# pitch, but pull the optical centre back into the body envelope.
-DEFAULT_EGO_CAMERA_MOUNT_POS_BODY = (0.04, 0.0, 0.07)
+# Use the actual URDF camera mount. Clipping should be handled by camera near
+# plane and frame safety checks, not by moving the optical centre inside the dog.
+DEFAULT_EGO_CAMERA_MOUNT_POS_BODY = (0.09055, 0.0, 0.07)
 DEFAULT_EGO_CAMERA_PITCH_DEG = 15.0
 DEFAULT_EGO_CAMERA_LOOKAT_DIST = 1.0
 DEFAULT_EGO_CAMERA_FOV_DEG = 58.0

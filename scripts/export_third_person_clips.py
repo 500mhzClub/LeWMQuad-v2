@@ -30,7 +30,7 @@ from lewm.math_utils import forward_up_from_quat
 from lewm.obstacle_utils import ObstacleLayout, add_obstacles_to_scene
 
 
-URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
+URDF_PATH = "assets/mini_pupper/mini_pupper_render.urdf"
 JOINTS_ACTUATED = [
     "lf_hip_joint", "lh_hip_joint", "rf_hip_joint", "rh_hip_joint",
     "lf_thigh_joint", "lh_thigh_joint", "rf_thigh_joint", "rh_thigh_joint",
