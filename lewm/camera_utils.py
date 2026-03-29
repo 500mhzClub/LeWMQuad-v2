@@ -252,7 +252,7 @@ def camera_rotation_matrix(base_quat: np.ndarray, pitch_rad: float) -> np.ndarra
 
 # ---- Camera retraction ---------------------------------------------------- #
 
-MAX_RETRACT_M = 0.06  # never retract further than 6 cm (keeps camera in body)
+MAX_RETRACT_M = 0.08  # never retract further than 8 cm (mount is ~9 cm forward)
 RETRACT_MARGIN_M = 0.005  # extra margin on top of safe_clearance
 
 
@@ -277,14 +277,15 @@ def retract_camera_to_safe(
     safe = config.safe_clearance
 
     # Quick check: is frustum already safe?
-    inside = camera_inside_any_obstacle(cam_pos, layout, margin=config.inside_margin)
+    inside_margined = camera_inside_any_obstacle(cam_pos, layout, margin=config.inside_margin)
     fmin = frustum_min_hit_distance(cam_pos, cam_rot, config.fov_deg, layout)
-    if fmin >= safe and not inside:
+    if fmin >= safe and not inside_margined:
         lookat = cam_pos + float(config.lookat_dist) * cam_forward
         return cam_pos, lookat, cam_up, cam_forward, 0.0
 
-    # Camera inside obstacle — need full retraction to escape
-    if inside:
+    # Camera literally inside obstacle geometry — need full retraction to escape
+    inside_actual = camera_inside_any_obstacle(cam_pos, layout, margin=0.0)
+    if inside_actual:
         retract = MAX_RETRACT_M
     elif fmin < float("inf"):
         needed = safe - fmin + RETRACT_MARGIN_M
