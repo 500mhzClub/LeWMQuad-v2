@@ -363,6 +363,7 @@ def render_worker(args_tuple):
             retracted_count = 0
             substituted_count = 0
             depth_clipped_count = 0
+            depth_available = True  # try depth on first frame; disable if unsupported
 
             for step in range(T):
                 base_pos = base_pos_seq[step].unsqueeze(0)
@@ -398,7 +399,6 @@ def render_worker(args_tuple):
                         cam_pos, cam_forward, cam_up, cam_rot, layout, camera_cfg,
                     )
                     if retract_dist > 0:
-                        retracted_count += 1
                         # Re-check after retraction
                         safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg, cam_rot=cam_rot)
                         if safety["unsafe"]:
@@ -407,6 +407,7 @@ def render_worker(args_tuple):
                             if last_clean_frame is not None:
                                 env_video[step] = last_clean_frame
                             continue
+                        retracted_count += 1
                     else:
                         # Retraction returned 0 but was still unsafe — substitute
                         substituted_count += 1
@@ -420,14 +421,22 @@ def render_worker(args_tuple):
                     up=cam_up,
                 )
 
-                render_out = cam.render(rgb=True, depth=True, force_render=skip_physics_step)
+                # Render with depth when available for clipping validation
+                if depth_available:
+                    try:
+                        render_out = cam.render(rgb=True, depth=True, force_render=skip_physics_step)
+                    except TypeError:
+                        depth_available = False
+                        render_out = cam.render(rgb=True, force_render=skip_physics_step)
+                else:
+                    render_out = cam.render(rgb=True, force_render=skip_physics_step)
                 rgb = render_out[0]
                 if hasattr(rgb, "cpu"):
                     rgb = rgb.cpu().numpy()
                 rgb = np.asarray(rgb, dtype=np.uint8)
 
                 # ---- Depth-buffer clipping validation ---- #
-                if len(render_out) > 1 and render_out[1] is not None:
+                if depth_available and len(render_out) > 1 and render_out[1] is not None:
                     depth_buf = render_out[1]
                     if hasattr(depth_buf, "cpu"):
                         depth_buf = depth_buf.cpu().numpy()
@@ -448,7 +457,7 @@ def render_worker(args_tuple):
             if total_issues > 0:
                 print(
                     f"[worker {worker_id}] env {env_idx}: "
-                    f"{retracted_count} retracted, {substituted_count} substituted, "
+                    f"{retracted_count} retracted-ok, {substituted_count} substituted, "
                     f"{depth_clipped_count} depth-clipped out of {T} frames",
                     flush=True,
                 )

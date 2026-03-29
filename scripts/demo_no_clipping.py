@@ -156,7 +156,12 @@ def render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, c
 
     # Render original (possibly clipped) frame
     cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=cam_up)
-    render_out = cam.render(rgb=True, depth=True, force_render=True)
+    try:
+        render_out = cam.render(rgb=True, depth=True, force_render=True)
+        has_depth = len(render_out) > 1 and render_out[1] is not None
+    except TypeError:
+        render_out = cam.render(rgb=True, force_render=True)
+        has_depth = False
     rgb = render_out[0]
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
@@ -164,7 +169,7 @@ def render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, c
 
     # Depth-buffer check
     depth_clip = False
-    if len(render_out) > 1 and render_out[1] is not None:
+    if has_depth:
         depth_buf = render_out[1]
         if hasattr(depth_buf, "cpu"):
             depth_buf = depth_buf.cpu().numpy()
@@ -179,7 +184,7 @@ def render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, c
         )
         if retract_dist > 0:
             cam.set_pose(pos=new_pos, lookat=new_lookat, up=new_up)
-            ret_out = cam.render(rgb=True, depth=True, force_render=True)
+            ret_out = cam.render(rgb=True, force_render=True)
             ret_rgb = ret_out[0]
             if hasattr(ret_rgb, "cpu"):
                 ret_rgb = ret_rgb.cpu().numpy()
