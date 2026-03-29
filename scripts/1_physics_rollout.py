@@ -108,7 +108,9 @@ class SimConfig:
     kp: float = 5.0
     kv: float = 0.5
     action_scale: float = 0.30
-    min_z: float = 0.05
+    # Mini Pupper regularly dips just below 5 cm during nominal gait, so a
+    # 4 cm threshold is a less trigger-happy "fallen" heuristic.
+    min_z: float = 0.04
     max_tilt: float = 1.0
     collision_margin: float = 0.15
     safe_clearance: float = 0.40
@@ -310,6 +312,8 @@ def main() -> None:
                         help="Fraction of envs using OU commands (rest use structured patterns).")
     parser.add_argument("--soft_collision_prob", type=float, default=0.3,
                         help="Probability of NOT terminating on collision (allows recovery).")
+    parser.add_argument("--min_z", type=float, default=SimConfig.min_z,
+                        help="Base-height threshold below which an env is marked fallen.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.ckpt):
@@ -319,7 +323,11 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = SimConfig(n_envs=args.n_envs, soft_collision_prob=args.soft_collision_prob)
+    cfg = SimConfig(
+        n_envs=args.n_envs,
+        soft_collision_prob=args.soft_collision_prob,
+        min_z=args.min_z,
+    )
     scene_batch_envs = cfg.n_envs if args.scene_batch_envs <= 0 else min(args.scene_batch_envs, cfg.n_envs)
     n_scene_batches = math.ceil(cfg.n_envs / scene_batch_envs)
 
@@ -336,6 +344,7 @@ def main() -> None:
     print(f"  Beacons     : {args.n_beacons}")
     print(f"  OU fraction : {args.ou_fraction}")
     print(f"  Soft collide: {cfg.soft_collision_prob}")
+    print(f"  Min z       : {cfg.min_z}")
     print(f"  Output      : {out_dir.resolve()}")
     print()
 
