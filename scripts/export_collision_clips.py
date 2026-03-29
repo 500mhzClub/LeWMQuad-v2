@@ -14,7 +14,6 @@ import glob
 import os
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
 
 import h5py
@@ -85,7 +84,7 @@ def annotate_frame(
     text_lines: list[str],
 ) -> np.ndarray:
     frame_hwc = np.transpose(frame_chw, (1, 2, 0))
-    img = Image.fromarray(frame_hwc, mode="RGB")
+    img = Image.fromarray(frame_hwc)
     draw = ImageDraw.Draw(img)
 
     line_height = 12
@@ -103,8 +102,6 @@ def annotate_frame(
 
 
 def encode_mp4(frames_hwc: list[np.ndarray], out_path: str, fps: int) -> None:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg not found on PATH")
     if not frames_hwc:
         raise ValueError("No frames provided for MP4 export")
 
@@ -144,6 +141,35 @@ def encode_mp4(frames_hwc: list[np.ndarray], out_path: str, fps: int) -> None:
         raise RuntimeError(f"ffmpeg failed for {out_path}:\n{stderr}")
 
 
+def encode_gif(frames_hwc: list[np.ndarray], out_path: str, fps: int) -> None:
+    if not frames_hwc:
+        raise ValueError("No frames provided for GIF export")
+    frames = [Image.fromarray(frame) for frame in frames_hwc]
+    duration_ms = max(1, round(1000 / max(1, fps)))
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+
+
+def resolve_output_format(requested: str) -> tuple[str, str]:
+    requested = requested.strip().lower()
+    if requested == "gif":
+        return "gif", ".gif"
+    if requested == "mp4":
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg not found on PATH; rerun with --format gif or install ffmpeg")
+        return "mp4", ".mp4"
+    if requested != "auto":
+        raise ValueError("Unsupported format. Use one of: auto, mp4, gif")
+    if shutil.which("ffmpeg") is not None:
+        return "mp4", ".mp4"
+    return "gif", ".gif"
+
+
 def export_clip(
     run: CollisionRun,
     out_dir: str,
@@ -152,6 +178,8 @@ def export_clip(
     post_frames: int,
     fps: int,
     font: ImageFont.ImageFont,
+    output_format: str,
+    extension: str,
 ) -> dict[str, object]:
     with h5py.File(run.file_path, "r") as h5f:
         vision = h5f["vision"]
@@ -175,10 +203,13 @@ def export_clip(
 
     clip_name = (
         f"clip_{clip_idx:03d}_{basename}_env{run.env_idx:03d}"
-        f"_t{run.start:04d}_len{run.length:03d}.mp4"
+        f"_t{run.start:04d}_len{run.length:03d}{extension}"
     )
     out_path = os.path.join(out_dir, clip_name)
-    encode_mp4(frames_hwc, out_path, fps=fps)
+    if output_format == "mp4":
+        encode_mp4(frames_hwc, out_path, fps=fps)
+    else:
+        encode_gif(frames_hwc, out_path, fps=fps)
 
     return {
         "clip_path": out_path,
@@ -200,6 +231,7 @@ def main() -> None:
     parser.add_argument("--pre_frames", type=int, default=20, help="Frames before collision onset to include.")
     parser.add_argument("--post_frames", type=int, default=40, help="Frames after collision run to include.")
     parser.add_argument("--fps", type=int, default=12, help="Output video FPS.")
+    parser.add_argument("--format", type=str, default="auto", help="Output format: auto | mp4 | gif")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -211,6 +243,8 @@ def main() -> None:
 
     font = ImageFont.load_default()
     manifest_path = os.path.join(args.out_dir, "clips_manifest.csv")
+    output_format, extension = resolve_output_format(args.format)
+    print(f"Clip output format: {output_format}")
 
     exported = []
     for clip_idx, run in enumerate(candidates[: max(1, args.max_clips)], start=1):
@@ -222,6 +256,8 @@ def main() -> None:
             post_frames=args.post_frames,
             fps=args.fps,
             font=font,
+            output_format=output_format,
+            extension=extension,
         )
         exported.append(meta)
         print(
