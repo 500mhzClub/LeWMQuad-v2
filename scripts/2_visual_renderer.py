@@ -435,7 +435,11 @@ def render_worker(args_tuple):
                     rgb = rgb.cpu().numpy()
                 rgb = np.asarray(rgb, dtype=np.uint8)
 
-                # ---- Depth-buffer clipping validation ---- #
+                # ---- Depth-buffer clipping validation (log only, no frame drop) ---- #
+                # The frustum+retraction check is the primary guard. Depth stats
+                # are logged so we can audit, but frames are NOT dropped here —
+                # the floor and robot legs legitimately produce near-plane depth
+                # pixels that would cause massive false-positive rates (~20%).
                 if depth_available and len(render_out) > 1 and render_out[1] is not None:
                     depth_buf = render_out[1]
                     if hasattr(depth_buf, "cpu"):
@@ -443,9 +447,6 @@ def render_worker(args_tuple):
                     depth_buf = np.asarray(depth_buf, dtype=np.float32)
                     if depth_buffer_has_clipping(depth_buf, camera_cfg.near_plane):
                         depth_clipped_count += 1
-                        if last_clean_frame is not None:
-                            env_video[step] = last_clean_frame
-                        continue
 
                 rgb = apply_visual_domain_randomization(rgb, env_rng)
 
