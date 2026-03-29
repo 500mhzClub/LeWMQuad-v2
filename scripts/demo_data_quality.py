@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Demo: collect a small dataset and verify zero wall-clipping frames.
+"""Demo: collect a small dataset and verify zero unsafe camera frames.
 
 Runs a short physics rollout (1 chunk, 32 envs, 100 steps) through the
 full v2 pipeline and reports:
   - Total frames rendered
-  - Frames where camera was inside a wall (should be 0 or near-0)
+  - Frames where the camera pose became unsafe (should be 0 or near-0)
   - Collision statistics (collisions still happen, but camera sees walls correctly)
 
 This is the end-to-end proof that the v2 pipeline produces clean training data.
@@ -15,7 +15,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import sys
 
@@ -26,30 +25,12 @@ if REPO_ROOT not in sys.path:
 import numpy as np
 import torch
 
-from lewm.math_utils import forward_up_from_quat
 from lewm.genesis_utils import to_numpy
 from lewm.obstacle_utils import ObstacleLayout, ObstacleSpec
+from lewm.camera_utils import add_egocentric_camera_args, camera_safety_metrics, ego_camera_config_from_args, egocentric_camera_pose
 
 
-# Camera constants (must match 2_visual_renderer.py v2)
-CAM_FORWARD_OFFSET = 0.06
-CAM_UP_OFFSET = 0.05
-CAM_NEAR_PLANE = 0.08
 WALL_THICKNESS = 0.20
-
-
-def camera_inside_any_obstacle(
-    cam_xy: np.ndarray,
-    layout: ObstacleLayout,
-    margin: float = 0.02,
-) -> bool:
-    cx, cy = float(cam_xy[0]), float(cam_xy[1])
-    for obs in layout.obstacles:
-        ox, oy = obs.pos[0], obs.pos[1]
-        hx, hy = obs.size[0] / 2.0 + margin, obs.size[1] / 2.0 + margin
-        if abs(cx - ox) < hx and abs(cy - oy) < hy:
-            return True
-    return False
 
 
 def main():
@@ -58,7 +39,9 @@ def main():
     parser.add_argument("--n_envs", type=int, default=32)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--sim_backend", type=str, default="auto")
+    add_egocentric_camera_args(parser)
     args = parser.parse_args()
+    camera_cfg = ego_camera_config_from_args(args)
 
     if not os.path.isfile(args.ckpt):
         print(f"ERROR: checkpoint not found: {args.ckpt}")
@@ -166,12 +149,11 @@ def main():
 
             # Simulate camera position for each env and check clipping
             for env_i in range(args.n_envs):
-                q_np = to_numpy(quat[env_i])
-                fw, up = forward_up_from_quat(q_np)
                 pos_np = to_numpy(pos[env_i])
-                cam_pos = pos_np + CAM_FORWARD_OFFSET * fw + CAM_UP_OFFSET * up
-
-                if camera_inside_any_obstacle(cam_pos[:2], obstacle_layout):
+                q_np = to_numpy(quat[env_i])
+                cam_pos, _cam_lookat, _cam_up, cam_forward = egocentric_camera_pose(pos_np, q_np, camera_cfg)
+                safety = camera_safety_metrics(cam_pos, cam_forward, obstacle_layout, camera_cfg)
+                if safety["unsafe"]:
                     clipped_frames += 1
 
             total_frames += args.n_envs
@@ -191,11 +173,17 @@ def main():
     print(f"{'='*60}")
     print(f"  Total frames:         {total_frames:,}")
     print(f"  Collision frames:     {collision_frames:,} ({100*collision_frames/total_frames:.1f}%)")
-    print(f"  Camera-in-wall frames: {clipped_frames:,} ({100*clipped_frames/total_frames:.2f}%)")
+    print(f"  Camera-unsafe frames: {clipped_frames:,} ({100*clipped_frames/total_frames:.2f}%)")
+    print(
+        "  Camera config:       "
+        f"mount=({camera_cfg.mount_pos_body[0]:.3f}, {camera_cfg.mount_pos_body[1]:.3f}, {camera_cfg.mount_pos_body[2]:.3f}) "
+        f"pitch={camera_cfg.pitch_rad * 180.0 / np.pi:.1f}deg "
+        f"near={camera_cfg.near_plane:.3f}m"
+    )
     print()
 
     if clipped_frames == 0:
-        print("  RESULT: ZERO clipping detected. Training data is clean.")
+        print("  RESULT: ZERO unsafe camera frames detected. Training data is clean.")
     elif clipped_frames / total_frames < 0.001:
         print(f"  RESULT: {clipped_frames} frames clipped ({100*clipped_frames/total_frames:.3f}%).")
         print("  These would be replaced by the renderer's frame substitution.")

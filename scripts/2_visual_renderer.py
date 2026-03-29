@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Visual renderer: renders egocentric RGB from recorded physics rollouts.
 
-v2 anti-clipping changes:
-  - CAM_FORWARD_OFFSET reduced from 0.10m to 0.06m (camera stays behind robot front edge)
-  - Explicit CAM_NEAR_PLANE=0.08m prevents rendering through nearby geometry
-  - Camera-inside-wall detection replaces clipped frames with last clean frame
-  - Walls are 0.20m thick (up from 0.06m) so camera can't physically reach through
+Egocentric camera protections:
+  - Shared camera model, reused by the renderer and validation scripts
+  - Smaller near plane to avoid cutting away nearby wall surfaces
+  - Camera mount pulled back into the body envelope for collision-heavy replay
+  - Unsafe-frame detection uses both point clearance and forward ray hits
+  - Unsafe frames are replaced with the previous clean frame before HDF5 write
 
 Other features (from v1):
   - Beacon panel rendering (coloured panels added to the scene)
@@ -41,11 +42,16 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from lewm.math_utils import forward_up_from_quat
 from lewm.genesis_utils import to_numpy
 from lewm.texture_utils import generate_texture_set
 from lewm.obstacle_utils import ObstacleLayout
 from lewm.beacon_utils import BeaconLayout, beacon_like_wall_color
+from lewm.camera_utils import (
+    add_egocentric_camera_args,
+    camera_safety_metrics,
+    ego_camera_config_from_args,
+    egocentric_camera_pose,
+)
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -60,22 +66,12 @@ JOINTS_ACTUATED = [
 ]
 
 DEFAULT_IMG_RES = 224
-CAM_FOV = 58
-CAM_FORWARD_OFFSET = 0.06       # v2: pulled back from 0.10 to keep camera behind robot front edge
-CAM_UP_OFFSET = 0.05
-CAM_LOOKAT_DIST = 1.0
-CAM_NEAR_PLANE = 0.08           # v2: explicit near-plane prevents rendering through geometry
 DEFAULT_TEXTURE_COUNT = 27
 DEFAULT_TEXTURE_VARIANTS_PER_WORKER = 4
 VULKAN_SAFE_WORKER_LIMIT = 4
 VULKAN_SAFE_TEXTURE_VARIANT_LIMIT = 1
 HIP_SAFE_WORKER_LIMIT = 1
 HIP_SAFE_TEXTURE_VARIANT_LIMIT = 1
-
-# Camera pose jitter range (metres / radians)
-CAM_POS_JITTER = 0.008
-CAM_LOOKAT_JITTER = 0.012
-
 
 # --------------------------------------------------------------------------- #
 # Visual domain randomization
@@ -186,26 +182,6 @@ def apply_visual_domain_randomization(rgb: np.ndarray, rng: np.random.RandomStat
     return img
 
 
-def camera_inside_any_obstacle(
-    cam_xy: np.ndarray,
-    layout: ObstacleLayout,
-    margin: float = 0.02,
-) -> bool:
-    """Return True if the camera XY position is inside any obstacle AABB.
-
-    Used to flag frames where the camera has penetrated wall geometry
-    despite the near-plane and offset protections.  These frames should
-    be replaced with the previous clean frame.
-    """
-    cx, cy = float(cam_xy[0]), float(cam_xy[1])
-    for obs in layout.obstacles:
-        ox, oy = obs.pos[0], obs.pos[1]
-        hx, hy = obs.size[0] / 2.0 + margin, obs.size[1] / 2.0 + margin
-        if abs(cx - ox) < hx and abs(cy - oy) < hy:
-            return True
-    return False
-
-
 def sample_obstacle_color(rng: np.random.RandomState) -> Tuple[float, float, float]:
     """Muted random obstacle colour."""
     base = rng.uniform(0.3, 0.7)
@@ -228,6 +204,8 @@ def build_render_bundle(
     beacon_layout: BeaconLayout,
     rng: np.random.RandomState,
     img_res: int,
+    cam_fov: float,
+    cam_near: float,
     beacon_confuse_prob: float = 0.3,
 ):
     """Construct one textured render scene variant with beacon panels."""
@@ -258,7 +236,7 @@ def build_render_bundle(
     robot = scene.add_entity(
         gs.morphs.URDF(file=URDF_PATH, fixed=False, merge_fixed_links=False),
     )
-    cam = scene.add_camera(res=(img_res, img_res), fov=CAM_FOV, near=CAM_NEAR_PLANE, GUI=False)
+    cam = scene.add_camera(res=(img_res, img_res), fov=cam_fov, near=cam_near, GUI=False)
     scene.build(n_envs=1)
 
     name_to_joint = {j.name: j for j in robot.joints}
@@ -283,7 +261,7 @@ def render_worker(args_tuple):
     (worker_id, chunk_file, start_env, end_env,
      tmp_file, sim_backend, texture_dir, obstacle_json, beacon_json,
      texture_count, texture_variants, beacon_confuse_prob, img_res,
-     tmp_vision_compression, skip_physics_step, progress_queue) = args_tuple
+     tmp_vision_compression, skip_physics_step, camera_cfg, progress_queue) = args_tuple
 
     N_subset = end_env - start_env
 
@@ -331,6 +309,8 @@ def render_worker(args_tuple):
             beacon_layout,
             np.random.RandomState(worker_seed + 1009 * (variant_offset + 1)),
             img_res=img_res,
+            cam_fov=camera_cfg.fov_deg,
+            cam_near=camera_cfg.near_plane,
             beacon_confuse_prob=beacon_confuse_prob,
         )
         for variant_offset, texture_idx in enumerate(variant_ids)
@@ -377,6 +357,9 @@ def render_worker(args_tuple):
             env_video = np.zeros((T, 3, img_res, img_res), dtype=np.uint8)
             last_clean_frame = None  # fallback for clipped frames
             clipped_count = 0
+            forward_count = 0
+            clearance_count = 0
+            inside_count = 0
 
             for step in range(T):
                 base_pos = base_pos_seq[step].unsqueeze(0)
@@ -391,19 +374,26 @@ def render_worker(args_tuple):
 
                 # ---- Camera placement with jitter ---- #
                 q_np = to_numpy(base_quat_seq[step])
-                fw, up = forward_up_from_quat(q_np)
                 pos_np = to_numpy(base_pos_seq[step])
+                cam_pos, cam_lookat, cam_up, cam_forward = egocentric_camera_pose(pos_np, q_np, camera_cfg)
 
-                cam_pos = pos_np + CAM_FORWARD_OFFSET * fw + CAM_UP_OFFSET * up
-                cam_lookat = cam_pos + CAM_LOOKAT_DIST * fw
+                # Camera pose jitter for visual robustness.
+                cam_pos = cam_pos + env_rng.uniform(-camera_cfg.pos_jitter, camera_cfg.pos_jitter, size=3)
+                cam_lookat = cam_lookat + env_rng.uniform(-camera_cfg.lookat_jitter, camera_cfg.lookat_jitter, size=3)
+                cam_forward = cam_lookat - cam_pos
+                forward_norm = float(np.linalg.norm(cam_forward))
+                if forward_norm > 1e-8:
+                    cam_forward = cam_forward / forward_norm
 
-                # Camera pose jitter for visual robustness
-                cam_pos = cam_pos + env_rng.uniform(-CAM_POS_JITTER, CAM_POS_JITTER, size=3)
-                cam_lookat = cam_lookat + env_rng.uniform(-CAM_LOOKAT_JITTER, CAM_LOOKAT_JITTER, size=3)
-
-                # v2: Check if camera is inside wall geometry (belt-and-suspenders)
-                if camera_inside_any_obstacle(cam_pos[:2], layout):
+                safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg)
+                if safety["unsafe"]:
                     clipped_count += 1
+                    if safety["inside_wall"]:
+                        inside_count += 1
+                    if safety["clearance"] < camera_cfg.safe_clearance:
+                        clearance_count += 1
+                    if safety["forward_hit"] < camera_cfg.safe_clearance:
+                        forward_count += 1
                     if last_clean_frame is not None:
                         env_video[step] = last_clean_frame
                     continue
@@ -411,7 +401,7 @@ def render_worker(args_tuple):
                 cam.set_pose(
                     pos=cam_pos,
                     lookat=cam_lookat,
-                    up=up,
+                    up=cam_up,
                 )
 
                 render_out = cam.render(rgb=True, force_render=skip_physics_step)
@@ -427,7 +417,11 @@ def render_worker(args_tuple):
                 last_clean_frame = frame
 
             if clipped_count > 0:
-                print(f"[worker {worker_id}] env {env_idx}: replaced {clipped_count}/{T} clipped frames", flush=True)
+                print(
+                    f"[worker {worker_id}] env {env_idx}: replaced {clipped_count}/{T} unsafe frames "
+                    f"({forward_count} forward-ray, {clearance_count} clearance, {inside_count} inside-wall)",
+                    flush=True,
+                )
 
             h5_vision[local_idx] = env_video
             progress_queue.put(1)
@@ -553,10 +547,12 @@ def main():
         action="store_true",
         help="Replay recorded poses without advancing Genesis physics; force camera refresh on render.",
     )
+    add_egocentric_camera_args(parser, include_jitter=True)
     args = parser.parse_args()
 
     tmp_vision_compression = normalize_h5_compression(args.tmp_vision_compression)
     final_vision_compression = normalize_h5_compression(args.final_vision_compression)
+    camera_cfg = ego_camera_config_from_args(args, include_jitter=True)
 
     effective_workers = max(1, int(args.workers))
     effective_texture_variants = max(1, int(args.texture_variants_per_worker))
@@ -593,6 +589,13 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     texture_dir = os.path.join(args.out_dir, "_textures")
+    tqdm.write(
+        "Egocentric camera: "
+        f"mount=({camera_cfg.mount_pos_body[0]:.3f}, {camera_cfg.mount_pos_body[1]:.3f}, {camera_cfg.mount_pos_body[2]:.3f}) "
+        f"pitch={math.degrees(camera_cfg.pitch_rad):.1f}deg "
+        f"near={camera_cfg.near_plane:.3f}m "
+        f"safe_clearance={camera_cfg.safe_clearance:.3f}m"
+    )
     tqdm.write(f"Generating ground texture set ({args.texture_count} textures) ...")
     generate_texture_set(texture_dir, count=args.texture_count)
 
@@ -689,7 +692,7 @@ def main():
                     args.sim_backend, texture_dir, obstacle_json, beacon_json,
                     args.texture_count, effective_texture_variants,
                     args.beacon_confuse_prob, args.img_res, tmp_vision_compression,
-                    args.skip_physics_step,
+                    args.skip_physics_step, camera_cfg,
                 ))
 
             progress_queue = mp.Queue()

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Demo: verify that wall clipping is eliminated in the v2 data pipeline.
+"""Demo: verify that wall clipping is eliminated in the data pipeline.
 
 This script places the robot at various distances and angles relative to a
 wall, renders the egocentric camera view, and reports whether the camera
 sees through the wall or correctly renders its surface.
 
 Three layers of protection are tested:
-  1. Thick walls (0.20m) — camera physically cannot reach through
-  2. Explicit near_plane (0.08m) — near geometry is rendered, not clipped
-  3. Camera-inside-wall detector — catches any remaining edge cases
+  1. Camera mount pulled back into the body envelope
+  2. Small near-plane so nearby wall surfaces are still rendered
+  3. Unsafe-frame detector catches any remaining edge cases
 
 Usage:
     python scripts/demo_no_clipping.py [--save_dir clip_test_output]
@@ -30,37 +30,23 @@ if REPO_ROOT not in sys.path:
 import numpy as np
 from PIL import Image
 
-from lewm.math_utils import forward_up_from_quat, yaw_to_quat
+from lewm.math_utils import yaw_to_quat
 from lewm.obstacle_utils import ObstacleSpec, ObstacleLayout
+from lewm.camera_utils import (
+    add_egocentric_camera_args,
+    camera_safety_metrics,
+    ego_camera_config_from_args,
+    egocentric_camera_pose,
+)
 
 
 # --------------------------------------------------------------------------- #
-# Camera / scene constants (must match 2_visual_renderer.py v2)
+# Camera / scene constants (must match 2_visual_renderer.py)
 # --------------------------------------------------------------------------- #
 
-CAM_FORWARD_OFFSET = 0.06
-CAM_UP_OFFSET = 0.05
-CAM_LOOKAT_DIST = 1.0
-CAM_NEAR_PLANE = 0.08
-CAM_FOV = 58
 IMG_RES = 224
 WALL_THICKNESS = 0.20
 WALL_HEIGHT = 0.30
-
-
-def camera_inside_any_obstacle(
-    cam_xy: np.ndarray,
-    layout: ObstacleLayout,
-    margin: float = 0.02,
-) -> bool:
-    """Return True if camera XY is inside any obstacle AABB (+ margin)."""
-    cx, cy = float(cam_xy[0]), float(cam_xy[1])
-    for obs in layout.obstacles:
-        ox, oy = obs.pos[0], obs.pos[1]
-        hx, hy = obs.size[0] / 2.0 + margin, obs.size[1] / 2.0 + margin
-        if abs(cx - ox) < hx and abs(cy - oy) < hy:
-            return True
-    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -125,8 +111,8 @@ def build_test_cases():
 # Rendering
 # --------------------------------------------------------------------------- #
 
-def render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout):
-    """Render a single test case and return (rgb, clipped_flag)."""
+def render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout, camera_cfg):
+    """Render a single test case and return frame + safety metrics."""
     pos = torch.tensor(case["robot_pos"], device=gs.device, dtype=torch.float32).unsqueeze(0)
     quat_np = yaw_to_quat(case["robot_yaw"])
     quat = torch.tensor(quat_np, device=gs.device, dtype=torch.float32).unsqueeze(0)
@@ -134,22 +120,17 @@ def render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout):
     robot.set_pos(pos)
     robot.set_quat(quat)
 
-    fw, up = forward_up_from_quat(quat_np)
-    pos_np = case["robot_pos"]
-    cam_pos = pos_np + CAM_FORWARD_OFFSET * fw + CAM_UP_OFFSET * up
-    cam_lookat = cam_pos + CAM_LOOKAT_DIST * fw
+    cam_pos, cam_lookat, cam_up, cam_forward = egocentric_camera_pose(case["robot_pos"], quat_np, camera_cfg)
+    safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg)
 
-    # Check if camera is inside wall
-    clipped = camera_inside_any_obstacle(cam_pos[:2], layout)
-
-    cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=up)
+    cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=cam_up)
     render_out = cam.render(rgb=True, force_render=True)
     rgb = render_out[0]
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
     rgb = np.asarray(rgb, dtype=np.uint8)
 
-    return rgb, clipped, cam_pos
+    return rgb, safety, cam_pos
 
 
 def analyse_frame(rgb: np.ndarray) -> dict:
@@ -186,7 +167,9 @@ def main():
     parser.add_argument("--save_dir", type=str, default="clip_test_output",
                         help="Directory to save rendered test images.")
     parser.add_argument("--sim_backend", type=str, default="auto")
+    add_egocentric_camera_args(parser)
     args = parser.parse_args()
+    camera_cfg = ego_camera_config_from_args(args)
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -211,7 +194,7 @@ def main():
     robot = scene.add_entity(
         gs.morphs.URDF(file="assets/mini_pupper/mini_pupper.urdf", fixed=False, merge_fixed_links=False),
     )
-    cam = scene.add_camera(res=(IMG_RES, IMG_RES), fov=CAM_FOV, near=CAM_NEAR_PLANE, GUI=False)
+    cam = scene.add_camera(res=(IMG_RES, IMG_RES), fov=camera_cfg.fov_deg, near=camera_cfg.near_plane, GUI=False)
     scene.build(n_envs=1)
 
     JOINTS_ACTUATED = [
@@ -227,18 +210,25 @@ def main():
     print(f"\n{'='*80}")
     print(f"  Wall Clipping Validation — {len(cases)} test configurations")
     print(f"  Wall thickness:     {WALL_THICKNESS:.2f}m")
-    print(f"  Camera fwd offset:  {CAM_FORWARD_OFFSET:.2f}m")
-    print(f"  Camera near_plane:  {CAM_NEAR_PLANE:.2f}m")
+    print(
+        "  Camera mount xyz:  "
+        f"({camera_cfg.mount_pos_body[0]:.3f}, {camera_cfg.mount_pos_body[1]:.3f}, {camera_cfg.mount_pos_body[2]:.3f})"
+    )
+    print(f"  Camera pitch:      {math.degrees(camera_cfg.pitch_rad):.1f}deg")
+    print(f"  Camera near_plane: {camera_cfg.near_plane:.3f}m")
     print(f"{'='*80}\n")
 
-    print(f"{'Test':<30s} {'Standoff':>10s} {'CamInWall':>10s} {'MeanBrt':>10s} {'StdBrt':>10s} {'Result':>10s}")
-    print("-" * 80)
+    print(
+        f"{'Test':<30s} {'Standoff':>10s} {'Clear':>10s} "
+        f"{'FwdHit':>10s} {'MeanBrt':>10s} {'StdBrt':>10s} {'Result':>10s}"
+    )
+    print("-" * 94)
 
     pass_count = 0
     fail_count = 0
 
     for case in cases:
-        rgb, clipped, cam_pos = render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout)
+        rgb, safety, cam_pos = render_test_case(gs, torch, scene, cam, robot, act_dofs, case, layout, camera_cfg)
         stats = analyse_frame(rgb)
 
         # Save image
@@ -249,7 +239,7 @@ def main():
         # A "clipped" frame means the camera detector caught it — that's the
         # safety net working.  The real question is: does the rendered image
         # look correct (wall surface visible, not seeing through)?
-        if clipped:
+        if safety["unsafe"]:
             result = "CAUGHT"  # detector caught it, frame would be replaced
             fail_count += 1
         elif stats["std_brightness"] < 5.0 and stats["mean_brightness"] < 15.0:
@@ -262,26 +252,22 @@ def main():
         print(
             f"{case['name']:<30s} "
             f"{case['standoff']:>+10.2f} "
-            f"{'YES' if clipped else 'no':>10s} "
+            f"{safety['clearance']:>10.3f} "
+            f"{safety['forward_hit']:>10.3f} "
             f"{stats['mean_brightness']:>10.1f} "
             f"{stats['std_brightness']:>10.1f} "
             f"{result:>10s}"
         )
 
-    print("-" * 80)
+    print("-" * 94)
     print(f"\nResults: {pass_count} PASS, {fail_count} CAUGHT/FAIL out of {len(cases)} tests")
     print(f"Images saved to: {os.path.abspath(args.save_dir)}/")
 
-    # The key insight: with 0.20m walls and 0.06m camera offset,
-    # the camera needs to be 0.04m past the wall surface to enter it.
-    # At standoff=0 the camera is right at the wall surface — it should
-    # see the wall filling the frame.  At standoff=-0.02 the robot's base
-    # is 2cm past the surface, but the camera (0.06m forward of base) is
-    # still 4cm from the wall centre — outside the 0.10m half-extent.
-    # Only extreme penetration (robot fully inside the wall) can clip.
-
-    clean_positive = sum(1 for c in cases if c["standoff"] >= 0.05)
-    print(f"\nAt standoff >= 0.05m: all {clean_positive} cases should PASS (wall visible, no clip)")
+    clean_positive = sum(1 for c in cases if c["standoff"] >= camera_cfg.safe_clearance)
+    print(
+        f"\nAt standoff >= {camera_cfg.safe_clearance:.2f}m camera clearance, "
+        f"the camera should remain outside the near-plane danger zone."
+    )
 
     scene.destroy()
     gs.destroy()
