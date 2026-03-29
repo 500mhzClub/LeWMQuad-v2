@@ -277,18 +277,20 @@ def retract_camera_to_safe(
     safe = config.safe_clearance
 
     # Quick check: is frustum already safe?
+    inside = camera_inside_any_obstacle(cam_pos, layout, margin=config.inside_margin)
     fmin = frustum_min_hit_distance(cam_pos, cam_rot, config.fov_deg, layout)
-    if fmin >= safe and not camera_inside_any_obstacle(cam_pos, layout, margin=config.inside_margin):
+    if fmin >= safe and not inside:
         lookat = cam_pos + float(config.lookat_dist) * cam_forward
         return cam_pos, lookat, cam_up, cam_forward, 0.0
 
-    # Compute required retraction from frustum min hit
-    if fmin < float("inf"):
+    # Camera inside obstacle — need full retraction to escape
+    if inside:
+        retract = MAX_RETRACT_M
+    elif fmin < float("inf"):
         needed = safe - fmin + RETRACT_MARGIN_M
+        retract = min(max(needed, 0.005), MAX_RETRACT_M)
     else:
-        # Inside obstacle or no hit at all — try max retraction
-        needed = MAX_RETRACT_M
-    retract = min(max(needed, 0.005), MAX_RETRACT_M)
+        retract = MAX_RETRACT_M
 
     new_pos = cam_pos - retract * cam_forward
     lookat = new_pos + float(config.lookat_dist) * cam_forward
