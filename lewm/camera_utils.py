@@ -149,10 +149,10 @@ def camera_clearance_to_any_obstacle(cam_pos: np.ndarray, layout) -> float:
     return min_clearance
 
 
-def forward_hit_distance_to_any_obstacle(cam_pos: np.ndarray, cam_forward: np.ndarray, layout) -> float:
-    """Return distance along the camera forward ray to the nearest obstacle AABB."""
-    cam_pos = np.asarray(cam_pos, dtype=np.float32)
-    cam_forward = normalize_vec(cam_forward)
+def _ray_hit_distance_to_any_obstacle(origin: np.ndarray, direction: np.ndarray, layout) -> float:
+    """Return distance along a single ray to the nearest obstacle AABB (slab method)."""
+    origin = np.asarray(origin, dtype=np.float32)
+    direction = normalize_vec(direction)
     min_distance = float("inf")
     eps = 1e-8
 
@@ -164,19 +164,19 @@ def forward_hit_distance_to_any_obstacle(cam_pos: np.ndarray, cam_forward: np.nd
         t_max = float("inf")
         hit = True
         for axis in range(3):
-            origin = float(cam_pos[axis])
-            direction = float(cam_forward[axis])
+            o = float(origin[axis])
+            d = float(direction[axis])
             lo = float(box_min[axis])
             hi = float(box_max[axis])
 
-            if abs(direction) < eps:
-                if origin < lo or origin > hi:
+            if abs(d) < eps:
+                if o < lo or o > hi:
                     hit = False
                     break
                 continue
 
-            t0 = (lo - origin) / direction
-            t1 = (hi - origin) / direction
+            t0 = (lo - o) / d
+            t1 = (hi - o) / d
             if t0 > t1:
                 t0, t1 = t1, t0
             t_min = max(t_min, t0)
@@ -192,15 +192,149 @@ def forward_hit_distance_to_any_obstacle(cam_pos: np.ndarray, cam_forward: np.nd
     return min_distance
 
 
-def camera_safety_metrics(cam_pos: np.ndarray, cam_forward: np.ndarray, layout, config: EgoCameraConfig) -> dict[str, float | bool]:
-    """Return shared camera safety metrics for frame validation."""
+def forward_hit_distance_to_any_obstacle(cam_pos: np.ndarray, cam_forward: np.ndarray, layout) -> float:
+    """Return distance along the camera forward ray to the nearest obstacle AABB."""
+    return _ray_hit_distance_to_any_obstacle(cam_pos, cam_forward, layout)
+
+
+def frustum_ray_directions(fov_deg: float) -> list[np.ndarray]:
+    """Return 9 unit-vector ray directions spanning the camera frustum in camera-local frame.
+
+    Camera-local convention: +X = forward, +Y = right, +Z = up.
+    Rays: center, 4 corners, 4 edge midpoints of the near-plane rectangle.
+    """
+    half_angle = math.radians(fov_deg / 2.0)
+    t = math.tan(half_angle)
+
+    raw = [
+        np.array([1.0, 0.0, 0.0]),       # center
+        np.array([1.0, -t, +t]),          # top-left
+        np.array([1.0, +t, +t]),          # top-right
+        np.array([1.0, -t, -t]),          # bottom-left
+        np.array([1.0, +t, -t]),          # bottom-right
+        np.array([1.0, -t, 0.0]),         # mid-left
+        np.array([1.0, +t, 0.0]),         # mid-right
+        np.array([1.0, 0.0, +t]),         # mid-top
+        np.array([1.0, 0.0, -t]),         # mid-bottom
+    ]
+    return [normalize_vec(r.astype(np.float32)) for r in raw]
+
+
+def frustum_min_hit_distance(
+    cam_pos: np.ndarray,
+    cam_rot: np.ndarray,
+    fov_deg: float,
+    layout,
+) -> float:
+    """Cast rays through 9 frustum sample points; return the minimum hit distance.
+
+    ``cam_rot`` is the 3×3 camera rotation matrix (columns = camera-local axes
+    expressed in world frame).  The frustum ray directions are transformed to
+    world space via this matrix before ray-AABB intersection.
+    """
+    cam_pos = np.asarray(cam_pos, dtype=np.float32)
+    cam_rot = np.asarray(cam_rot, dtype=np.float32)
+    local_dirs = frustum_ray_directions(fov_deg)
+    min_hit = float("inf")
+    for local_d in local_dirs:
+        world_d = cam_rot @ local_d
+        hit = _ray_hit_distance_to_any_obstacle(cam_pos, world_d, layout)
+        if hit < min_hit:
+            min_hit = hit
+    return min_hit
+
+
+def camera_rotation_matrix(base_quat: np.ndarray, pitch_rad: float) -> np.ndarray:
+    """Return the 3×3 world-frame camera rotation from base quaternion and pitch."""
+    body_rot = quat_to_rotmat_wxyz(base_quat)
+    return body_rot @ rotmat_pitch_y(pitch_rad)
+
+
+# ---- Camera retraction ---------------------------------------------------- #
+
+MAX_RETRACT_M = 0.06  # never retract further than 6 cm (keeps camera in body)
+RETRACT_MARGIN_M = 0.005  # extra margin on top of safe_clearance
+
+
+def retract_camera_to_safe(
+    cam_pos: np.ndarray,
+    cam_forward: np.ndarray,
+    cam_up: np.ndarray,
+    cam_rot: np.ndarray,
+    layout,
+    config: EgoCameraConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Pull the camera backward along -cam_forward until the frustum clears.
+
+    Returns (new_cam_pos, new_cam_lookat, cam_up, cam_forward, retract_dist).
+    cam_forward and cam_up are unchanged (translation only).
+    retract_dist is 0.0 if no retraction was needed.
+    """
+    cam_pos = np.asarray(cam_pos, dtype=np.float32)
+    cam_forward = np.asarray(cam_forward, dtype=np.float32)
+    cam_up = np.asarray(cam_up, dtype=np.float32)
+    cam_rot = np.asarray(cam_rot, dtype=np.float32)
+    safe = config.safe_clearance
+
+    # Quick check: is frustum already safe?
+    fmin = frustum_min_hit_distance(cam_pos, cam_rot, config.fov_deg, layout)
+    if fmin >= safe and not camera_inside_any_obstacle(cam_pos, layout, margin=config.inside_margin):
+        lookat = cam_pos + float(config.lookat_dist) * cam_forward
+        return cam_pos, lookat, cam_up, cam_forward, 0.0
+
+    # Compute required retraction from frustum min hit
+    if fmin < float("inf"):
+        needed = safe - fmin + RETRACT_MARGIN_M
+    else:
+        # Inside obstacle or no hit at all — try max retraction
+        needed = MAX_RETRACT_M
+    retract = min(max(needed, 0.005), MAX_RETRACT_M)
+
+    new_pos = cam_pos - retract * cam_forward
+    lookat = new_pos + float(config.lookat_dist) * cam_forward
+    return new_pos.astype(np.float32), lookat.astype(np.float32), cam_up, cam_forward, float(retract)
+
+
+# ---- Depth-buffer clipping check ----------------------------------------- #
+
+def depth_buffer_has_clipping(depth: np.ndarray, near_plane: float, frac_threshold: float = 0.005) -> bool:
+    """Return True if a meaningful fraction of depth-buffer pixels are at or below the near plane.
+
+    ``depth`` is an (H, W) float array of per-pixel depth values from the renderer.
+    ``frac_threshold`` controls how many near-plane pixels constitute clipping (default 0.5%).
+    """
+    depth = np.asarray(depth, dtype=np.float32)
+    at_near = (depth <= near_plane * 1.05)  # 5% tolerance
+    return float(at_near.mean()) >= frac_threshold
+
+
+def camera_safety_metrics(
+    cam_pos: np.ndarray,
+    cam_forward: np.ndarray,
+    layout,
+    config: EgoCameraConfig,
+    cam_rot: np.ndarray | None = None,
+) -> dict[str, float | bool]:
+    """Return shared camera safety metrics for frame validation.
+
+    If ``cam_rot`` (3×3 camera rotation matrix) is provided, a full frustum
+    multi-ray check is used.  Otherwise falls back to single forward ray
+    (backward compatible).
+    """
     inside_wall = camera_inside_any_obstacle(cam_pos, layout, margin=config.inside_margin)
     clearance = camera_clearance_to_any_obstacle(cam_pos, layout)
     forward_hit = forward_hit_distance_to_any_obstacle(cam_pos, cam_forward, layout)
-    unsafe = inside_wall or clearance < config.safe_clearance or forward_hit < config.safe_clearance
+
+    if cam_rot is not None:
+        fmin = frustum_min_hit_distance(cam_pos, cam_rot, config.fov_deg, layout)
+    else:
+        fmin = forward_hit
+
+    unsafe = inside_wall or clearance < config.safe_clearance or fmin < config.safe_clearance
     return {
         "inside_wall": inside_wall,
         "clearance": clearance,
         "forward_hit": forward_hit,
+        "frustum_min_hit": fmin,
         "unsafe": unsafe,
     }

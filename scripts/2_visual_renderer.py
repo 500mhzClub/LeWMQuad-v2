@@ -4,9 +4,10 @@
 Egocentric camera protections:
   - Shared camera model, reused by the renderer and validation scripts
   - Smaller near plane to avoid cutting away nearby wall surfaces
-  - Camera mount pulled back into the body envelope for collision-heavy replay
-  - Unsafe-frame detection uses both point clearance and forward ray hits
-  - Unsafe frames are replaced with the previous clean frame before HDF5 write
+  - Frustum-aware multi-ray clipping detection (9 rays spanning the full FOV)
+  - Camera retraction along -forward when frustum check detects imminent clipping
+  - Depth-buffer validation after render to confirm no near-plane pixels remain
+  - Frame substitution as last-resort fallback only
 
 Other features (from v1):
   - Beacon panel rendering (coloured panels added to the scene)
@@ -48,9 +49,12 @@ from lewm.obstacle_utils import ObstacleLayout
 from lewm.beacon_utils import BeaconLayout, beacon_like_wall_color
 from lewm.camera_utils import (
     add_egocentric_camera_args,
+    camera_rotation_matrix,
     camera_safety_metrics,
+    depth_buffer_has_clipping,
     ego_camera_config_from_args,
     egocentric_camera_pose,
+    retract_camera_to_safe,
 )
 
 # --------------------------------------------------------------------------- #
@@ -355,11 +359,10 @@ def render_worker(args_tuple):
             )
 
             env_video = np.zeros((T, 3, img_res, img_res), dtype=np.uint8)
-            last_clean_frame = None  # fallback for clipped frames
-            clipped_count = 0
-            forward_count = 0
-            clearance_count = 0
-            inside_count = 0
+            last_clean_frame = None  # last-resort fallback only
+            retracted_count = 0
+            substituted_count = 0
+            depth_clipped_count = 0
 
             for step in range(T):
                 base_pos = base_pos_seq[step].unsqueeze(0)
@@ -376,6 +379,7 @@ def render_worker(args_tuple):
                 q_np = to_numpy(base_quat_seq[step])
                 pos_np = to_numpy(base_pos_seq[step])
                 cam_pos, cam_lookat, cam_up, cam_forward = egocentric_camera_pose(pos_np, q_np, camera_cfg)
+                cam_rot = camera_rotation_matrix(q_np, camera_cfg.pitch_rad)
 
                 # Camera pose jitter for visual robustness.
                 cam_pos = cam_pos + env_rng.uniform(-camera_cfg.pos_jitter, camera_cfg.pos_jitter, size=3)
@@ -385,18 +389,30 @@ def render_worker(args_tuple):
                 if forward_norm > 1e-8:
                     cam_forward = cam_forward / forward_norm
 
-                safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg)
+                # ---- Frustum-aware safety check ---- #
+                safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg, cam_rot=cam_rot)
+
                 if safety["unsafe"]:
-                    clipped_count += 1
-                    if safety["inside_wall"]:
-                        inside_count += 1
-                    if safety["clearance"] < camera_cfg.safe_clearance:
-                        clearance_count += 1
-                    if safety["forward_hit"] < camera_cfg.safe_clearance:
-                        forward_count += 1
-                    if last_clean_frame is not None:
-                        env_video[step] = last_clean_frame
-                    continue
+                    # Try camera retraction before falling back to substitution
+                    cam_pos, cam_lookat, cam_up, cam_forward, retract_dist = retract_camera_to_safe(
+                        cam_pos, cam_forward, cam_up, cam_rot, layout, camera_cfg,
+                    )
+                    if retract_dist > 0:
+                        retracted_count += 1
+                        # Re-check after retraction
+                        safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg, cam_rot=cam_rot)
+                        if safety["unsafe"]:
+                            # Retraction wasn't enough — last-resort substitution
+                            substituted_count += 1
+                            if last_clean_frame is not None:
+                                env_video[step] = last_clean_frame
+                            continue
+                    else:
+                        # Retraction returned 0 but was still unsafe — substitute
+                        substituted_count += 1
+                        if last_clean_frame is not None:
+                            env_video[step] = last_clean_frame
+                        continue
 
                 cam.set_pose(
                     pos=cam_pos,
@@ -404,11 +420,23 @@ def render_worker(args_tuple):
                     up=cam_up,
                 )
 
-                render_out = cam.render(rgb=True, force_render=skip_physics_step)
+                render_out = cam.render(rgb=True, depth=True, force_render=skip_physics_step)
                 rgb = render_out[0]
                 if hasattr(rgb, "cpu"):
                     rgb = rgb.cpu().numpy()
                 rgb = np.asarray(rgb, dtype=np.uint8)
+
+                # ---- Depth-buffer clipping validation ---- #
+                if len(render_out) > 1 and render_out[1] is not None:
+                    depth_buf = render_out[1]
+                    if hasattr(depth_buf, "cpu"):
+                        depth_buf = depth_buf.cpu().numpy()
+                    depth_buf = np.asarray(depth_buf, dtype=np.float32)
+                    if depth_buffer_has_clipping(depth_buf, camera_cfg.near_plane):
+                        depth_clipped_count += 1
+                        if last_clean_frame is not None:
+                            env_video[step] = last_clean_frame
+                        continue
 
                 rgb = apply_visual_domain_randomization(rgb, env_rng)
 
@@ -416,10 +444,12 @@ def render_worker(args_tuple):
                 env_video[step] = frame
                 last_clean_frame = frame
 
-            if clipped_count > 0:
+            total_issues = retracted_count + substituted_count + depth_clipped_count
+            if total_issues > 0:
                 print(
-                    f"[worker {worker_id}] env {env_idx}: replaced {clipped_count}/{T} unsafe frames "
-                    f"({forward_count} forward-ray, {clearance_count} clearance, {inside_count} inside-wall)",
+                    f"[worker {worker_id}] env {env_idx}: "
+                    f"{retracted_count} retracted, {substituted_count} substituted, "
+                    f"{depth_clipped_count} depth-clipped out of {T} frames",
                     flush=True,
                 )
 

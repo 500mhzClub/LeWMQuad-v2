@@ -5,16 +5,20 @@ This script places the robot at various distances and angles relative to a
 wall, renders the egocentric camera view, and reports whether the camera
 sees through the wall or correctly renders its surface.
 
-Three layers of protection are tested:
+Four layers of protection are tested:
   1. Camera placed at the actual front camera mount
   2. Small near-plane so nearby wall surfaces are still rendered
-  3. Unsafe-frame detector catches any remaining edge cases
+  3. Frustum-aware 9-ray clipping detector (catches off-axis clipping)
+  4. Camera retraction pulls the camera back when frustum check detects danger
+
+For cases that would have clipped, the script also renders the retracted
+camera position and saves both original and retracted frames for comparison.
 
 Usage:
     python scripts/demo_no_clipping.py [--save_dir clip_test_output]
 
 Output:
-    Per-test PNG renders + a summary table showing PASS/FAIL for each pose.
+    Per-test PNG renders + a summary table showing PASS/CAUGHT/RETRACTED.
 """
 from __future__ import annotations
 
@@ -34,10 +38,13 @@ from lewm.math_utils import yaw_to_quat
 from lewm.obstacle_utils import ObstacleSpec, ObstacleLayout
 from lewm.camera_utils import (
     add_egocentric_camera_args,
+    camera_rotation_matrix,
     camera_safety_metrics,
+    depth_buffer_has_clipping,
     ego_camera_config_from_args,
     egocentric_camera_pose,
     quat_to_rotmat_wxyz,
+    retract_camera_to_safe,
 )
 
 
@@ -130,7 +137,11 @@ def build_test_cases(camera_cfg):
 # --------------------------------------------------------------------------- #
 
 def render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, camera_cfg):
-    """Render a single test case and return frame + safety metrics."""
+    """Render a single test case and return frame + safety metrics + retraction info.
+
+    Returns (rgb, safety, cam_pos, retracted_rgb, retract_dist, depth_clip).
+    retracted_rgb is None if no retraction was needed/attempted.
+    """
     pos = torch.tensor(case["robot_pos"], device=gs.device, dtype=torch.float32).unsqueeze(0)
     quat_np = yaw_to_quat(case["robot_yaw"])
     quat = torch.tensor(quat_np, device=gs.device, dtype=torch.float32).unsqueeze(0)
@@ -140,16 +151,41 @@ def render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, c
     robot.set_dofs_position(q0.unsqueeze(0), act_dofs)
 
     cam_pos, cam_lookat, cam_up, cam_forward = egocentric_camera_pose(case["robot_pos"], quat_np, camera_cfg)
-    safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg)
+    cam_rot = camera_rotation_matrix(quat_np, camera_cfg.pitch_rad)
+    safety = camera_safety_metrics(cam_pos, cam_forward, layout, camera_cfg, cam_rot=cam_rot)
 
+    # Render original (possibly clipped) frame
     cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=cam_up)
-    render_out = cam.render(rgb=True, force_render=True)
+    render_out = cam.render(rgb=True, depth=True, force_render=True)
     rgb = render_out[0]
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
     rgb = np.asarray(rgb, dtype=np.uint8)
 
-    return rgb, safety, cam_pos
+    # Depth-buffer check
+    depth_clip = False
+    if len(render_out) > 1 and render_out[1] is not None:
+        depth_buf = render_out[1]
+        if hasattr(depth_buf, "cpu"):
+            depth_buf = depth_buf.cpu().numpy()
+        depth_clip = depth_buffer_has_clipping(np.asarray(depth_buf, dtype=np.float32), camera_cfg.near_plane)
+
+    # If unsafe, attempt retraction and render the retracted view
+    retracted_rgb = None
+    retract_dist = 0.0
+    if safety["unsafe"]:
+        new_pos, new_lookat, new_up, new_fwd, retract_dist = retract_camera_to_safe(
+            cam_pos, cam_forward, cam_up, cam_rot, layout, camera_cfg,
+        )
+        if retract_dist > 0:
+            cam.set_pose(pos=new_pos, lookat=new_lookat, up=new_up)
+            ret_out = cam.render(rgb=True, depth=True, force_render=True)
+            ret_rgb = ret_out[0]
+            if hasattr(ret_rgb, "cpu"):
+                ret_rgb = ret_rgb.cpu().numpy()
+            retracted_rgb = np.asarray(ret_rgb, dtype=np.uint8)
+
+    return rgb, safety, cam_pos, retracted_rgb, retract_dist, depth_clip
 
 
 def analyse_frame(rgb: np.ndarray) -> dict:
@@ -243,54 +279,80 @@ def main():
 
     print(
         f"{'Test':<30s} {'Standoff':>10s} {'Clear':>10s} "
-        f"{'FwdHit':>10s} {'MeanBrt':>10s} {'StdBrt':>10s} {'Result':>10s}"
+        f"{'FrustMin':>10s} {'Retract':>10s} {'DepthClp':>10s} {'Result':>10s}"
     )
-    print("-" * 94)
+    print("-" * 96)
 
     pass_count = 0
+    retract_count = 0
     fail_count = 0
 
     for case in cases:
-        rgb, safety, cam_pos = render_test_case(gs, torch, scene, cam, robot, act_dofs, q0, case, layout, camera_cfg)
+        rgb, safety, cam_pos, retracted_rgb, retract_dist, depth_clip = render_test_case(
+            gs, torch, scene, cam, robot, act_dofs, q0, case, layout, camera_cfg,
+        )
         stats = analyse_frame(rgb)
 
-        # Save image
+        # Save original frame
         img_path = os.path.join(args.save_dir, f"{case['name']}.png")
         Image.fromarray(rgb).save(img_path)
 
-        # Determine pass/fail
-        # A "clipped" frame means the camera detector caught it — that's the
-        # safety net working.  The real question is: does the rendered image
-        # look correct (wall surface visible, not seeing through)?
-        if safety["unsafe"]:
-            result = "CAUGHT"  # detector caught it, frame would be replaced
+        # Save retracted frame if available
+        if retracted_rgb is not None:
+            ret_path = os.path.join(args.save_dir, f"{case['name']}_retracted.png")
+            Image.fromarray(retracted_rgb).save(ret_path)
+            ret_stats = analyse_frame(retracted_rgb)
+
+        # Determine result
+        if safety["unsafe"] and retracted_rgb is not None:
+            # Retraction was applied — check if the retracted frame looks valid
+            ret_stats = analyse_frame(retracted_rgb)
+            if ret_stats["std_brightness"] < 5.0 and ret_stats["mean_brightness"] < 15.0:
+                result = "FAIL"  # retraction didn't fix the visual
+                fail_count += 1
+            else:
+                result = "RETRACTED"
+                retract_count += 1
+        elif safety["unsafe"]:
+            result = "CAUGHT"
+            fail_count += 1
+        elif depth_clip:
+            result = "DEPTH_FAIL"
             fail_count += 1
         elif stats["std_brightness"] < 5.0 and stats["mean_brightness"] < 15.0:
-            result = "FAIL"   # likely inside geometry (all black)
+            result = "FAIL"
             fail_count += 1
         else:
             result = "PASS"
             pass_count += 1
 
+        fmin = safety.get("frustum_min_hit", safety["forward_hit"])
         print(
             f"{case['name']:<30s} "
             f"{case['standoff']:>+10.2f} "
             f"{safety['clearance']:>10.3f} "
-            f"{safety['forward_hit']:>10.3f} "
-            f"{stats['mean_brightness']:>10.1f} "
-            f"{stats['std_brightness']:>10.1f} "
+            f"{fmin:>10.3f} "
+            f"{retract_dist:>10.3f} "
+            f"{'yes' if depth_clip else 'no':>10s} "
             f"{result:>10s}"
         )
 
-    print("-" * 94)
-    print(f"\nResults: {pass_count} PASS, {fail_count} CAUGHT/FAIL out of {len(cases)} tests")
+    print("-" * 96)
+    print(
+        f"\nResults: {pass_count} PASS, {retract_count} RETRACTED, "
+        f"{fail_count} CAUGHT/FAIL out of {len(cases)} tests"
+    )
     print(f"Images saved to: {os.path.abspath(args.save_dir)}/")
 
-    clean_positive = sum(1 for c in cases if c["standoff"] >= camera_cfg.safe_clearance)
     print(
         f"\nAt standoff >= {camera_cfg.safe_clearance:.2f}m camera clearance, "
         f"the camera should remain outside the near-plane danger zone."
     )
+    if retract_count > 0:
+        print(
+            f"{retract_count} case(s) were saved by camera retraction — "
+            f"check the *_retracted.png files for visual quality."
+        )
 
     scene.destroy()
     gs.destroy()

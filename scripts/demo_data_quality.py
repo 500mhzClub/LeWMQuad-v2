@@ -27,7 +27,14 @@ import torch
 
 from lewm.genesis_utils import to_numpy
 from lewm.obstacle_utils import ObstacleLayout, ObstacleSpec
-from lewm.camera_utils import add_egocentric_camera_args, camera_safety_metrics, ego_camera_config_from_args, egocentric_camera_pose
+from lewm.camera_utils import (
+    add_egocentric_camera_args,
+    camera_rotation_matrix,
+    camera_safety_metrics,
+    ego_camera_config_from_args,
+    egocentric_camera_pose,
+    retract_camera_to_safe,
+)
 
 
 WALL_THICKNESS = 0.20
@@ -110,6 +117,7 @@ def main():
     # Statistics
     total_frames = 0
     clipped_frames = 0
+    retracted_frames = 0
     collision_frames = 0
 
     rng = np.random.RandomState(42)
@@ -151,16 +159,28 @@ def main():
             for env_i in range(args.n_envs):
                 pos_np = to_numpy(pos[env_i])
                 q_np = to_numpy(quat[env_i])
-                cam_pos, _cam_lookat, _cam_up, cam_forward = egocentric_camera_pose(pos_np, q_np, camera_cfg)
-                safety = camera_safety_metrics(cam_pos, cam_forward, obstacle_layout, camera_cfg)
+                cam_pos, _cam_lookat, cam_up, cam_forward = egocentric_camera_pose(pos_np, q_np, camera_cfg)
+                cam_rot = camera_rotation_matrix(q_np, camera_cfg.pitch_rad)
+                safety = camera_safety_metrics(cam_pos, cam_forward, obstacle_layout, camera_cfg, cam_rot=cam_rot)
                 if safety["unsafe"]:
-                    clipped_frames += 1
+                    # Try retraction
+                    new_pos, _, _, _, rdist = retract_camera_to_safe(
+                        cam_pos, cam_forward, cam_up, cam_rot, obstacle_layout, camera_cfg,
+                    )
+                    if rdist > 0:
+                        post = camera_safety_metrics(new_pos, cam_forward, obstacle_layout, camera_cfg, cam_rot=cam_rot)
+                        if post["unsafe"]:
+                            clipped_frames += 1
+                        else:
+                            retracted_frames += 1
+                    else:
+                        clipped_frames += 1
 
             total_frames += args.n_envs
 
             if (step + 1) % 20 == 0:
                 print(f"  Step {step+1}/{args.steps}: "
-                      f"clipped={clipped_frames}/{total_frames} "
+                      f"retracted={retracted_frames} clipped={clipped_frames}/{total_frames} "
                       f"({100*clipped_frames/total_frames:.2f}%), "
                       f"collisions={collision_frames}/{total_frames} "
                       f"({100*collision_frames/total_frames:.1f}%)")
@@ -173,7 +193,8 @@ def main():
     print(f"{'='*60}")
     print(f"  Total frames:         {total_frames:,}")
     print(f"  Collision frames:     {collision_frames:,} ({100*collision_frames/total_frames:.1f}%)")
-    print(f"  Camera-unsafe frames: {clipped_frames:,} ({100*clipped_frames/total_frames:.2f}%)")
+    print(f"  Retracted frames:     {retracted_frames:,} ({100*retracted_frames/total_frames:.2f}%)")
+    print(f"  Unrecoverable frames: {clipped_frames:,} ({100*clipped_frames/total_frames:.2f}%)")
     print(
         "  Camera config:       "
         f"mount=({camera_cfg.mount_pos_body[0]:.3f}, {camera_cfg.mount_pos_body[1]:.3f}, {camera_cfg.mount_pos_body[2]:.3f}) "
@@ -182,15 +203,17 @@ def main():
     )
     print()
 
-    if clipped_frames == 0:
-        print("  RESULT: ZERO unsafe camera frames detected. Training data is clean.")
+    if clipped_frames == 0 and retracted_frames == 0:
+        print("  RESULT: ZERO unsafe camera frames. Training data is clean.")
+    elif clipped_frames == 0:
+        print(f"  RESULT: {retracted_frames} frames fixed by camera retraction, ZERO unrecoverable.")
+        print("  All frames will produce valid observations at training and inference time.")
     elif clipped_frames / total_frames < 0.001:
-        print(f"  RESULT: {clipped_frames} frames clipped ({100*clipped_frames/total_frames:.3f}%).")
-        print("  These would be replaced by the renderer's frame substitution.")
-        print("  Effective clipping rate in final dataset: 0%.")
+        print(f"  RESULT: {retracted_frames} retracted, {clipped_frames} unrecoverable ({100*clipped_frames/total_frames:.3f}%).")
+        print("  Unrecoverable frames fall back to frame substitution.")
     else:
         clip_pct = 100 * clipped_frames / total_frames
-        print(f"  WARNING: {clip_pct:.1f}% frames clipped. Investigate camera offset / wall thickness.")
+        print(f"  WARNING: {clip_pct:.1f}% unrecoverable after retraction. Investigate camera offset / wall thickness.")
 
     print()
 
