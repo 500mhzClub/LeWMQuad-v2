@@ -579,7 +579,7 @@ def main():
     parser.add_argument(
         "--final_vision_compression",
         type=str,
-        default="gzip",
+        default="none",
         help="Compression for final stitched vision datasets: none | gzip | lzf",
     )
     parser.add_argument(
