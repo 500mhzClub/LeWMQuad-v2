@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Train the LatentEnergyHead probe on frozen LeWM encoder latents.
+"""Train the full planning stack on frozen LeWM encoder latents.
 
-Two-phase approach:
-  Phase 1 — Extract: run the frozen encoder once over the full dataset,
-            compute composite energy targets, cache (z_proj, target) to disk.
-  Phase 2 — Train:   load cached latents, train the MLP head on pure tensors.
-            No ViT in the loop → minutes per epoch instead of hours.
+Three heads are trained on the same cached latent bank:
+
+  Phase 1 — Extract:  run frozen encoder once, cache (z_proj, labels) to disk.
+  Phase 2 — Safety:   LatentEnergyHead on composite safety+mobility target.
+  Phase 3 — Goal:     GoalEnergyHead on identity-conditioned beacon pairs.
+  Phase 4 — Explore:  ExplorationBonus (RND) on the full latent set.
+
+All three are combined at planning time by TrajectoryScorer:
+
+    cost = safety + α·goal − β·exploration
 
 Usage:
     python scripts/4_train_energy_head.py \
@@ -30,54 +35,83 @@ import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import autocast
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from tqdm import tqdm
 
-from lewm.models import LeWorldModel, LatentEnergyHead, composite_energy_target
+from lewm.models import (
+    LeWorldModel,
+    LatentEnergyHead,
+    GoalEnergyHead,
+    ExplorationBonus,
+    TrajectoryScorer,
+    composite_safety_target,
+)
 from lewm.data import StreamingJEPADataset
 from lewm.checkpoint_utils import clean_state_dict
 
 
+# --------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------- #
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train LatentEnergyHead probe")
+    p = argparse.ArgumentParser(description="Train planning heads on frozen LeWM latents")
+    # Data / encoder
     p.add_argument("--data_dir", type=str, default="jepa_final_dataset")
     p.add_argument("--checkpoint", type=str, required=True,
                    help="Path to trained LeWM checkpoint.")
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=256,
-                   help="Batch size for latent extraction (must match dataset).")
-    p.add_argument("--train_batch_size", type=int, default=8192,
-                   help="Batch size for MLP training on cached latents.")
+                   help="Batch size for latent extraction.")
     p.add_argument("--seq_len", type=int, default=4)
+    p.add_argument("--image_size", type=int, default=None)
+    p.add_argument("--patch_size", type=int, default=None)
+    p.add_argument("--use_proprio", action="store_true")
+    # Shared
+    p.add_argument("--out_dir", type=str, default="energy_head_checkpoints")
+    p.add_argument("--log_dir", type=str, default="energy_head_logs")
+    p.add_argument("--cache_dir", type=str, default=None,
+                   help="Directory for cached latents. Defaults to <out_dir>/latent_cache_v2.")
+    p.add_argument("--extract_only", action="store_true",
+                   help="Only extract latents, skip training.")
+    # Model dims (must match encoder checkpoint)
+    p.add_argument("--latent_dim", type=int, default=192)
+    p.add_argument("--hidden_dim", type=int, default=512)
+    p.add_argument("--dropout", type=float, default=0.1)
+    # Safety head
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--train_batch_size", type=int, default=8192)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--save_every", type=int, default=2000)
-    p.add_argument("--out_dir", type=str, default="energy_head_checkpoints")
-    p.add_argument("--log_dir", type=str, default="energy_head_logs")
-    p.add_argument("--cache_dir", type=str, default=None,
-                   help="Directory for cached latents. Defaults to <out_dir>/latent_cache.")
-    # Model dims (must match the checkpoint)
-    p.add_argument("--latent_dim", type=int, default=192)
-    p.add_argument("--hidden_dim", type=int, default=512)
-    p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--image_size", type=int, default=None)
-    p.add_argument("--patch_size", type=int, default=None)
-    p.add_argument("--use_proprio", action="store_true")
-    # Composite target weights
-    p.add_argument("--w_safety", type=float, default=0.5)
-    p.add_argument("--w_mobility", type=float, default=0.3)
-    p.add_argument("--w_beacon", type=float, default=0.2)
-    p.add_argument("--clearance_clip", type=float, default=1.0,
-                   help="Saturate clearance beyond this distance (metres).")
-    p.add_argument("--beacon_clip", type=float, default=5.0,
-                   help="Saturate beacon_range beyond this distance (metres).")
-    # Extraction only
-    p.add_argument("--extract_only", action="store_true",
-                   help="Only extract latents, skip training.")
+    p.add_argument("--w_safety", type=float, default=0.6)
+    p.add_argument("--w_mobility", type=float, default=0.4)
+    p.add_argument("--clearance_clip", type=float, default=1.0)
+    # Goal head
+    p.add_argument("--skip_goal", action="store_true",
+                   help="Skip GoalEnergyHead training.")
+    p.add_argument("--goal_epochs", type=int, default=10)
+    p.add_argument("--goal_lr", type=float, default=3e-4)
+    p.add_argument("--goal_batch_size", type=int, default=4096)
+    p.add_argument("--beacon_clip", type=float, default=5.0)
+    # Exploration bonus
+    p.add_argument("--skip_exploration", action="store_true",
+                   help="Skip ExplorationBonus (RND) training.")
+    p.add_argument("--exploration_epochs", type=int, default=5)
+    p.add_argument("--exploration_lr", type=float, default=1e-3)
+    p.add_argument("--exploration_feature_dim", type=int, default=128)
+    # TrajectoryScorer weights
+    p.add_argument("--goal_weight", type=float, default=1.0)
+    p.add_argument("--exploration_weight", type=float, default=0.1)
+    p.add_argument("--no_progress", action="store_true",
+                   help="Disable animated tqdm progress bars and emit plain logs only.")
     return p.parse_args()
 
+
+# --------------------------------------------------------------------- #
+# Encoder loading
+# --------------------------------------------------------------------- #
 
 def load_frozen_encoder(args, device):
     """Load the LeWM encoder from a checkpoint and freeze it."""
@@ -103,21 +137,49 @@ def load_frozen_encoder(args, device):
 
 
 # --------------------------------------------------------------------- #
-# Phase 1: Extract latents + targets to disk
+# Phase 1: Extract latents + labels to disk
 # --------------------------------------------------------------------- #
 
 SHARD_SAMPLES = 1_000_000  # ~750 MB per shard at dim=192
+CACHE_VERSION = 2          # bump to invalidate old caches
+
+
+def progress_enabled(args: argparse.Namespace) -> bool:
+    """Use animated tqdm bars only when stderr looks like a real terminal."""
+    term = os.environ.get("TERM", "")
+    return not args.no_progress and sys.stderr.isatty() and term.lower() != "dumb"
+
+
+def make_progress(args: argparse.Namespace, iterable, *, desc: str):
+    return tqdm(
+        iterable,
+        desc=desc,
+        disable=not progress_enabled(args),
+        dynamic_ncols=True,
+        mininterval=1.0,
+    )
+
+
+def progress_write(message: str, pbar=None) -> None:
+    if pbar is None:
+        print(message)
+        return
+    pbar.write(message)
 
 
 def extract_latents(args, device) -> str:
-    """Encode the full dataset once and cache (z_proj, target) shards to disk."""
-    cache_dir = args.cache_dir or os.path.join(args.out_dir, "latent_cache")
+    """Encode the full dataset once and cache (z_proj, safety_target,
+    beacon_identity, beacon_range) shards to disk."""
+    cache_dir = args.cache_dir or os.path.join(args.out_dir, "latent_cache_v2")
     manifest_path = os.path.join(cache_dir, "manifest.pt")
 
     if os.path.exists(manifest_path):
         info = torch.load(manifest_path, map_location="cpu")
-        print(f"Latent cache found: {info['n_samples']:,} samples in {info['n_shards']} shards")
-        return cache_dir
+        if info.get("version", 1) >= CACHE_VERSION:
+            print(f"Latent cache found: {info['n_samples']:,} samples in "
+                  f"{info['n_shards']} shards (v{info.get('version', 1)})")
+            return cache_dir
+        print("Cache version mismatch — re-extracting.")
 
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -146,215 +208,504 @@ def extract_latents(args, device) -> str:
     )
 
     z_buf: list[torch.Tensor] = []
-    t_buf: list[torch.Tensor] = []
+    st_buf: list[torch.Tensor] = []
+    bid_buf: list[torch.Tensor] = []
+    br_buf: list[torch.Tensor] = []
     buf_samples = 0
     shard_idx = 0
     total_samples = 0
+    pbar = None
 
     def flush_shard():
-        nonlocal z_buf, t_buf, buf_samples, shard_idx, total_samples
+        nonlocal z_buf, st_buf, bid_buf, br_buf, buf_samples, shard_idx, total_samples
         if not z_buf:
             return
         shard_path = os.path.join(cache_dir, f"shard_{shard_idx:04d}.pt")
         torch.save({
             "z": torch.cat(z_buf),
-            "target": torch.cat(t_buf),
+            "safety_target": torch.cat(st_buf),
+            "beacon_identity": torch.cat(bid_buf),
+            "beacon_range": torch.cat(br_buf),
         }, shard_path)
         total_samples += buf_samples
-        print(f"  Shard {shard_idx}: {buf_samples:,} samples -> {shard_path}")
-        z_buf, t_buf = [], []
+        progress_write(f"  Shard {shard_idx}: {buf_samples:,} samples -> {shard_path}", pbar)
+        z_buf, st_buf, bid_buf, br_buf = [], [], [], []
         buf_samples = 0
         shard_idx += 1
 
     t0 = time.time()
-    for batch in tqdm(dataloader, desc="Extracting latents"):
-        vision, proprio, cmds, dones, collisions, labels = batch
+    with make_progress(args, dataloader, desc="Extracting latents") as pbar:
+        for batch in pbar:
+            vision, proprio, cmds, dones, collisions, labels = batch
 
-        clearance = labels.get("clearance")
-        traversability = labels.get("traversability")
-        beacon_range = labels.get("beacon_range")
-        if clearance is None or traversability is None:
-            continue
+            clearance = labels.get("clearance")
+            traversability = labels.get("traversability")
+            if clearance is None or traversability is None:
+                continue
 
-        vision = vision.to(device, non_blocking=True).float().div_(255.0)
-        proprio = proprio.to(device, non_blocking=True)
+            beacon_range = labels.get("beacon_range")
+            beacon_identity = labels.get("beacon_identity")
 
-        B, T = vision.shape[:2]
+            vision = vision.to(device, non_blocking=True).float().div_(255.0)
+            proprio = proprio.to(device, non_blocking=True)
 
-        with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
-            _, z_proj = encoder.encode_seq(vision, proprio)
+            B, T = vision.shape[:2]
 
-        z_flat = z_proj.reshape(B * T, -1).float().cpu()
+            with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
+                _, z_proj = encoder.encode_seq(vision, proprio)
 
-        # Compute composite target on CPU
-        beacon_range = beacon_range.float() if beacon_range is not None else torch.full_like(clearance, 999.0)
-        target = composite_energy_target(
-            clearance.float(), traversability, beacon_range,
-            clearance_clip=args.clearance_clip,
-            traversability_horizon=10,
-            beacon_clip=args.beacon_clip,
-            w_safety=args.w_safety,
-            w_mobility=args.w_mobility,
-            w_beacon=args.w_beacon,
-        ).reshape(B * T)
+            z_flat = z_proj.reshape(B * T, -1).float().cpu()
 
-        z_buf.append(z_flat)
-        t_buf.append(target)
-        buf_samples += B * T
+            # Safety + mobility target (no beacon term)
+            safety_t = composite_safety_target(
+                clearance.float(), traversability,
+                clearance_clip=args.clearance_clip,
+                traversability_horizon=10,
+                w_safety=args.w_safety,
+                w_mobility=args.w_mobility,
+            ).reshape(B * T)
 
-        if buf_samples >= SHARD_SAMPLES:
-            flush_shard()
+            # Beacon labels (flattened)
+            if beacon_range is not None:
+                br_flat = beacon_range.float().reshape(B * T)
+            else:
+                br_flat = torch.full((B * T,), 999.0)
+            if beacon_identity is not None:
+                bid_flat = beacon_identity.long().reshape(B * T)
+            else:
+                bid_flat = torch.full((B * T,), -1, dtype=torch.long)
 
-    flush_shard()  # remaining
+            z_buf.append(z_flat)
+            st_buf.append(safety_t)
+            bid_buf.append(bid_flat)
+            br_buf.append(br_flat)
+            buf_samples += B * T
+
+            if buf_samples >= SHARD_SAMPLES:
+                flush_shard()
+
+    pbar = None
+    flush_shard()
 
     elapsed = time.time() - t0
     torch.save({
         "n_samples": total_samples,
         "n_shards": shard_idx,
         "latent_dim": args.latent_dim,
+        "version": CACHE_VERSION,
     }, manifest_path)
-    print(f"Extraction complete: {total_samples:,} samples, {shard_idx} shards, {elapsed:.0f}s")
+    print(f"Extraction complete: {total_samples:,} samples, "
+          f"{shard_idx} shards, {elapsed:.0f}s")
 
-    # Free encoder VRAM
     del encoder
     torch.cuda.empty_cache()
-
     return cache_dir
 
 
-# --------------------------------------------------------------------- #
-# Phase 2: Train MLP on cached latents
-# --------------------------------------------------------------------- #
-
 def load_cached_latents(cache_dir: str):
-    """Load all shards into a single TensorDataset."""
+    """Load all shards and return (z, safety_target, beacon_identity, beacon_range)."""
     manifest = torch.load(os.path.join(cache_dir, "manifest.pt"), map_location="cpu")
-    z_all, t_all = [], []
+    z_all, st_all, bid_all, br_all = [], [], [], []
     for i in range(manifest["n_shards"]):
         shard = torch.load(os.path.join(cache_dir, f"shard_{i:04d}.pt"), map_location="cpu")
         z_all.append(shard["z"])
-        t_all.append(shard["target"])
+        st_all.append(shard["safety_target"])
+        bid_all.append(shard["beacon_identity"])
+        br_all.append(shard["beacon_range"])
         print(f"  Loaded shard {i}: {shard['z'].shape[0]:,} samples")
-    z_cat = torch.cat(z_all)
-    t_cat = torch.cat(t_all)
-    print(f"Total: {z_cat.shape[0]:,} samples, z={z_cat.shape}, target={t_cat.shape}")
-    return TensorDataset(z_cat, t_cat)
+    z = torch.cat(z_all)
+    st = torch.cat(st_all)
+    bid = torch.cat(bid_all)
+    br = torch.cat(br_all)
+    print(f"Total: {z.shape[0]:,} samples, z={z.shape}")
+    return z, st, bid, br
 
 
-def train(args):
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Training LatentEnergyHead on {device}")
-    print(f"Target weights: safety={args.w_safety}, mobility={args.w_mobility}, beacon={args.w_beacon}")
+# --------------------------------------------------------------------- #
+# Phase 2: Train LatentEnergyHead (safety + mobility)
+# --------------------------------------------------------------------- #
 
-    # Phase 1: extract (or reuse cache)
-    cache_dir = extract_latents(args, device)
+def train_safety_head(args, z_all, safety_target, device):
+    print("\n" + "=" * 60)
+    print("Phase 2: Training LatentEnergyHead (safety + mobility)")
+    print("=" * 60)
 
-    if args.extract_only:
-        return
-
-    # Phase 2: load cache and train
-    print("\nLoading cached latents...")
-    cached_dataset = load_cached_latents(cache_dir)
-
+    dataset = TensorDataset(z_all, safety_target)
     dataloader = DataLoader(
-        cached_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True,
+        dataset, batch_size=args.train_batch_size,
+        shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
     )
-    n_batches = len(dataloader)
-    print(f"Training dataloader: {n_batches} batches of {args.train_batch_size}")
+    print(f"  {len(dataloader)} batches of {args.train_batch_size}")
 
-    # Energy head
     head = LatentEnergyHead(
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
     ).to(device)
     head = torch.compile(head)
-
-    n_params = sum(p.numel() for p in head.parameters())
-    print(f"Energy head parameters: {n_params:,}")
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
 
     optimizer = torch.optim.AdamW(
         head.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Logging
-    os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
-    csv_path = os.path.join(args.log_dir, "energy_head_metrics.csv")
+    csv_path = os.path.join(args.log_dir, "safety_head_metrics.csv")
     if not os.path.exists(csv_path):
         with open(csv_path, mode="w", newline="") as f:
             csv.writer(f).writerow(["step", "epoch", "loss", "mean_energy", "lr"])
 
     global_step = 0
-
     for epoch in range(args.epochs):
         head.train()
-        epoch_loss_sum = 0.0
-        epoch_batches = 0
+        epoch_loss = 0.0
+        epoch_n = 0
         t0 = time.time()
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
-        for z_batch, target_batch in pbar:
-            z_batch = z_batch.to(device, non_blocking=True)
-            target_batch = target_batch.to(device, non_blocking=True)
+        with make_progress(args, dataloader, desc=f"  Safety {epoch + 1}/{args.epochs}") as pbar:
+            for z_batch, target_batch in pbar:
+                z_batch = z_batch.to(device, non_blocking=True)
+                target_batch = target_batch.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
-
-            energy = head(z_batch)
-            loss = nn.functional.mse_loss(energy, target_batch)
-
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                head.parameters(), max_norm=args.grad_clip,
-            ).item()
-
-            if not torch.isfinite(loss) or not math.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
-                continue
+                energy = head(z_batch)
+                loss = nn.functional.mse_loss(energy, target_batch)
+                loss.backward()
 
-            optimizer.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    head.parameters(), max_norm=args.grad_clip,
+                ).item()
+                if not torch.isfinite(loss) or not math.isfinite(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
-            global_step += 1
-            loss_val = loss.item()
-            mean_energy = energy.detach().mean().item()
-            epoch_loss_sum += loss_val
-            epoch_batches += 1
+                optimizer.step()
+                global_step += 1
+                loss_val = loss.item()
+                epoch_loss += loss_val
+                epoch_n += 1
 
-            with open(csv_path, mode="a", newline="") as f:
-                csv.writer(f).writerow([
-                    global_step, epoch + 1,
-                    f"{loss_val:.6f}",
-                    f"{mean_energy:.4f}",
-                    f"{optimizer.param_groups[0]['lr']:.2e}",
-                ])
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step, epoch + 1, f"{loss_val:.6f}",
+                        f"{energy.detach().mean().item():.4f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
 
-            if global_step % 5 == 0:
-                pbar.set_postfix(
-                    loss=f"{loss_val:.4f}",
-                    energy=f"{mean_energy:.3f}",
-                    lr=f"{optimizer.param_groups[0]['lr']:.1e}",
-                )
+                if global_step % 5 == 0:
+                    pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}")
 
-            if global_step % args.save_every == 0:
-                ckpt_path = os.path.join(args.out_dir, f"energy_step_{global_step}.pt")
-                torch.save({"head_state_dict": head.state_dict(), "step": global_step, "epoch": epoch}, ckpt_path)
-                print(f"\n  Saved: {ckpt_path}")
+                if global_step % args.save_every == 0:
+                    ckpt_path = os.path.join(args.out_dir, f"safety_step_{global_step}.pt")
+                    torch.save({"head_state_dict": head.state_dict(), "step": global_step}, ckpt_path)
+                    progress_write(f"    Saved: {ckpt_path}", pbar)
 
         scheduler.step()
-        avg_loss = epoch_loss_sum / max(1, epoch_batches)
-        elapsed = time.time() - t0
-        print(f"Epoch {epoch + 1} complete | avg_loss={avg_loss:.4f} | time={elapsed:.0f}s")
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.4f} | time={time.time() - t0:.0f}s")
 
-        epoch_path = os.path.join(args.out_dir, f"energy_epoch_{epoch + 1}.pt")
-        torch.save({"head_state_dict": head.state_dict(), "step": global_step, "epoch": epoch}, epoch_path)
+        torch.save(
+            {"head_state_dict": head.state_dict(), "step": global_step, "epoch": epoch},
+            os.path.join(args.out_dir, f"safety_epoch_{epoch + 1}.pt"),
+        )
 
-    print("Energy head training complete.")
+    print("  Safety head training complete.")
+    return head
+
+
+# --------------------------------------------------------------------- #
+# Phase 3: Train GoalEnergyHead (identity-conditioned beacon pairs)
+# --------------------------------------------------------------------- #
+
+class GoalPairedDataset(Dataset):
+    """Builds (z_anchor, z_goal, target) triples on-the-fly.
+
+    For each sample:
+      1. Pick a random target beacon identity from those present in the data.
+      2. Sample a z_goal from the pool of latents where that identity is visible.
+      3. Compute target:
+           - If anchor sees the same identity: target ∝ range (low = close).
+           - Otherwise: target = 1 (high energy).
+
+    This teaches the GoalEnergyHead to discriminate which beacon
+    the breadcrumb refers to and to produce low energy only when
+    approaching that specific beacon.
+    """
+
+    def __init__(self, z_all, beacon_identity, beacon_range, beacon_clip=5.0):
+        self.z = z_all
+        self.identity = beacon_identity.long()
+        self.range = beacon_range
+        self.beacon_clip = beacon_clip
+
+        # Build index: identity_id -> sample indices where that beacon is visible
+        self.pools: dict[int, torch.Tensor] = {}
+        pool_lists: dict[int, list[int]] = {}
+        for i in range(len(beacon_identity)):
+            bid = beacon_identity[i].item()
+            if bid >= 0 and beacon_range[i].item() < beacon_clip * 2:
+                pool_lists.setdefault(bid, []).append(i)
+        for k, v in pool_lists.items():
+            self.pools[k] = torch.tensor(v, dtype=torch.long)
+
+        self.valid_ids = list(self.pools.keys())
+        if not self.valid_ids:
+            raise ValueError(
+                "No beacon-visible samples found in the dataset. "
+                "Cannot train GoalEnergyHead — use --skip_goal."
+            )
+        print(f"    GoalPairedDataset: {len(self.valid_ids)} beacon identities, "
+              f"pools: {', '.join(f'{k}:{len(v)}' for k, v in pool_lists.items())}")
+
+    def __len__(self):
+        return len(self.z)
+
+    def __getitem__(self, idx):
+        z_anchor = self.z[idx]
+
+        # Random target identity
+        tid = self.valid_ids[torch.randint(len(self.valid_ids), (1,)).item()]
+
+        # Sample z_goal from that identity's pool
+        pool = self.pools[tid]
+        goal_idx = pool[torch.randint(len(pool), (1,)).item()].item()
+        z_goal = self.z[goal_idx]
+
+        # Target: low when anchor sees matching beacon, high otherwise
+        anchor_bid = self.identity[idx].item()
+        anchor_range = self.range[idx].item()
+
+        if anchor_bid == tid and anchor_range < self.beacon_clip * 2:
+            target = min(anchor_range / self.beacon_clip, 1.0)
+        else:
+            target = 1.0
+
+        return z_anchor, z_goal, torch.tensor(target, dtype=z_anchor.dtype)
+
+
+def train_goal_head(args, z_all, beacon_identity, beacon_range, device):
+    print("\n" + "=" * 60)
+    print("Phase 3: Training GoalEnergyHead (beacon identity matching)")
+    print("=" * 60)
+
+    try:
+        dataset = GoalPairedDataset(z_all, beacon_identity, beacon_range, args.beacon_clip)
+    except ValueError as e:
+        print(f"  Skipping: {e}")
+        return None
+
+    dataloader = DataLoader(
+        dataset, batch_size=args.goal_batch_size,
+        shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
+    )
+    print(f"  {len(dataloader)} batches of {args.goal_batch_size}")
+
+    head = GoalEnergyHead(
+        latent_dim=args.latent_dim, dropout=args.dropout,
+    ).to(device)
+    head = torch.compile(head)
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(
+        head.parameters(), lr=args.goal_lr, weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.goal_epochs)
+
+    csv_path = os.path.join(args.log_dir, "goal_head_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow(["step", "epoch", "loss", "mean_energy", "lr"])
+
+    global_step = 0
+    for epoch in range(args.goal_epochs):
+        head.train()
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+
+        with make_progress(args, dataloader, desc=f"  Goal {epoch + 1}/{args.goal_epochs}") as pbar:
+            for z_a, z_g, target in pbar:
+                z_a = z_a.to(device, non_blocking=True)
+                z_g = z_g.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                energy = head(z_a, z_g)
+                loss = nn.functional.mse_loss(energy, target)
+                loss.backward()
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    head.parameters(), max_norm=args.grad_clip,
+                ).item()
+                if not torch.isfinite(loss) or not math.isfinite(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                optimizer.step()
+                global_step += 1
+                loss_val = loss.item()
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step, epoch + 1, f"{loss_val:.6f}",
+                        f"{energy.detach().mean().item():.4f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}")
+
+                if global_step % args.save_every == 0:
+                    ckpt_path = os.path.join(args.out_dir, f"goal_step_{global_step}.pt")
+                    torch.save({"head_state_dict": head.state_dict(), "step": global_step}, ckpt_path)
+                    progress_write(f"    Saved: {ckpt_path}", pbar)
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.4f} | time={time.time() - t0:.0f}s")
+
+        torch.save(
+            {"head_state_dict": head.state_dict(), "step": global_step, "epoch": epoch},
+            os.path.join(args.out_dir, f"goal_epoch_{epoch + 1}.pt"),
+        )
+
+    print("  Goal head training complete.")
+    return head
+
+
+# --------------------------------------------------------------------- #
+# Phase 4: Train ExplorationBonus (RND)
+# --------------------------------------------------------------------- #
+
+def train_exploration(args, z_all, device):
+    print("\n" + "=" * 60)
+    print("Phase 4: Training ExplorationBonus (RND)")
+    print("=" * 60)
+
+    dataset = TensorDataset(z_all)
+    dataloader = DataLoader(
+        dataset, batch_size=args.train_batch_size,
+        shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
+    )
+    print(f"  {len(dataloader)} batches of {args.train_batch_size}")
+
+    bonus = ExplorationBonus(
+        latent_dim=args.latent_dim,
+        feature_dim=args.exploration_feature_dim,
+    ).to(device)
+    bonus = torch.compile(bonus)
+
+    n_trainable = sum(p.numel() for p in bonus.predictor.parameters())
+    print(f"  Predictor parameters: {n_trainable:,} (target is frozen)")
+
+    optimizer = torch.optim.AdamW(
+        bonus.predictor.parameters(), lr=args.exploration_lr, weight_decay=1e-4,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.exploration_epochs)
+
+    csv_path = os.path.join(args.log_dir, "exploration_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow(["step", "epoch", "loss", "lr"])
+
+    global_step = 0
+    for epoch in range(args.exploration_epochs):
+        bonus.train()
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+
+        with make_progress(args, dataloader, desc=f"  RND {epoch + 1}/{args.exploration_epochs}") as pbar:
+            for (z_batch,) in pbar:
+                z_batch = z_batch.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                loss = bonus.loss(z_batch)
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(bonus.predictor.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                global_step += 1
+                loss_val = loss.item()
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step, epoch + 1, f"{loss_val:.6f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(loss=f"{loss_val:.6f}")
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.6f} | time={time.time() - t0:.0f}s")
+
+    torch.save(
+        {"bonus_state_dict": bonus.state_dict(), "epoch": args.exploration_epochs},
+        os.path.join(args.out_dir, "exploration_bonus.pt"),
+    )
+    print("  RND training complete.")
+    return bonus
+
+
+# --------------------------------------------------------------------- #
+# Main orchestrator
+# --------------------------------------------------------------------- #
+
+def train(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    print(f"Training planning heads on {device}")
+    print(f"Safety weights: w_safety={args.w_safety}, w_mobility={args.w_mobility}")
+    print(f"Goal weight: {args.goal_weight}, Exploration weight: {args.exploration_weight}")
+
+    # Phase 1: extract (or reuse cache)
+    cache_dir = extract_latents(args, device)
+    if args.extract_only:
+        return
+
+    # Load all cached latents
+    print("\nLoading cached latents...")
+    z_all, safety_target, beacon_id, beacon_range = load_cached_latents(cache_dir)
+
+    # Phase 2: safety head
+    safety_head = train_safety_head(args, z_all, safety_target, device)
+
+    # Phase 3: goal head
+    goal_head = None
+    if not args.skip_goal:
+        goal_head = train_goal_head(args, z_all, beacon_id, beacon_range, device)
+
+    # Phase 4: exploration bonus
+    exploration = None
+    if not args.skip_exploration:
+        exploration = train_exploration(args, z_all, device)
+
+    # Save combined TrajectoryScorer checkpoint
+    scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
+    scorer_data = {
+        "safety_head": safety_head.state_dict(),
+        "goal_head": goal_head.state_dict() if goal_head is not None else None,
+        "exploration": exploration.state_dict() if exploration is not None else None,
+        "goal_weight": args.goal_weight,
+        "exploration_weight": args.exploration_weight,
+        "latent_dim": args.latent_dim,
+        "hidden_dim": args.hidden_dim,
+        "dropout": args.dropout,
+        "exploration_feature_dim": args.exploration_feature_dim,
+    }
+    torch.save(scorer_data, scorer_path)
+    print(f"\nTrajectoryScorer checkpoint saved: {scorer_path}")
+    print("All training complete.")
 
 
 if __name__ == "__main__":

@@ -9,7 +9,12 @@ class GoalEnergyHead(nn.Module):
     """Scores compatibility between a predicted latent and a goal latent.
 
     Input: concatenation of [z_pred, z_goal, z_pred - z_goal, z_pred * z_goal].
-    Output: scalar energy (lower = more compatible).
+    Output: non-negative scalar energy (lower = more compatible).
+
+    At planning time, the goal latent is the "breadcrumb" — a latent captured
+    when the robot first observes the target beacon.  The head learns to
+    produce low energy when the current state is approaching that specific
+    beacon, and high energy otherwise.
     """
 
     def __init__(self, latent_dim: int = 192, dropout: float = 0.0):
@@ -19,11 +24,30 @@ class GoalEnergyHead(nn.Module):
             nn.Linear(in_dim, 1024), nn.LayerNorm(1024), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(1024, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(512, 1),
+            nn.Softplus(),
         )
 
     def forward(self, z_pred: torch.Tensor, z_goal: torch.Tensor) -> torch.Tensor:
+        """z_pred, z_goal: (..., D) -> (...,) non-negative energy."""
         x = torch.cat([z_pred, z_goal, z_pred - z_goal, z_pred * z_goal], dim=-1)
         return self.net(x).squeeze(-1)
+
+    def score_trajectory(
+        self, z_seq: torch.Tensor, z_goal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score a trajectory against a breadcrumb latent.
+
+        Args:
+            z_seq:  (B, H, D) predicted latents from plan_rollout.
+            z_goal: (B, D) breadcrumb latent from target beacon observation.
+
+        Returns:
+            (B,) total goal energy over horizon (lower = closer to beacon).
+        """
+        B, H, D = z_seq.shape
+        z_goal_exp = z_goal.unsqueeze(1).expand(B, H, D)
+        per_step = self.forward(z_seq, z_goal_exp)   # (B, H)
+        return per_step.sum(dim=-1)                   # (B,)
 
 
 class LatentEnergyHead(nn.Module):
@@ -123,3 +147,177 @@ def composite_energy_target(
     w_beacon_eff = torch.where(beacon_visible, torch.tensor(w_beacon), torch.tensor(0.0))
 
     return w_safety_eff * safety + w_mobility * mobility + w_beacon_eff * beacon_term
+
+
+# --------------------------------------------------------------------- #
+# Decomposed targets for the new training pipeline
+# --------------------------------------------------------------------- #
+
+def composite_safety_target(
+    clearance: torch.Tensor,
+    traversability: torch.Tensor,
+    clearance_clip: float = 1.0,
+    traversability_horizon: int = 10,
+    w_safety: float = 0.6,
+    w_mobility: float = 0.4,
+) -> torch.Tensor:
+    """Safety + mobility target without any beacon term.
+
+    Used by the unconditional :class:`LatentEnergyHead`.  Beacon attraction
+    is handled separately by the :class:`GoalEnergyHead`.
+
+    Returns a value in [0, 1] where 0 = safe, open corridor.
+    """
+    safety = 1.0 - (clearance / clearance_clip).clamp(0, 1)
+    mobility = 1.0 - (traversability.float() / traversability_horizon).clamp(0, 1)
+    return w_safety * safety + w_mobility * mobility
+
+
+def beacon_goal_target(
+    beacon_range: torch.Tensor,
+    beacon_identity: torch.Tensor,
+    target_identity: int,
+    beacon_clip: float = 5.0,
+) -> torch.Tensor:
+    """Identity-aware beacon attraction target for :class:`GoalEnergyHead`.
+
+    Returns a value in [0, 1]:
+      - 0 = on top of the matching beacon.
+      - Proportional to distance when approaching the correct beacon.
+      - 1 = wrong beacon, no beacon visible, or out of range.
+
+    Args:
+        beacon_range:    (N,) distance to closest visible beacon (metres).
+        beacon_identity: (N,) int index of closest visible beacon (-1 = none).
+        target_identity: which beacon we are seeking (index into BEACON_FAMILIES).
+        beacon_clip:     saturate beyond this range.
+    """
+    visible = beacon_range < beacon_clip * 2
+    matches = beacon_identity == target_identity
+    active = visible & matches
+    range_norm = (beacon_range / beacon_clip).clamp(0, 1)
+    return torch.where(active, range_norm, torch.ones_like(range_norm))
+
+
+# --------------------------------------------------------------------- #
+# RND exploration bonus
+# --------------------------------------------------------------------- #
+
+class ExplorationBonus(nn.Module):
+    """Random Network Distillation exploration bonus.
+
+    A fixed random network (target) and a trained predictor.  Prediction
+    error is high for latent states the predictor has not been trained on
+    (i.e. novel / unvisited regions).  At planning time, *subtracting*
+    this bonus from trajectory cost encourages the robot to explore
+    unseen corridors in a novel maze.
+
+    Training: minimise ``loss(z)`` on the *training* latents so that
+    familiar states produce low bonus.  At inference, unvisited states
+    will naturally have high bonus.
+    """
+
+    def __init__(self, latent_dim: int = 192, feature_dim: int = 128):
+        super().__init__()
+        # Fixed random target — never trained
+        self.target = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, feature_dim),
+        )
+        for p in self.target.parameters():
+            p.requires_grad_(False)
+
+        # Learned predictor — trained to match target on seen states
+        self.predictor = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, feature_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Per-sample exploration bonus (higher = more novel).
+
+        Args:
+            z: (..., D) latent embeddings.
+
+        Returns:
+            (...,) non-negative bonus.
+        """
+        with torch.no_grad():
+            t = self.target(z)
+        p = self.predictor(z)
+        return (p - t).square().mean(dim=-1)
+
+    def loss(self, z: torch.Tensor) -> torch.Tensor:
+        """Training loss — average prediction error over the batch."""
+        return self.forward(z).mean()
+
+
+# --------------------------------------------------------------------- #
+# Combined trajectory scorer for CEM / MPC planning
+# --------------------------------------------------------------------- #
+
+class TrajectoryScorer(nn.Module):
+    """Merges safety, goal-seeking, and exploration into a single cost.
+
+    .. math::
+
+        \\text{cost} = E_{\\text{safety}}
+                     + \\alpha \\, E_{\\text{goal}}
+                     - \\beta  \\, \\text{exploration bonus}
+
+    Lower cost → better trajectory.
+
+    Usage at planning time::
+
+        scorer = TrajectoryScorer(safety_head, goal_head, exploration)
+        z_rollouts = world_model.plan_rollout(z_start, candidate_actions)
+        costs = scorer.score(z_rollouts, z_breadcrumb)
+        best = costs.argmin()
+    """
+
+    def __init__(
+        self,
+        safety_head: LatentEnergyHead,
+        goal_head: GoalEnergyHead | None = None,
+        exploration: ExplorationBonus | None = None,
+        goal_weight: float = 1.0,
+        exploration_weight: float = 0.1,
+    ):
+        super().__init__()
+        self.safety_head = safety_head
+        self.goal_head = goal_head
+        self.exploration = exploration
+        self.goal_weight = goal_weight
+        self.exploration_weight = exploration_weight
+
+    def score(
+        self,
+        z_seq: torch.Tensor,
+        z_goal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Score candidate trajectories.
+
+        Args:
+            z_seq:  (B, H, D) predicted latent trajectories.
+            z_goal: (B, D) breadcrumb latent (omit for pure exploration).
+
+        Returns:
+            (B,) cost per trajectory.
+        """
+        cost = self.safety_head.score_trajectory(z_seq)
+
+        if self.goal_head is not None and z_goal is not None:
+            cost = cost + self.goal_weight * self.goal_head.score_trajectory(z_seq, z_goal)
+
+        if self.exploration is not None:
+            B, H, D = z_seq.shape
+            bonus = self.exploration(z_seq.reshape(B * H, D)).reshape(B, H)
+            cost = cost - self.exploration_weight * bonus.sum(dim=-1)
+
+        return cost

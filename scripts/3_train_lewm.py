@@ -77,6 +77,8 @@ def parse_args() -> argparse.Namespace:
                    help="ViT patch size. Defaults to 14 for 224px data and 4 for 64px data.")
     p.add_argument("--use_proprio", action="store_true",
                    help="Fuse proprioception instead of the paper's vision-only encoder.")
+    p.add_argument("--no_progress", action="store_true",
+                   help="Disable animated tqdm progress bars and emit plain logs only.")
     return p.parse_args()
 
 
@@ -106,6 +108,29 @@ def save_checkpoint(
     if os.path.islink(latest):
         os.remove(latest)
     os.symlink(os.path.abspath(path), latest)
+
+
+def progress_enabled(args: argparse.Namespace) -> bool:
+    """Use animated tqdm bars only when stderr looks like a real terminal."""
+    term = os.environ.get("TERM", "")
+    return not args.no_progress and sys.stderr.isatty() and term.lower() != "dumb"
+
+
+def make_progress(args: argparse.Namespace, iterable, *, desc: str):
+    return tqdm(
+        iterable,
+        desc=desc,
+        disable=not progress_enabled(args),
+        dynamic_ncols=True,
+        mininterval=1.0,
+    )
+
+
+def progress_write(message: str, pbar=None) -> None:
+    if pbar is None:
+        print(message)
+        return
+    pbar.write(message)
 
 
 # --------------------------------------------------------------------- #
@@ -227,98 +252,106 @@ def train(args: argparse.Namespace) -> None:
         epoch_batches = 0
         t_epoch_start = time.time()
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+        with make_progress(args, dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}") as pbar:
+            for batch in pbar:
+                # Dataset returns 5-tuple (old) or 6-tuple (new, with labels dict)
+                if len(batch) == 6:
+                    vision, proprio, cmds, dones, collisions, _labels = batch
+                else:
+                    vision, proprio, cmds, dones, collisions = batch
 
-        for batch in pbar:
-            # Dataset returns 5-tuple (old) or 6-tuple (new, with labels dict)
-            if len(batch) == 6:
-                vision, proprio, cmds, dones, collisions, _labels = batch
-            else:
-                vision, proprio, cmds, dones, collisions = batch
+                vision = vision.to(device, non_blocking=True).float().div_(255.0)
+                proprio = proprio.to(device, non_blocking=True)
+                cmds = cmds.to(device, non_blocking=True)
+                dones = dones.to(device, non_blocking=True)
+                collisions = collisions.to(device, non_blocking=True)
 
-            vision = vision.to(device, non_blocking=True).float().div_(255.0)
-            proprio = proprio.to(device, non_blocking=True)
-            cmds = cmds.to(device, non_blocking=True)
-            dones = dones.to(device, non_blocking=True)
-            collisions = collisions.to(device, non_blocking=True)
+                # Keep soft-collision transitions in the loss so the predictor
+                # learns wall-contact dynamics; only reset/teleport boundaries are masked.
+                mask = ~dones[:, 1:]
 
-            # Keep soft-collision transitions in the loss so the predictor
-            # learns wall-contact dynamics; only reset/teleport boundaries are masked.
-            mask = ~dones[:, 1:]
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with autocast("cuda", dtype=torch.bfloat16):
-                out = model(vision, proprio, cmds, mask=mask)
-
-            total_loss = out["loss"]
-            pred_loss_val = out["pred_loss"].item()
-            sigreg_loss_val = out["sigreg_loss"].item()
-            z_std = out["z_proj_std"].item()
-
-            # Warmup: linearly ramp LR from near-zero to args.lr over warmup_steps
-            if global_step < args.warmup_steps:
-                warmup_lr = args.lr * (global_step + 1) / args.warmup_steps
-                for pg in optimizer.param_groups:
-                    pg["lr"] = warmup_lr
-
-            total_loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=args.grad_clip,
-            ).item()
-
-            if not torch.isfinite(total_loss) or not math.isfinite(grad_norm):
-                print(f"\n  WARNING: non-finite loss={total_loss.item():.4f} or grad_norm={grad_norm:.4f} at step {global_step}, skipping update.")
                 optimizer.zero_grad(set_to_none=True)
-                continue
 
-            optimizer.step()
+                with autocast("cuda", dtype=torch.bfloat16):
+                    out = model(vision, proprio, cmds, mask=mask)
 
-            # NOTE: No EMA update — that's the whole point of LeWM.
+                total_loss = out["loss"]
+                pred_loss_val = out["pred_loss"].item()
+                sigreg_loss_val = out["sigreg_loss"].item()
+                z_std = out["z_proj_std"].item()
 
-            # ---- Collapse monitoring ---------------------------------
-            if z_std < 0.1:
-                print(f"\n  WARNING: z_proj_std={z_std:.4f} < 0.1 — possible collapse!")
+                # Warmup: linearly ramp LR from near-zero to args.lr over warmup_steps
+                if global_step < args.warmup_steps:
+                    warmup_lr = args.lr * (global_step + 1) / args.warmup_steps
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = warmup_lr
 
-            # ---- Logging ---------------------------------------------
-            global_step += 1
-            current_lr = optimizer.param_groups[0]["lr"]
-            loss_val = total_loss.item()
-            epoch_loss_sum += loss_val
-            epoch_batches += 1
+                total_loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=args.grad_clip,
+                ).item()
 
-            with open(csv_path, mode="a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    global_step,
-                    epoch + 1,
-                    f"{loss_val:.6f}",
-                    f"{pred_loss_val:.6f}",
-                    f"{sigreg_loss_val:.6f}",
-                    f"{current_lr:.2e}",
-                    f"{z_std:.6f}",
-                    f"{grad_norm:.4f}",
-                ])
+                if not torch.isfinite(total_loss) or not math.isfinite(grad_norm):
+                    progress_write(
+                        "  WARNING: "
+                        f"non-finite loss={total_loss.item():.4f} or "
+                        f"grad_norm={grad_norm:.4f} at step {global_step}, "
+                        "skipping update.",
+                        pbar,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
-            if global_step % 5 == 0:
-                pbar.set_postfix({
-                    "loss": f"{loss_val:.4f}",
-                    "pred": f"{pred_loss_val:.4f}",
-                    "sig": f"{sigreg_loss_val:.4f}",
-                    "z_std": f"{z_std:.3f}",
-                    "gnorm": f"{grad_norm:.3f}",
-                    "lr": f"{current_lr:.1e}",
-                })
+                optimizer.step()
 
-            # ---- Intra-epoch checkpoint ------------------------------
-            if global_step % args.save_every == 0:
-                ckpt_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
-                save_checkpoint(ckpt_path, model, optimizer, scheduler, epoch, global_step)
-                print(f"\n  Checkpoint saved: {ckpt_path}")
-                import glob as _glob
-                step_ckpts = sorted(_glob.glob(os.path.join(args.out_dir, "step_*.pt")))
-                for old in step_ckpts[:-3]:
-                    os.remove(old)
+                # NOTE: No EMA update — that's the whole point of LeWM.
+
+                # ---- Collapse monitoring ---------------------------------
+                if z_std < 0.1:
+                    progress_write(
+                        f"  WARNING: z_proj_std={z_std:.4f} < 0.1; possible collapse.",
+                        pbar,
+                    )
+
+                # ---- Logging ---------------------------------------------
+                global_step += 1
+                current_lr = optimizer.param_groups[0]["lr"]
+                loss_val = total_loss.item()
+                epoch_loss_sum += loss_val
+                epoch_batches += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        global_step,
+                        epoch + 1,
+                        f"{loss_val:.6f}",
+                        f"{pred_loss_val:.6f}",
+                        f"{sigreg_loss_val:.6f}",
+                        f"{current_lr:.2e}",
+                        f"{z_std:.6f}",
+                        f"{grad_norm:.4f}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix({
+                        "loss": f"{loss_val:.4f}",
+                        "pred": f"{pred_loss_val:.4f}",
+                        "sig": f"{sigreg_loss_val:.4f}",
+                        "z_std": f"{z_std:.3f}",
+                        "gnorm": f"{grad_norm:.3f}",
+                        "lr": f"{current_lr:.1e}",
+                    })
+
+                # ---- Intra-epoch checkpoint ------------------------------
+                if global_step % args.save_every == 0:
+                    ckpt_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
+                    save_checkpoint(ckpt_path, model, optimizer, scheduler, epoch, global_step)
+                    progress_write(f"  Checkpoint saved: {ckpt_path}", pbar)
+                    import glob as _glob
+                    step_ckpts = sorted(_glob.glob(os.path.join(args.out_dir, "step_*.pt")))
+                    for old in step_ckpts[:-3]:
+                        os.remove(old)
 
         # ---- End of epoch --------------------------------------------
         scheduler.step()
