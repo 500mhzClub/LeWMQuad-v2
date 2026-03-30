@@ -270,6 +270,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene_attempts", type=int, default=64, help="Maximum retries to find a valid nontrivial scene.")
     parser.add_argument("--min_obstacles", type=int, default=4, help="Reject generated scenes with fewer obstacles.")
     parser.add_argument(
+        "--spawn_range",
+        type=float,
+        default=2.0,
+        help="Sample spawn positions within +/- this XY range, matching the sibling maze eval.",
+    )
+    parser.add_argument(
+        "--spawn_clearance",
+        type=float,
+        default=0.20,
+        help="Spawn collision margin. Lower than the old open-space bias so corridor spawns are allowed.",
+    )
+    parser.add_argument(
+        "--max_spawn_clearance",
+        type=float,
+        default=0.75,
+        help="Prefer spawn points near maze walls/corridors instead of large open floor when possible.",
+    )
+    parser.add_argument(
         "--min_spawn_beacon_range",
         type=float,
         default=1.2,
@@ -504,16 +522,16 @@ def choose_spawn_pose(
     beacon_layout: BeaconLayout,
     safe_clearance: float,
     arena_half: float,
+    spawn_range: float,
+    max_spawn_clearance: float,
     min_spawn_beacon_range: float,
     allow_visible_start: bool,
     fov_deg: float,
     rng: np.random.RandomState,
     n_candidates: int = 4096,
 ) -> tuple[np.ndarray | None, float | None, dict[str, Any]]:
-    span = max(0.5, float(arena_half) - 0.25)
+    span = min(max(0.5, float(spawn_range)), max(0.5, float(arena_half) - 0.25))
     candidates = rng.uniform(-span, span, size=(n_candidates, 2)).astype(np.float32)
-    origin = np.zeros((1, 2), dtype=np.float32)
-    candidates = np.concatenate([origin, candidates], axis=0)
 
     cand_t = torch.from_numpy(candidates)
     safe_mask = ~detect_collisions(cand_t, obstacle_layout, margin=safe_clearance)
@@ -522,6 +540,10 @@ def choose_spawn_pose(
 
     safe_xy = candidates[safe_mask.cpu().numpy()]
     clearance = compute_clearance(safe_xy, obstacle_layout)
+    maze_like = clearance <= float(max_spawn_clearance)
+    if np.any(maze_like):
+        safe_xy = safe_xy[maze_like]
+        clearance = clearance[maze_like]
 
     if beacon_layout.beacons:
         beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
@@ -560,25 +582,40 @@ def choose_spawn_pose(
                 return None, None, {}
             safe_xy = safe_xy[hidden]
             clearance = clearance[hidden]
+            nearest_idx = nearest_idx[hidden]
             nearest_dist = nearest_dist[hidden]
             yaw = yaw[hidden]
             visible = visible[hidden]
 
-        score = nearest_dist + 0.25 * clearance
+        nearest_beacon_xy = beacon_xy[nearest_idx]
+        maze_core = beacon_xy.mean(axis=0)
+        dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
+        target_beacon_range = float(min_spawn_beacon_range) + 0.6
+        score = (
+            -np.abs(nearest_dist - target_beacon_range)
+            - 0.50 * np.abs(clearance - 0.30)
+            - 0.35 * dist_to_core
+        )
         best = int(np.argmax(score))
         return safe_xy[best], float(yaw[best]), {
             "spawn_beacon_range": float(nearest_dist[best]),
             "spawn_clearance": float(clearance[best]),
             "spawn_beacon_visible": bool(visible[best]),
+            "spawn_dist_to_maze_core": float(dist_to_core[best]),
+            "spawn_nearest_beacon_xy": [float(nearest_beacon_xy[best, 0]), float(nearest_beacon_xy[best, 1])],
         }
 
-    score = clearance
+    obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
+    maze_core = obstacle_xy.mean(axis=0) if obstacle_xy.size else np.zeros(2, dtype=np.float32)
+    dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
+    score = -np.abs(clearance - 0.30) - 0.35 * dist_to_core
     best = int(np.argmax(score))
     yaw = float(rng.uniform(-math.pi, math.pi))
     return safe_xy[best], yaw, {
         "spawn_beacon_range": float("inf"),
         "spawn_clearance": float(clearance[best]),
         "spawn_beacon_visible": False,
+        "spawn_dist_to_maze_core": float(dist_to_core[best]),
     }
 
 
@@ -604,8 +641,10 @@ def generate_scene_with_spawn(
         spawn_xy, spawn_yaw, spawn_meta = choose_spawn_pose(
             obstacle_layout=obstacle_layout,
             beacon_layout=beacon_layout,
-            safe_clearance=RobotSimConfig().safe_clearance,
+            safe_clearance=float(args.spawn_clearance),
             arena_half=args.arena_half,
+            spawn_range=args.spawn_range,
+            max_spawn_clearance=args.max_spawn_clearance,
             min_spawn_beacon_range=args.min_spawn_beacon_range,
             allow_visible_start=args.allow_visible_start,
             fov_deg=camera_cfg.fov_deg,
