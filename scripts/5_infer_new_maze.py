@@ -301,6 +301,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=240, help="Maximum executed planning steps.")
     parser.add_argument("--success_range", type=float, default=0.40, help="Stop when target beacon is this close.")
     parser.add_argument(
+        "--terminate_on_collision",
+        action="store_true",
+        help="Stop the rollout on first collision. Default is to keep going and replan.",
+    )
+    parser.add_argument(
         "--beacon_view_dist",
         type=float,
         default=0.5,
@@ -1370,6 +1375,7 @@ def main() -> None:
     target_beacon_id: int | None = None
     z_breadcrumb: torch.Tensor | None = None
     visited_proj_history: list[torch.Tensor] = []
+    collision_count = 0
     terminate_reason = "max_steps"
 
     t0 = time.time()
@@ -1615,9 +1621,18 @@ def main() -> None:
                 print(f"Step {step:03d} | terminating after fall")
                 break
             if collided:
-                terminate_reason = "collision"
-                print(f"Step {step:03d} | terminating after collision")
-                break
+                collision_count += 1
+                planner.reset()
+                last_nominal_cmd.zero_()
+                runtime.latency_buffer.zero_()
+                if args.terminate_on_collision:
+                    terminate_reason = "collision"
+                    print(f"Step {step:03d} | terminating after collision")
+                    break
+                print(
+                    f"Step {step:03d} | collision detected, clearing planner state and continuing "
+                    f"(count={collision_count})"
+                )
     finally:
         try:
             import genesis as gs
@@ -1663,6 +1678,8 @@ def main() -> None:
         "forward_reward_weight": args.forward_reward_weight,
         "novelty_weight": args.novelty_weight,
         "visible_beacon_assist_weight": args.visible_beacon_assist_weight,
+        "terminate_on_collision": bool(args.terminate_on_collision),
+        "collision_count": int(collision_count),
         "beacon_view_dist": args.beacon_view_dist,
         "beacon_n_views": int(args.beacon_n_views),
         "path_xy": path_xy,
