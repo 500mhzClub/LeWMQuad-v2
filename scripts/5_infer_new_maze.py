@@ -532,6 +532,14 @@ def choose_spawn_pose(
 ) -> tuple[np.ndarray | None, float | None, dict[str, Any]]:
     span = min(max(0.5, float(spawn_range)), max(0.5, float(arena_half) - 0.25))
     candidates = rng.uniform(-span, span, size=(n_candidates, 2)).astype(np.float32)
+    specials = [np.zeros((1, 2), dtype=np.float32)]
+    if obstacle_layout.obstacles:
+        obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
+        specials.append(obstacle_xy.mean(axis=0, keepdims=True).astype(np.float32))
+    if beacon_layout.beacons:
+        beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
+        specials.append(beacon_xy.mean(axis=0, keepdims=True).astype(np.float32))
+    candidates = np.concatenate([*specials, candidates], axis=0)
 
     cand_t = torch.from_numpy(candidates)
     safe_mask = ~detect_collisions(cand_t, obstacle_layout, margin=safe_clearance)
@@ -544,6 +552,15 @@ def choose_spawn_pose(
     if np.any(maze_like):
         safe_xy = safe_xy[maze_like]
         clearance = clearance[maze_like]
+
+    if obstacle_layout.obstacles:
+        obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
+        maze_core = obstacle_xy.mean(axis=0)
+    elif beacon_layout.beacons:
+        beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
+        maze_core = beacon_xy.mean(axis=0)
+    else:
+        maze_core = np.zeros(2, dtype=np.float32)
 
     if beacon_layout.beacons:
         beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
@@ -588,13 +605,13 @@ def choose_spawn_pose(
             visible = visible[hidden]
 
         nearest_beacon_xy = beacon_xy[nearest_idx]
-        maze_core = beacon_xy.mean(axis=0)
         dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
-        target_beacon_range = float(min_spawn_beacon_range) + 0.6
+        target_clearance = min(float(max_spawn_clearance), 0.30)
+        target_beacon_range = max(float(min_spawn_beacon_range), 1.4)
         score = (
-            -np.abs(nearest_dist - target_beacon_range)
-            - 0.50 * np.abs(clearance - 0.30)
-            - 0.35 * dist_to_core
+            -1.25 * dist_to_core
+            -0.80 * np.abs(clearance - target_clearance)
+            -0.20 * np.abs(nearest_dist - target_beacon_range)
         )
         best = int(np.argmax(score))
         return safe_xy[best], float(yaw[best]), {
@@ -605,10 +622,9 @@ def choose_spawn_pose(
             "spawn_nearest_beacon_xy": [float(nearest_beacon_xy[best, 0]), float(nearest_beacon_xy[best, 1])],
         }
 
-    obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
-    maze_core = obstacle_xy.mean(axis=0) if obstacle_xy.size else np.zeros(2, dtype=np.float32)
     dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
-    score = -np.abs(clearance - 0.30) - 0.35 * dist_to_core
+    target_clearance = min(float(max_spawn_clearance), 0.30)
+    score = -1.25 * dist_to_core - 0.80 * np.abs(clearance - target_clearance)
     best = int(np.argmax(score))
     yaw = float(rng.uniform(-math.pi, math.pi))
     return safe_xy[best], yaw, {
