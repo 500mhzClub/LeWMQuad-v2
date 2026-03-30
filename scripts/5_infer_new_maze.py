@@ -560,7 +560,7 @@ def render_egocentric_frame(
     rgb = render_out[0]
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
-    return np.asarray(rgb, dtype=np.uint8), pos_np, quat_np
+    return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)), pos_np, quat_np
 
 
 def render_third_person_frame(
@@ -598,7 +598,7 @@ def render_third_person_frame(
     rgb = render_out[0]
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
-    return np.asarray(rgb, dtype=np.uint8)
+    return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
 
 
 @torch.no_grad()
@@ -635,7 +635,8 @@ def observe(
         fov_deg=camera_cfg.fov_deg,
     )
 
-    frame_chw = np.transpose(frame_hwc, (2, 0, 1))
+    frame_hwc = np.ascontiguousarray(frame_hwc)
+    frame_chw = np.ascontiguousarray(np.transpose(frame_hwc, (2, 0, 1)))
     vision = torch.from_numpy(frame_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
     proprio_enc = None
     if world_model.encoder.use_proprio:
