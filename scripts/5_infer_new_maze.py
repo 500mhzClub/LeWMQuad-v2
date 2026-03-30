@@ -47,7 +47,7 @@ from lewm.camera_utils import (
 )
 from lewm.checkpoint_utils import clean_state_dict, load_ppo_checkpoint
 from lewm.genesis_utils import init_genesis_once, to_numpy
-from lewm.label_utils import compute_beacon_labels
+from lewm.label_utils import compute_beacon_labels, compute_clearance
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import MAZE_STYLES, generate_composite_scene
 from lewm.models import (
@@ -266,6 +266,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_distractors", type=int, default=0, help="Number of distractor patches.")
     parser.add_argument("--n_free_obstacles", type=int, default=0, help="Additional free obstacles.")
     parser.add_argument("--arena_half", type=float, default=3.0, help="Arena half-extent.")
+    parser.add_argument("--scene_attempts", type=int, default=64, help="Maximum retries to find a valid nontrivial scene.")
+    parser.add_argument("--min_obstacles", type=int, default=4, help="Reject generated scenes with fewer obstacles.")
+    parser.add_argument(
+        "--min_spawn_beacon_range",
+        type=float,
+        default=1.2,
+        help="Require the chosen spawn to be at least this far from the nearest beacon.",
+    )
+    parser.add_argument(
+        "--allow_visible_start",
+        action="store_true",
+        help="Allow the beacon to be visible at the initial spawn. Default is hidden-start exploration.",
+    )
     parser.add_argument("--steps", type=int, default=120, help="Maximum executed planning steps.")
     parser.add_argument("--success_range", type=float, default=0.40, help="Stop when target beacon is this close.")
     parser.add_argument("--show_viewer", action="store_true", help="Open the Genesis viewer.")
@@ -471,6 +484,132 @@ def sample_spawn_xy(
 
     dists = np.linalg.norm(candidates[safe_ids], axis=1)
     return candidates[safe_ids[int(np.argmin(dists))]]
+
+
+def choose_spawn_pose(
+    obstacle_layout,
+    beacon_layout: BeaconLayout,
+    safe_clearance: float,
+    arena_half: float,
+    min_spawn_beacon_range: float,
+    allow_visible_start: bool,
+    fov_deg: float,
+    rng: np.random.RandomState,
+    n_candidates: int = 4096,
+) -> tuple[np.ndarray | None, float | None, dict[str, Any]]:
+    span = max(0.5, float(arena_half) - 0.25)
+    candidates = rng.uniform(-span, span, size=(n_candidates, 2)).astype(np.float32)
+    origin = np.zeros((1, 2), dtype=np.float32)
+    candidates = np.concatenate([origin, candidates], axis=0)
+
+    cand_t = torch.from_numpy(candidates)
+    safe_mask = ~detect_collisions(cand_t, obstacle_layout, margin=safe_clearance)
+    if not bool(safe_mask.any().item()):
+        return None, None, {}
+
+    safe_xy = candidates[safe_mask.cpu().numpy()]
+    clearance = compute_clearance(safe_xy, obstacle_layout)
+
+    if beacon_layout.beacons:
+        beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
+        deltas = beacon_xy[None, :, :] - safe_xy[:, None, :]
+        dists = np.linalg.norm(deltas, axis=-1)
+        nearest_idx = np.argmin(dists, axis=1)
+        nearest_dist = dists[np.arange(dists.shape[0]), nearest_idx]
+        preferred = nearest_dist >= float(min_spawn_beacon_range)
+        if bool(preferred.any()):
+            safe_xy = safe_xy[preferred]
+            clearance = clearance[preferred]
+            nearest_idx = nearest_idx[preferred]
+            nearest_dist = nearest_dist[preferred]
+
+        nearest_beacon_xy = beacon_xy[nearest_idx]
+        if allow_visible_start:
+            yaw = np.arctan2(
+                nearest_beacon_xy[:, 1] - safe_xy[:, 1],
+                nearest_beacon_xy[:, 0] - safe_xy[:, 0],
+            ).astype(np.float32)
+            visible = np.ones(len(safe_xy), dtype=bool)
+        else:
+            yaw = np.arctan2(
+                safe_xy[:, 1] - nearest_beacon_xy[:, 1],
+                safe_xy[:, 0] - nearest_beacon_xy[:, 0],
+            ).astype(np.float32)
+            labels = compute_beacon_labels(
+                robot_xy=safe_xy,
+                robot_yaw=yaw,
+                beacon_layout=beacon_layout,
+                fov_deg=fov_deg,
+            )
+            visible = np.asarray(labels["beacon_visible"], dtype=bool)
+            hidden = ~visible
+            if not np.any(hidden):
+                return None, None, {}
+            safe_xy = safe_xy[hidden]
+            clearance = clearance[hidden]
+            nearest_dist = nearest_dist[hidden]
+            yaw = yaw[hidden]
+            visible = visible[hidden]
+
+        score = nearest_dist + 0.25 * clearance
+        best = int(np.argmax(score))
+        return safe_xy[best], float(yaw[best]), {
+            "spawn_beacon_range": float(nearest_dist[best]),
+            "spawn_clearance": float(clearance[best]),
+            "spawn_beacon_visible": bool(visible[best]),
+        }
+
+    score = clearance
+    best = int(np.argmax(score))
+    yaw = float(rng.uniform(-math.pi, math.pi))
+    return safe_xy[best], yaw, {
+        "spawn_beacon_range": float("inf"),
+        "spawn_clearance": float(clearance[best]),
+        "spawn_beacon_visible": False,
+    }
+
+
+def generate_scene_with_spawn(
+    args: argparse.Namespace,
+    camera_cfg,
+    rng: np.random.RandomState,
+) -> tuple[Any, BeaconLayout, int, np.ndarray, float, dict[str, Any]]:
+    for attempt in range(max(1, int(args.scene_attempts))):
+        scene_seed = int(args.seed + 1009 * attempt)
+        maze_style = None if args.maze_style == "random" else args.maze_style
+        obstacle_layout, beacon_layout = generate_composite_scene(
+            seed=scene_seed,
+            maze_style=maze_style,
+            n_free_obstacles=args.n_free_obstacles,
+            n_beacons=args.n_beacons,
+            n_distractors=args.n_distractors,
+            arena_half=args.arena_half,
+        )
+        if len(obstacle_layout.obstacles) < int(args.min_obstacles):
+            continue
+
+        spawn_xy, spawn_yaw, spawn_meta = choose_spawn_pose(
+            obstacle_layout=obstacle_layout,
+            beacon_layout=beacon_layout,
+            safe_clearance=RobotSimConfig().safe_clearance,
+            arena_half=args.arena_half,
+            min_spawn_beacon_range=args.min_spawn_beacon_range,
+            allow_visible_start=args.allow_visible_start,
+            fov_deg=camera_cfg.fov_deg,
+            rng=rng,
+        )
+        if spawn_xy is None or spawn_yaw is None:
+            continue
+
+        spawn_meta = dict(spawn_meta)
+        spawn_meta["scene_seed"] = scene_seed
+        spawn_meta["scene_attempt"] = attempt
+        return obstacle_layout, beacon_layout, scene_seed, spawn_xy, spawn_yaw, spawn_meta
+
+    raise RuntimeError(
+        "Failed to generate a nontrivial scene that satisfies the spawn constraints. "
+        "Try lowering --min_obstacles, lowering --min_spawn_beacon_range, or passing --allow_visible_start."
+    )
 
 
 def spawn_heading(spawn_xy: np.ndarray, obstacle_layout, beacon_layout: BeaconLayout) -> float:
@@ -1016,14 +1155,10 @@ def main() -> None:
         raise RuntimeError("Latent-dimension mismatch between world model and trajectory scorer")
 
     camera_cfg = ego_camera_config_from_args(args)
-    maze_style = None if args.maze_style == "random" else args.maze_style
-    obstacle_layout, beacon_layout = generate_composite_scene(
-        seed=args.seed,
-        maze_style=maze_style,
-        n_free_obstacles=args.n_free_obstacles,
-        n_beacons=args.n_beacons,
-        n_distractors=args.n_distractors,
-        arena_half=args.arena_half,
+    obstacle_layout, beacon_layout, scene_seed, spawn_xy, spawn_yaw, spawn_meta = generate_scene_with_spawn(
+        args=args,
+        camera_cfg=camera_cfg,
+        rng=rng,
     )
     video_formats = resolve_video_formats(args.video_format)
     cmd_low_t = torch.tensor(args.cmd_low, dtype=torch.float32, device=planning_device)
@@ -1084,8 +1219,15 @@ def main() -> None:
             f"visible_beacon_assist={args.visible_beacon_assist_weight:.3f}"
         )
         print(
-            f"Scene: maze_style={args.maze_style} obstacles={len(obstacle_layout.obstacles)} "
+            f"Scene: maze_style={args.maze_style} scene_seed={scene_seed} "
+            f"obstacles={len(obstacle_layout.obstacles)} "
             f"beacons={len(beacon_layout.beacons)} distractors={len(beacon_layout.distractors)}"
+        )
+        print(
+            f"Spawn: pos=({float(spawn_xy[0]):+.2f}, {float(spawn_xy[1]):+.2f}) "
+            f"yaw={math.degrees(float(spawn_yaw)):+.1f}deg "
+            f"beacon_range={spawn_meta['spawn_beacon_range']:.2f} "
+            f"beacon_visible={spawn_meta['spawn_beacon_visible']}"
         )
         print(f"Video export: {','.join(video_formats)} @ {args.video_fps} fps")
         print(
@@ -1117,8 +1259,6 @@ def main() -> None:
             fov=args.third_person_fov,
             near=0.01,
         )
-        spawn_xy = sample_spawn_xy(obstacle_layout, sim_cfg.safe_clearance, rng)
-        spawn_yaw = spawn_heading(spawn_xy, obstacle_layout, beacon_layout)
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
         runtime = RuntimeState(
@@ -1291,16 +1431,23 @@ def main() -> None:
 
     summary = {
         "seed": int(args.seed),
+        "scene_seed": int(scene_seed),
         "maze_style": args.maze_style,
         "n_obstacles": int(len(obstacle_layout.obstacles)),
         "n_beacons": int(len(beacon_layout.beacons)),
         "n_distractors": int(len(beacon_layout.distractors)),
+        "min_obstacles": int(args.min_obstacles),
+        "min_spawn_beacon_range": float(args.min_spawn_beacon_range),
+        "allow_visible_start": bool(args.allow_visible_start),
         "terminate_reason": terminate_reason,
         "elapsed_sec": elapsed,
         "steps_executed": len(nominal_cmds),
         "breadcrumb_step": breadcrumb_step,
         "target_beacon_id": target_beacon_id,
         "target_beacon_name": pretty_beacon(target_beacon_id if target_beacon_id is not None else -1),
+        "spawn_xy": [float(spawn_xy[0]), float(spawn_xy[1])],
+        "spawn_yaw_rad": float(spawn_yaw),
+        "spawn_meta": spawn_meta,
         "ego_render_urdf": EGO_RENDER_URDF_PATH,
         "third_person_render_urdf": THIRD_PERSON_URDF_PATH,
         "video_format": args.video_format,
