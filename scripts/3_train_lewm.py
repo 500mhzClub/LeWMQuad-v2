@@ -152,7 +152,8 @@ def train(args: argparse.Namespace) -> None:
         batch_size=None,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=4,
+        persistent_workers=True,
     )
 
     # ---- Model -------------------------------------------------------

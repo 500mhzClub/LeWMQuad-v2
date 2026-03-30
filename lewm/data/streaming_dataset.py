@@ -134,13 +134,33 @@ class StreamingJEPADataset(IterableDataset):
         worker_sizes = [len(range(w, n, self._num_workers)) for w in range(self._num_workers)]
         return sum(math.ceil(s / self.batch_size) for s in worker_sizes)
 
+    @staticmethod
+    def _group_and_shuffle(indices, rng):
+        """Group indices by (file, env) so reads within a group hit the same
+        HDF5 chunk (avoiding repeated gzip decompression), then shuffle the
+        group order for epoch-level randomness.  Indices within each group are
+        kept in ascending t0 order for sequential reads."""
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for fpath, e, t0 in indices:
+            groups[(fpath, e)].append((fpath, e, t0))
+        # Sort within each group by t0 for sequential access
+        group_list = [sorted(v, key=lambda x: x[2]) for v in groups.values()]
+        rng.shuffle(group_list)
+        # Flatten back
+        out = []
+        for g in group_list:
+            out.extend(g)
+        return out
+
     def __iter__(self) -> Iterator:
         info = torch.utils.data.get_worker_info()
 
-        # Shuffle the full index list each epoch
+        # Group by (file, env) then shuffle groups — avoids re-decompressing
+        # the same gzip HDF5 chunk for every random 4-frame read.
         rng = np.random.RandomState()
         indices = list(self._all_indices)
-        rng.shuffle(indices)
+        indices = self._group_and_shuffle(indices, rng)
 
         # Shard by worker index (stride pattern keeps batches balanced)
         if info is not None:
