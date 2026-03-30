@@ -177,6 +177,7 @@ class CEMPlanner:
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None = None,
         last_cmd: torch.Tensor | None = None,
+        queued_cmd: torch.Tensor | None = None,
         visited_proj: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, PlanningStats]:
         mean = self._initial_mean(last_cmd)
@@ -201,8 +202,19 @@ class CEMPlanner:
             samples = samples.clamp(self.cmd_low.view(1, 1, 3), self.cmd_high.view(1, 1, 3))
             samples[0] = mean
 
-            z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
-            costs = self.scorer.score(z_rollouts, z_goal_batch)
+            if queued_cmd is not None:
+                queued = queued_cmd.to(device=self.device, dtype=torch.float32).reshape(1, 1, 3)
+                queued = queued.expand(self.n_candidates, -1, -1)
+                rollout_cmds = torch.cat([queued, samples], dim=1)
+                # The PPO controller executes the previously queued command on the
+                # next physics step. Include that prefix so CEM doesn't assume the
+                # newly sampled command affects the very next latent transition.
+                z_rollouts = self.world_model.plan_rollout(z0_batch, rollout_cmds)
+                scored_rollouts = z_rollouts[:, 1:, :]
+            else:
+                scored_rollouts = self.world_model.plan_rollout(z0_batch, samples)
+
+            costs = self.scorer.score(scored_rollouts, z_goal_batch)
 
             if self.forward_reward_weight > 0.0:
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
@@ -213,7 +225,10 @@ class CEMPlanner:
                     visited_proj.to(device=self.device, dtype=torch.float32),
                     dim=-1,
                 )
-                pred = F.normalize(z_rollouts.reshape(self.n_candidates * self.horizon, -1), dim=-1)
+                pred = F.normalize(
+                    scored_rollouts.reshape(self.n_candidates * self.horizon, -1),
+                    dim=-1,
+                )
                 sim = pred @ visited.transpose(0, 1)
                 novelty = 1.0 - sim.max(dim=1).values
                 novelty_bonus = novelty.reshape(self.n_candidates, self.horizon).sum(dim=-1)
@@ -1509,6 +1524,7 @@ def main() -> None:
         visited_proj_history.append(obs.z_proj.detach().clone())
 
         last_nominal_cmd = torch.zeros(3, device=planning_device, dtype=torch.float32)
+        prev_collided = False
 
         for step in range(args.steps):
             if z_breadcrumb is None and obs.beacon_visible:
@@ -1539,6 +1555,7 @@ def main() -> None:
                 z_start_raw=obs.z_raw,
                 z_goal_proj=z_breadcrumb,
                 last_cmd=last_nominal_cmd,
+                queued_cmd=runtime.latency_buffer[-1, 0].to(planning_device),
                 visited_proj=torch.cat(visited_proj_history[-256:], dim=0),
             )
             nominal_cmd = plan_seq[0]
@@ -1622,17 +1639,18 @@ def main() -> None:
                 break
             if collided:
                 collision_count += 1
-                planner.reset()
-                last_nominal_cmd.zero_()
-                runtime.latency_buffer.zero_()
                 if args.terminate_on_collision:
                     terminate_reason = "collision"
                     print(f"Step {step:03d} | terminating after collision")
                     break
-                print(
-                    f"Step {step:03d} | collision detected, clearing planner state and continuing "
-                    f"(count={collision_count})"
-                )
+                if not prev_collided:
+                    planner.reset()
+                    last_nominal_cmd.zero_()
+                    print(
+                        f"Step {step:03d} | collision detected, clearing planner state and continuing "
+                        f"(count={collision_count})"
+                    )
+            prev_collided = collided
     finally:
         try:
             import genesis as gs
