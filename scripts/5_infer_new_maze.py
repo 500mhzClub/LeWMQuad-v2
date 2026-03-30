@@ -11,7 +11,7 @@ This script:
   4. Replans every step with Cross-Entropy Method over 3D velocity commands
      ``[vx, vy, yaw_rate]``.
   5. Captures a breadcrumb latent the first time a beacon enters the camera FOV.
-  6. Saves egocentric, third-person, side-by-side GIFs, and a top-down trajectory plot.
+  6. Saves egocentric, third-person, side-by-side videos, and a top-down trajectory plot.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ import argparse
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ if REPO_ROOT not in sys.path:
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from lewm.beacon_utils import BEACON_FAMILIES, BeaconLayout
@@ -136,6 +139,8 @@ class CEMPlanner:
         cmd_high: torch.Tensor,
         init_std: torch.Tensor,
         min_std: torch.Tensor,
+        forward_reward_weight: float,
+        novelty_weight: float,
         device: torch.device,
     ):
         self.world_model = world_model
@@ -148,6 +153,8 @@ class CEMPlanner:
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
+        self.forward_reward_weight = float(forward_reward_weight)
+        self.novelty_weight = float(novelty_weight)
         self.device = device
         self._warm_start: torch.Tensor | None = None
 
@@ -169,6 +176,7 @@ class CEMPlanner:
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None = None,
         last_cmd: torch.Tensor | None = None,
+        visited_proj: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, PlanningStats]:
         mean = self._initial_mean(last_cmd)
         std = self.init_std.unsqueeze(0).repeat(self.horizon, 1)
@@ -194,6 +202,21 @@ class CEMPlanner:
 
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = self.scorer.score(z_rollouts, z_goal_batch)
+
+            if self.forward_reward_weight > 0.0:
+                forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
+                costs = costs - self.forward_reward_weight * forward_bonus
+
+            if self.novelty_weight > 0.0 and visited_proj is not None and visited_proj.numel() > 0:
+                visited = F.normalize(
+                    visited_proj.to(device=self.device, dtype=torch.float32),
+                    dim=-1,
+                )
+                pred = F.normalize(z_rollouts.reshape(self.n_candidates * self.horizon, -1), dim=-1)
+                sim = pred @ visited.transpose(0, 1)
+                novelty = 1.0 - sim.max(dim=1).values
+                novelty_bonus = novelty.reshape(self.n_candidates, self.horizon).sum(dim=-1)
+                costs = costs - self.novelty_weight * novelty_bonus
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -252,10 +275,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cem_iters", type=int, default=4, help="CEM refinement iterations.")
     parser.add_argument("--elite_frac", type=float, default=0.125, help="Elite fraction for CEM.")
     parser.add_argument(
+        "--forward_reward_weight",
+        type=float,
+        default=0.35,
+        help="Reward for positive forward command during planning.",
+    )
+    parser.add_argument(
+        "--novelty_weight",
+        type=float,
+        default=0.20,
+        help="Reward for plans that move away from already-visited latent states.",
+    )
+    parser.add_argument(
+        "--visible_beacon_assist_weight",
+        type=float,
+        default=0.75,
+        help="Blend-in weight for a simple drive-toward-visible-beacon controller.",
+    )
+    parser.add_argument(
+        "--visible_beacon_forward_speed",
+        type=float,
+        default=0.35,
+        help="Forward speed target for visible-beacon assist.",
+    )
+    parser.add_argument(
+        "--visible_beacon_yaw_gain",
+        type=float,
+        default=1.75,
+        help="Yaw-rate gain from beacon bearing for visible-beacon assist.",
+    )
+    parser.add_argument(
         "--cmd_low",
         type=float,
         nargs=3,
-        default=(-0.40, -0.25, -1.20),
+        default=(-0.10, -0.25, -1.20),
         metavar=("VX", "VY", "WZ"),
         help="Lower command bounds.",
     )
@@ -284,8 +337,21 @@ def parse_args() -> argparse.Namespace:
         help="Minimum per-dimension CEM std.",
     )
     parser.add_argument("--out_dir", type=str, default=None, help="Output directory for visuals and logs.")
-    parser.add_argument("--gif_stride", type=int, default=1, help="Keep every Nth frame in the GIF.")
-    parser.add_argument("--no_gif", action="store_true", help="Skip GIF exports.")
+    parser.add_argument("--gif_stride", type=int, default=1, help="Keep every Nth frame in the exported video.")
+    parser.add_argument("--no_gif", action="store_true", help="Skip video exports.")
+    parser.add_argument(
+        "--video_format",
+        type=str,
+        default="auto",
+        choices=("auto", "mp4", "gif", "both"),
+        help="Video export format.",
+    )
+    parser.add_argument(
+        "--video_fps",
+        type=int,
+        default=25,
+        help="Export FPS. 25 matches dt=0.01 with decimation=4.",
+    )
     parser.add_argument("--no_topdown", action="store_true", help="Skip top-down trajectory export.")
     parser.add_argument("--third_person_res", type=int, default=384, help="Third-person render resolution.")
     parser.add_argument("--third_person_fov", type=float, default=60.0, help="Third-person camera field of view.")
@@ -783,18 +849,86 @@ def draw_topdown_trajectory(
     img.save(out_path)
 
 
-def save_gif(out_path: str, frames_hwc: list[np.ndarray], stride: int) -> None:
+def encode_mp4(out_path: str, frames_hwc: list[np.ndarray], fps: int) -> None:
+    if not frames_hwc:
+        return
+    height, width = frames_hwc[0].shape[:2]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        out_path,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdin is not None
+    try:
+        for frame in frames_hwc:
+            proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        proc.stdin.close()
+        stderr = proc.stderr.read().decode("utf-8", errors="replace")
+        ret = proc.wait()
+    finally:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    if ret != 0:
+        raise RuntimeError(f"ffmpeg failed for {out_path}:\n{stderr}")
+
+
+def resolve_video_formats(requested: str) -> list[str]:
+    requested = requested.strip().lower()
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+    if requested == "auto":
+        return ["mp4"] if has_ffmpeg else ["gif"]
+    if requested == "mp4":
+        if not has_ffmpeg:
+            raise RuntimeError("ffmpeg not found on PATH; use --video_format gif or install ffmpeg")
+        return ["mp4"]
+    if requested == "gif":
+        return ["gif"]
+    if requested == "both":
+        if not has_ffmpeg:
+            raise RuntimeError("ffmpeg not found on PATH; cannot use --video_format both")
+        return ["mp4", "gif"]
+    raise ValueError(f"Unsupported video format: {requested}")
+
+
+def save_gif(out_path: str, frames_hwc: list[np.ndarray], stride: int, fps: int) -> None:
     keep = max(1, int(stride))
     frames = [Image.fromarray(frame) for frame in frames_hwc[::keep]]
     if not frames:
         return
+    duration_ms = max(1, round(1000 * keep / max(1, fps)))
     frames[0].save(
         out_path,
         save_all=True,
         append_images=frames[1:],
-        duration=100,
+        duration=duration_ms,
         loop=0,
     )
+
+
+def export_video(out_stem: str, frames_hwc: list[np.ndarray], stride: int, fps: int, formats: list[str]) -> None:
+    if not frames_hwc:
+        return
+    kept = [np.ascontiguousarray(frame, dtype=np.uint8) for frame in frames_hwc[:: max(1, int(stride))]]
+    if "mp4" in formats:
+        encode_mp4(f"{out_stem}.mp4", kept, max(1, round(fps / max(1, int(stride)))))
+    if "gif" in formats:
+        save_gif(f"{out_stem}.gif", frames_hwc, stride, fps)
 
 
 def resize_frame(frame_hwc: np.ndarray, target_res: int) -> np.ndarray:
@@ -821,6 +955,32 @@ def pretty_beacon(beacon_id: int) -> str:
     return f"{beacon_id}:{names[beacon_id]}"
 
 
+def apply_visible_beacon_assist(
+    nominal_cmd: torch.Tensor,
+    obs: ObservationBundle,
+    target_beacon_id: int | None,
+    args: argparse.Namespace,
+    cmd_low: torch.Tensor,
+    cmd_high: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        args.visible_beacon_assist_weight <= 0.0
+        or not obs.beacon_visible
+        or target_beacon_id is None
+        or obs.beacon_identity != target_beacon_id
+    ):
+        return nominal_cmd
+
+    w = float(max(0.0, min(1.0, args.visible_beacon_assist_weight)))
+    forward = float(args.visible_beacon_forward_speed) * max(0.0, math.cos(float(obs.beacon_bearing)))
+    yaw = float(obs.beacon_bearing) * float(args.visible_beacon_yaw_gain)
+    yaw = max(float(cmd_low[2].item()), min(float(cmd_high[2].item()), yaw))
+
+    assist = torch.tensor([forward, 0.0, yaw], device=nominal_cmd.device, dtype=nominal_cmd.dtype)
+    blended = (1.0 - w) * nominal_cmd + w * assist
+    return blended.clamp(cmd_low, cmd_high)
+
+
 def main() -> None:
     args = parse_args()
     if args.plan_horizon < 1:
@@ -831,6 +991,8 @@ def main() -> None:
         raise ValueError("--cem_iters must be >= 1")
     if not (0.0 < args.elite_frac <= 1.0):
         raise ValueError("--elite_frac must be in (0, 1]")
+    if args.video_fps < 1:
+        raise ValueError("--video_fps must be >= 1")
     if args.out_dir is None:
         args.out_dir = os.path.join("inference_runs", f"maze_seed_{args.seed:04d}")
     out_dir = Path(args.out_dir)
@@ -863,6 +1025,9 @@ def main() -> None:
         n_distractors=args.n_distractors,
         arena_half=args.arena_half,
     )
+    video_formats = resolve_video_formats(args.video_format)
+    cmd_low_t = torch.tensor(args.cmd_low, dtype=torch.float32, device=planning_device)
+    cmd_high_t = torch.tensor(args.cmd_high, dtype=torch.float32, device=planning_device)
 
     planner = CEMPlanner(
         world_model=world_model,
@@ -871,10 +1036,12 @@ def main() -> None:
         n_candidates=args.n_candidates,
         cem_iters=args.cem_iters,
         elite_frac=args.elite_frac,
-        cmd_low=torch.tensor(args.cmd_low, dtype=torch.float32),
-        cmd_high=torch.tensor(args.cmd_high, dtype=torch.float32),
+        cmd_low=cmd_low_t,
+        cmd_high=cmd_high_t,
         init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
         min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
+        forward_reward_weight=args.forward_reward_weight,
+        novelty_weight=args.novelty_weight,
         device=planning_device,
     )
 
@@ -889,6 +1056,7 @@ def main() -> None:
     breadcrumb_step: int | None = None
     target_beacon_id: int | None = None
     z_breadcrumb: torch.Tensor | None = None
+    visited_proj_history: list[torch.Tensor] = []
     terminate_reason = "max_steps"
 
     t0 = time.time()
@@ -911,9 +1079,15 @@ def main() -> None:
             f"Scorer weights: goal={scorer.goal_weight:.3f} exploration={scorer.exploration_weight:.3f}"
         )
         print(
+            f"Planner extras: forward_reward={args.forward_reward_weight:.3f} "
+            f"novelty_weight={args.novelty_weight:.3f} "
+            f"visible_beacon_assist={args.visible_beacon_assist_weight:.3f}"
+        )
+        print(
             f"Scene: maze_style={args.maze_style} obstacles={len(obstacle_layout.obstacles)} "
             f"beacons={len(beacon_layout.beacons)} distractors={len(beacon_layout.distractors)}"
         )
+        print(f"Video export: {','.join(video_formats)} @ {args.video_fps} fps")
         print(
             f"Egocentric render URDF: {EGO_RENDER_URDF_PATH} "
             f"(matches training: base shell hidden)"
@@ -981,6 +1155,7 @@ def main() -> None:
         third_person_frames_hwc.append(third_person_frame)
         combined_frames_hwc.append(build_side_by_side_frame(obs.frame_hwc, third_person_frame))
         path_xy.append([float(obs.pos_np[0]), float(obs.pos_np[1])])
+        visited_proj_history.append(obs.z_proj.detach().clone())
 
         last_nominal_cmd = torch.zeros(3, device=planning_device, dtype=torch.float32)
 
@@ -1012,8 +1187,17 @@ def main() -> None:
                 z_start_raw=obs.z_raw,
                 z_goal_proj=z_breadcrumb,
                 last_cmd=last_nominal_cmd,
+                visited_proj=torch.cat(visited_proj_history[-256:], dim=0),
             )
             nominal_cmd = plan_seq[0]
+            nominal_cmd = apply_visible_beacon_assist(
+                nominal_cmd=nominal_cmd,
+                obs=obs,
+                target_beacon_id=target_beacon_id,
+                args=args,
+                cmd_low=cmd_low_t,
+                cmd_high=cmd_high_t,
+            )
             last_nominal_cmd = nominal_cmd.detach().clone()
             nominal_cmd_vals = [float(v) for v in nominal_cmd.detach().cpu().tolist()]
 
@@ -1065,6 +1249,7 @@ def main() -> None:
             third_person_frames_hwc.append(third_person_frame)
             combined_frames_hwc.append(build_side_by_side_frame(obs.frame_hwc, third_person_frame))
             path_xy.append([float(obs.pos_np[0]), float(obs.pos_np[1])])
+            visited_proj_history.append(obs.z_proj.detach().clone())
             nominal_cmds.append(nominal_cmd_vals)
             active_cmds.append([float(v) for v in active_cmd[0].detach().cpu().tolist()])
             plan_costs.append(float(plan_stats.best_cost))
@@ -1118,6 +1303,11 @@ def main() -> None:
         "target_beacon_name": pretty_beacon(target_beacon_id if target_beacon_id is not None else -1),
         "ego_render_urdf": EGO_RENDER_URDF_PATH,
         "third_person_render_urdf": THIRD_PERSON_URDF_PATH,
+        "video_format": args.video_format,
+        "video_fps": args.video_fps,
+        "forward_reward_weight": args.forward_reward_weight,
+        "novelty_weight": args.novelty_weight,
+        "visible_beacon_assist_weight": args.visible_beacon_assist_weight,
         "path_xy": path_xy,
         "nominal_cmds": nominal_cmds,
         "active_cmds": active_cmds,
@@ -1136,11 +1326,23 @@ def main() -> None:
         json.dump(summary, f, indent=2)
 
     if not args.no_gif and ego_frames_hwc:
-        save_gif(str(out_dir / "ego_rollout.gif"), ego_frames_hwc, args.gif_stride)
+        export_video(str(out_dir / "ego_rollout"), ego_frames_hwc, args.gif_stride, args.video_fps, video_formats)
     if not args.no_gif and third_person_frames_hwc:
-        save_gif(str(out_dir / "third_person_rollout.gif"), third_person_frames_hwc, args.gif_stride)
+        export_video(
+            str(out_dir / "third_person_rollout"),
+            third_person_frames_hwc,
+            args.gif_stride,
+            args.video_fps,
+            video_formats,
+        )
     if not args.no_gif and combined_frames_hwc:
-        save_gif(str(out_dir / "side_by_side_rollout.gif"), combined_frames_hwc, args.gif_stride)
+        export_video(
+            str(out_dir / "side_by_side_rollout"),
+            combined_frames_hwc,
+            args.gif_stride,
+            args.video_fps,
+            video_formats,
+        )
 
     if not args.no_topdown and path_xy:
         draw_topdown_trajectory(
