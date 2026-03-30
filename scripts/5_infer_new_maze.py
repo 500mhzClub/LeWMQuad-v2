@@ -10,7 +10,7 @@ This script:
      and the trained TrajectoryScorer heads.
   4. Replans every step with Cross-Entropy Method over 3D velocity commands
      ``[vx, vy, yaw_rate]``.
-  5. Captures a breadcrumb latent the first time a beacon enters the camera FOV.
+  5. Pre-encodes hidden breadcrumb latents for the maze beacons before rollout.
   6. Saves egocentric, third-person, side-by-side videos, and a top-down trajectory plot.
 """
 from __future__ import annotations
@@ -82,6 +82,7 @@ EGO_RENDER_URDF_PATH = "assets/mini_pupper/mini_pupper_render.urdf"
 THIRD_PERSON_URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
 ROBOT_SPAWN_Z = 0.12
 MAZE_STYLE_CHOICES = ["random", *MAZE_STYLES]
+BEACON_IDENTITY_NAMES = list(BEACON_FAMILIES.keys())
 
 
 @dataclass(frozen=True)
@@ -264,7 +265,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n_beacons", type=int, default=1, help="Number of maze beacons.")
     parser.add_argument("--n_distractors", type=int, default=0, help="Number of distractor patches.")
-    parser.add_argument("--n_free_obstacles", type=int, default=0, help="Additional free obstacles.")
+    parser.add_argument("--n_free_obstacles", type=int, default=2, help="Additional free obstacles.")
     parser.add_argument("--arena_half", type=float, default=3.0, help="Arena half-extent.")
     parser.add_argument("--scene_attempts", type=int, default=64, help="Maximum retries to find a valid nontrivial scene.")
     parser.add_argument("--min_obstacles", type=int, default=4, help="Reject generated scenes with fewer obstacles.")
@@ -279,8 +280,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow the beacon to be visible at the initial spawn. Default is hidden-start exploration.",
     )
-    parser.add_argument("--steps", type=int, default=120, help="Maximum executed planning steps.")
+    parser.add_argument("--steps", type=int, default=240, help="Maximum executed planning steps.")
     parser.add_argument("--success_range", type=float, default=0.40, help="Stop when target beacon is this close.")
+    parser.add_argument(
+        "--beacon_view_dist",
+        type=float,
+        default=0.5,
+        help="Distance from which to view beacons during hidden breadcrumb pre-encoding.",
+    )
+    parser.add_argument(
+        "--beacon_n_views",
+        type=int,
+        default=4,
+        help="Number of viewpoints per beacon for hidden breadcrumb pre-encoding.",
+    )
     parser.add_argument("--show_viewer", action="store_true", help="Open the Genesis viewer.")
     parser.add_argument("--ppo_obs_noise_std", type=float, default=0.0, help="Optional noise on PPO proprio.")
     parser.add_argument("--plan_horizon", type=int, default=12, help="Number of commands per CEM rollout.")
@@ -572,11 +585,11 @@ def choose_spawn_pose(
 def generate_scene_with_spawn(
     args: argparse.Namespace,
     camera_cfg,
-    rng: np.random.RandomState,
-) -> tuple[Any, BeaconLayout, int, np.ndarray, float, dict[str, Any]]:
+) -> tuple[Any, BeaconLayout, str, int, np.ndarray, float, dict[str, Any]]:
     for attempt in range(max(1, int(args.scene_attempts))):
         scene_seed = int(args.seed + 1009 * attempt)
-        maze_style = None if args.maze_style == "random" else args.maze_style
+        scene_rng = np.random.RandomState(scene_seed)
+        maze_style = str(scene_rng.choice(MAZE_STYLES)) if args.maze_style == "random" else str(args.maze_style)
         obstacle_layout, beacon_layout = generate_composite_scene(
             seed=scene_seed,
             maze_style=maze_style,
@@ -596,7 +609,7 @@ def generate_scene_with_spawn(
             min_spawn_beacon_range=args.min_spawn_beacon_range,
             allow_visible_start=args.allow_visible_start,
             fov_deg=camera_cfg.fov_deg,
-            rng=rng,
+            rng=scene_rng,
         )
         if spawn_xy is None or spawn_yaw is None:
             continue
@@ -604,7 +617,8 @@ def generate_scene_with_spawn(
         spawn_meta = dict(spawn_meta)
         spawn_meta["scene_seed"] = scene_seed
         spawn_meta["scene_attempt"] = attempt
-        return obstacle_layout, beacon_layout, scene_seed, spawn_xy, spawn_yaw, spawn_meta
+        spawn_meta["maze_style"] = maze_style
+        return obstacle_layout, beacon_layout, maze_style, scene_seed, spawn_xy, spawn_yaw, spawn_meta
 
     raise RuntimeError(
         "Failed to generate a nontrivial scene that satisfies the spawn constraints. "
@@ -864,6 +878,111 @@ def observe(
     )
 
 
+@torch.no_grad()
+def pre_encode_beacons(
+    world_model: LeWorldModel,
+    render_scene,
+    render_robot,
+    render_act_dofs,
+    cam,
+    beacon_layout: BeaconLayout,
+    view_dist: float,
+    n_views: int,
+    planning_device: torch.device,
+    q0,
+    gs,
+    torch_mod,
+) -> dict[int, torch.Tensor]:
+    """Render each beacon from multiple viewpoints and average its projected latent."""
+    if world_model.encoder.use_proprio:
+        raise RuntimeError("Hidden beacon pre-encoding requires a visual-only encoder.")
+
+    render_robot.set_pos(
+        torch_mod.tensor([[999.0, 999.0, -10.0]], device=gs.device, dtype=torch_mod.float32),
+        zero_velocity=True,
+    )
+    render_robot.set_quat(
+        torch_mod.tensor([[1.0, 0.0, 0.0, 0.0]], device=gs.device, dtype=torch_mod.float32),
+        zero_velocity=True,
+    )
+    render_robot.set_dofs_position(q0.unsqueeze(0), render_act_dofs)
+    render_robot.set_dofs_velocity(torch_mod.zeros((1, 12), device=gs.device), render_act_dofs)
+    render_scene.step()
+
+    targets: dict[int, torch.Tensor] = {}
+    n_views = max(1, int(n_views))
+    for beacon in beacon_layout.beacons:
+        beacon_id = beacon_name_to_id(beacon.identity)
+        if beacon_id < 0:
+            continue
+
+        bx, by, bz = [float(v) for v in beacon.pos]
+        nx, ny = [float(v) for v in beacon.normal]
+        latents: list[torch.Tensor] = []
+        base_angle = math.atan2(ny, nx) + math.pi
+
+        for view_idx in range(n_views):
+            angle_offset = (view_idx / max(n_views - 1, 1) - 0.5) * math.pi * 0.6
+            view_angle = base_angle + angle_offset
+            cam_pos = np.array(
+                [
+                    bx + float(view_dist) * math.cos(view_angle),
+                    by + float(view_dist) * math.sin(view_angle),
+                    bz + 0.05,
+                ],
+                dtype=np.float32,
+            )
+            cam.set_pose(
+                pos=cam_pos,
+                lookat=np.array([bx, by, bz], dtype=np.float32),
+                up=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            )
+            render_scene.step()
+
+            render_out = cam.render(rgb=True, force_render=True)
+            rgb = render_out[0]
+            if hasattr(rgb, "cpu"):
+                rgb = rgb.cpu().numpy()
+            rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+            rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
+            vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
+            _, z_proj = world_model.encode(vis_t, None)
+            latents.append(z_proj.squeeze(0).detach())
+
+        if latents:
+            targets[beacon_id] = torch.stack(latents, dim=0).mean(dim=0)
+
+    return targets
+
+
+def select_hidden_breadcrumb(
+    beacon_layout: BeaconLayout,
+    beacon_targets: dict[int, torch.Tensor],
+    spawn_xy: np.ndarray,
+) -> tuple[int | None, torch.Tensor | None, list[float] | None, float | None]:
+    """Pick the closest beacon with a pre-encoded latent target."""
+    if not beacon_layout.beacons or not beacon_targets:
+        return None, None, None, None
+
+    spawn_xy = np.asarray(spawn_xy, dtype=np.float32)
+    best: tuple[float, int, torch.Tensor, list[float]] | None = None
+    for beacon in beacon_layout.beacons:
+        beacon_id = beacon_name_to_id(beacon.identity)
+        z_goal = beacon_targets.get(beacon_id)
+        if beacon_id < 0 or z_goal is None:
+            continue
+        beacon_xy = np.asarray(beacon.pos[:2], dtype=np.float32)
+        dist = float(np.linalg.norm(beacon_xy - spawn_xy))
+        target_xy = [float(beacon_xy[0]), float(beacon_xy[1])]
+        candidate = (dist, beacon_id, z_goal.detach().clone(), target_xy)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+
+    if best is None:
+        return None, None, None, None
+    return best[1], best[2], best[3], best[0]
+
+
 def execute_nominal_command(
     scene,
     robot,
@@ -1085,13 +1204,19 @@ def build_side_by_side_frame(first_person_hwc: np.ndarray, third_person_hwc: np.
     return np.concatenate([ego, divider, third_person_hwc], axis=1)
 
 
+def beacon_name_to_id(identity: str) -> int:
+    try:
+        return BEACON_IDENTITY_NAMES.index(identity)
+    except ValueError:
+        return -1
+
+
 def pretty_beacon(beacon_id: int) -> str:
     if beacon_id < 0:
         return "none"
-    names = list(BEACON_FAMILIES.keys())
-    if beacon_id >= len(names):
+    if beacon_id >= len(BEACON_IDENTITY_NAMES):
         return str(beacon_id)
-    return f"{beacon_id}:{names[beacon_id]}"
+    return f"{beacon_id}:{BEACON_IDENTITY_NAMES[beacon_id]}"
 
 
 def apply_visible_beacon_assist(
@@ -1147,18 +1272,15 @@ def main() -> None:
     planning_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    rng = np.random.RandomState(args.seed)
-
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
     scorer, scorer_meta = load_trajectory_scorer(args.scorer_ckpt, planning_device)
     if int(scorer_meta.get("latent_dim", wm_meta["latent_dim"])) != int(wm_meta["latent_dim"]):
         raise RuntimeError("Latent-dimension mismatch between world model and trajectory scorer")
 
     camera_cfg = ego_camera_config_from_args(args)
-    obstacle_layout, beacon_layout, scene_seed, spawn_xy, spawn_yaw, spawn_meta = generate_scene_with_spawn(
+    obstacle_layout, beacon_layout, maze_style, scene_seed, spawn_xy, spawn_yaw, spawn_meta = generate_scene_with_spawn(
         args=args,
         camera_cfg=camera_cfg,
-        rng=rng,
     )
     video_formats = resolve_video_formats(args.video_format)
     cmd_low_t = torch.tensor(args.cmd_low, dtype=torch.float32, device=planning_device)
@@ -1189,6 +1311,7 @@ def main() -> None:
     plan_costs: list[float] = []
     breadcrumb_xy: list[float] | None = None
     breadcrumb_step: int | None = None
+    breadcrumb_source = "none"
     target_beacon_id: int | None = None
     z_breadcrumb: torch.Tensor | None = None
     visited_proj_history: list[torch.Tensor] = []
@@ -1219,7 +1342,7 @@ def main() -> None:
             f"visible_beacon_assist={args.visible_beacon_assist_weight:.3f}"
         )
         print(
-            f"Scene: maze_style={args.maze_style} scene_seed={scene_seed} "
+            f"Scene: maze_style={maze_style} scene_seed={scene_seed} "
             f"obstacles={len(obstacle_layout.obstacles)} "
             f"beacons={len(beacon_layout.beacons)} distractors={len(beacon_layout.distractors)}"
         )
@@ -1260,6 +1383,33 @@ def main() -> None:
             near=0.01,
         )
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
+        beacon_targets = pre_encode_beacons(
+            world_model=world_model,
+            render_scene=ego_scene,
+            render_robot=ego_robot,
+            render_act_dofs=ego_act_dofs,
+            cam=ego_cam,
+            beacon_layout=beacon_layout,
+            view_dist=args.beacon_view_dist,
+            n_views=args.beacon_n_views,
+            planning_device=planning_device,
+            q0=q0,
+            gs=gs,
+            torch_mod=torch,
+        )
+        target_beacon_id, z_breadcrumb, breadcrumb_xy, target_spawn_range = select_hidden_breadcrumb(
+            beacon_layout=beacon_layout,
+            beacon_targets=beacon_targets,
+            spawn_xy=spawn_xy,
+        )
+        if z_breadcrumb is not None:
+            breadcrumb_step = -1
+            breadcrumb_source = "preencoded"
+            print(
+                f"Hidden breadcrumb: target={pretty_beacon(target_beacon_id)} "
+                f"views={args.beacon_n_views} view_dist={args.beacon_view_dist:.2f}m "
+                f"spawn_range={target_spawn_range:.2f}m"
+            )
 
         runtime = RuntimeState(
             prev_action=torch.zeros((1, 12), device=gs.device, dtype=torch.float32),
@@ -1305,6 +1455,7 @@ def main() -> None:
                 target_beacon_id = obs.beacon_identity
                 breadcrumb_xy = [float(obs.pos_np[0]), float(obs.pos_np[1])]
                 breadcrumb_step = step
+                breadcrumb_source = "live_capture"
                 print(
                     f"Step {step:03d} | captured breadcrumb for beacon {pretty_beacon(target_beacon_id)} "
                     f"at range={obs.beacon_range:.3f}m"
@@ -1432,7 +1583,8 @@ def main() -> None:
     summary = {
         "seed": int(args.seed),
         "scene_seed": int(scene_seed),
-        "maze_style": args.maze_style,
+        "maze_style": maze_style,
+        "maze_style_requested": args.maze_style,
         "n_obstacles": int(len(obstacle_layout.obstacles)),
         "n_beacons": int(len(beacon_layout.beacons)),
         "n_distractors": int(len(beacon_layout.distractors)),
@@ -1443,6 +1595,7 @@ def main() -> None:
         "elapsed_sec": elapsed,
         "steps_executed": len(nominal_cmds),
         "breadcrumb_step": breadcrumb_step,
+        "breadcrumb_source": breadcrumb_source,
         "target_beacon_id": target_beacon_id,
         "target_beacon_name": pretty_beacon(target_beacon_id if target_beacon_id is not None else -1),
         "spawn_xy": [float(spawn_xy[0]), float(spawn_xy[1])],
@@ -1455,6 +1608,8 @@ def main() -> None:
         "forward_reward_weight": args.forward_reward_weight,
         "novelty_weight": args.novelty_weight,
         "visible_beacon_assist_weight": args.visible_beacon_assist_weight,
+        "beacon_view_dist": args.beacon_view_dist,
+        "beacon_n_views": int(args.beacon_n_views),
         "path_xy": path_xy,
         "nominal_cmds": nominal_cmds,
         "active_cmds": active_cmds,
