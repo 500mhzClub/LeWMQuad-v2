@@ -566,8 +566,17 @@ def choose_spawn_pose(
     n_candidates: int = 4096,
 ) -> tuple[np.ndarray | None, float | None, dict[str, Any]]:
     span = min(max(0.5, float(spawn_range)), max(0.5, float(arena_half) - 0.25))
-    candidates = rng.uniform(-span, span, size=(n_candidates, 2)).astype(np.float32)
-    specials = [np.zeros((1, 2), dtype=np.float32)]
+    local_span = min(span, 0.9)
+    local_candidates = rng.uniform(-local_span, local_span, size=(max(1, int(0.75 * n_candidates)), 2)).astype(np.float32)
+    global_candidates = rng.uniform(-span, span, size=(max(1, n_candidates - local_candidates.shape[0]), 2)).astype(np.float32)
+    origin_anchor = sample_spawn_xy(
+        obstacle_layout=obstacle_layout,
+        safe_clearance=float(safe_clearance),
+        rng=rng,
+        span=span,
+    )
+    candidates = np.concatenate([origin_anchor[None, :], local_candidates, global_candidates], axis=0)
+    specials = [np.zeros((1, 2), dtype=np.float32), origin_anchor[None, :]]
     if obstacle_layout.obstacles:
         obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
         specials.append(obstacle_xy.mean(axis=0, keepdims=True).astype(np.float32))
@@ -603,12 +612,6 @@ def choose_spawn_pose(
         dists = np.linalg.norm(deltas, axis=-1)
         nearest_idx = np.argmin(dists, axis=1)
         nearest_dist = dists[np.arange(dists.shape[0]), nearest_idx]
-        preferred = nearest_dist >= float(min_spawn_beacon_range)
-        if bool(preferred.any()):
-            safe_xy = safe_xy[preferred]
-            clearance = clearance[preferred]
-            nearest_idx = nearest_idx[preferred]
-            nearest_dist = nearest_dist[preferred]
 
         nearest_beacon_xy = beacon_xy[nearest_idx]
         if allow_visible_start:
@@ -648,14 +651,16 @@ def choose_spawn_pose(
             step_size=0.05,
             collision_margin=max(float(safe_clearance), 0.15),
         ).astype(np.float32)
+        dist_to_origin = np.linalg.norm(safe_xy, axis=1)
         dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
         target_clearance = min(float(max_spawn_clearance), 0.30)
-        target_beacon_range = max(float(min_spawn_beacon_range), 1.4)
         target_traversability = 6.0
+        beacon_too_close = np.maximum(float(min_spawn_beacon_range) - nearest_dist, 0.0)
         score = (
-            -1.25 * dist_to_core
+            -2.50 * dist_to_origin
+            -0.30 * dist_to_core
             -0.80 * np.abs(clearance - target_clearance)
-            -0.20 * np.abs(nearest_dist - target_beacon_range)
+            -0.90 * beacon_too_close
             -0.45 * np.abs(traversability - target_traversability)
         )
         best = int(np.argmax(score))
@@ -664,13 +669,15 @@ def choose_spawn_pose(
             "spawn_clearance": float(clearance[best]),
             "spawn_traversability": float(traversability[best]),
             "spawn_beacon_visible": bool(visible[best]),
+            "spawn_dist_to_origin": float(dist_to_origin[best]),
             "spawn_dist_to_maze_core": float(dist_to_core[best]),
             "spawn_nearest_beacon_xy": [float(nearest_beacon_xy[best, 0]), float(nearest_beacon_xy[best, 1])],
         }
 
     dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
+    dist_to_origin = np.linalg.norm(safe_xy, axis=1)
     target_clearance = min(float(max_spawn_clearance), 0.30)
-    score = -1.25 * dist_to_core - 0.80 * np.abs(clearance - target_clearance)
+    score = -2.50 * dist_to_origin - 0.30 * dist_to_core - 0.80 * np.abs(clearance - target_clearance)
     best = int(np.argmax(score))
     yaw = float(rng.uniform(-math.pi, math.pi))
     traversability = compute_traversability(
@@ -686,6 +693,7 @@ def choose_spawn_pose(
         "spawn_clearance": float(clearance[best]),
         "spawn_traversability": float(traversability[0]),
         "spawn_beacon_visible": False,
+        "spawn_dist_to_origin": float(dist_to_origin[best]),
         "spawn_dist_to_maze_core": float(dist_to_core[best]),
     }
 
@@ -1479,7 +1487,8 @@ def main() -> None:
             f"yaw={math.degrees(float(spawn_yaw)):+.1f}deg "
             f"beacon_range={spawn_meta['spawn_beacon_range']:.2f} "
             f"beacon_visible={spawn_meta['spawn_beacon_visible']} "
-            f"traversability={spawn_meta.get('spawn_traversability', float('nan')):.1f}"
+            f"traversability={spawn_meta.get('spawn_traversability', float('nan')):.1f} "
+            f"origin_dist={spawn_meta.get('spawn_dist_to_origin', float('nan')):.2f}"
         )
         print(f"Video export: {','.join(video_formats)} @ {args.video_fps} fps")
         print(
