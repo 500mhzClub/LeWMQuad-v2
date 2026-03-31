@@ -49,6 +49,178 @@ def _clears_origin(obs: ObstacleSpec, clearance: float) -> bool:
     return (dx * dx + dy * dy) >= clearance * clearance
 
 
+def _point_clearance_xy(point_xy: np.ndarray, obstacles: List[ObstacleSpec]) -> float:
+    """Minimum XY clearance from a point to any obstacle AABB."""
+    px, py = float(point_xy[0]), float(point_xy[1])
+    min_dist = float("inf")
+    for obs in obstacles:
+        cx, cy = obs.pos[0], obs.pos[1]
+        hx, hy = obs.size[0] / 2.0, obs.size[1] / 2.0
+        dx = max(abs(px - cx) - hx, 0.0)
+        dy = max(abs(py - cy) - hy, 0.0)
+        min_dist = min(min_dist, math.sqrt(dx * dx + dy * dy))
+    return min_dist
+
+
+def _wall_candidate_normals(obs: ObstacleSpec) -> List[Tuple[float, float]]:
+    """Two possible outward-facing normals for an axis-aligned wall."""
+    if obs.size[0] < obs.size[1]:
+        return [(1.0, 0.0), (-1.0, 0.0)]
+    return [(0.0, 1.0), (0.0, -1.0)]
+
+
+def _build_free_space_grid(
+    obstacles: List[ObstacleSpec],
+    arena_half: float,
+    clearance_margin: float,
+    resolution: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    xs = np.arange(-arena_half, arena_half + 0.5 * resolution, resolution, dtype=np.float32)
+    ys = np.arange(-arena_half, arena_half + 0.5 * resolution, resolution, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
+    points = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1)
+    min_dist = np.full(points.shape[0], float("inf"), dtype=np.float32)
+
+    for obs in obstacles:
+        cx, cy = obs.pos[0], obs.pos[1]
+        hx, hy = obs.size[0] / 2.0, obs.size[1] / 2.0
+        dx = np.maximum(np.abs(points[:, 0] - cx) - hx, 0.0)
+        dy = np.maximum(np.abs(points[:, 1] - cy) - hy, 0.0)
+        dist = np.sqrt(dx * dx + dy * dy)
+        min_dist = np.minimum(min_dist, dist)
+
+    free = (min_dist >= float(clearance_margin)).reshape(len(ys), len(xs))
+    return xs, ys, free
+
+
+def _nearest_free_cell(
+    free: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    point_xy: np.ndarray,
+    max_search_radius: int = 8,
+) -> Optional[Tuple[int, int]]:
+    ix = int(np.argmin(np.abs(xs - float(point_xy[0]))))
+    iy = int(np.argmin(np.abs(ys - float(point_xy[1]))))
+    if bool(free[iy, ix]):
+        return iy, ix
+
+    h, w = free.shape
+    best_cell: Optional[Tuple[int, int]] = None
+    best_dist = float("inf")
+    for radius in range(1, max_search_radius + 1):
+        y0 = max(0, iy - radius)
+        y1 = min(h, iy + radius + 1)
+        x0 = max(0, ix - radius)
+        x1 = min(w, ix + radius + 1)
+        for cy in range(y0, y1):
+            for cx in range(x0, x1):
+                if not bool(free[cy, cx]):
+                    continue
+                dist = float((xs[cx] - point_xy[0]) ** 2 + (ys[cy] - point_xy[1]) ** 2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_cell = (cy, cx)
+        if best_cell is not None:
+            return best_cell
+    return None
+
+
+def _has_free_path(
+    free: np.ndarray,
+    start_cell: Tuple[int, int],
+    goal_cell: Tuple[int, int],
+) -> bool:
+    if start_cell == goal_cell:
+        return True
+
+    h, w = free.shape
+    visited = np.zeros((h, w), dtype=bool)
+    frontier: List[Tuple[int, int]] = [start_cell]
+    visited[start_cell] = True
+    neighbors = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (-1, 1),
+        (1, -1),
+        (1, 1),
+    ]
+
+    while frontier:
+        next_frontier: List[Tuple[int, int]] = []
+        for cy, cx in frontier:
+            for dy, dx in neighbors:
+                ny = cy + dy
+                nx = cx + dx
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+                if visited[ny, nx] or not bool(free[ny, nx]):
+                    continue
+                if (ny, nx) == goal_cell:
+                    return True
+                visited[ny, nx] = True
+                next_frontier.append((ny, nx))
+        frontier = next_frontier
+
+    return False
+
+
+def _choose_accessible_wall_face(
+    obs: ObstacleSpec,
+    obstacles: List[ObstacleSpec],
+    robot_clearance: float,
+    arena_half: float,
+) -> Tuple[float, float]:
+    """Pick the wall face with the most open free space in front of it."""
+    half_thickness = 0.5 * min(float(obs.size[0]), float(obs.size[1]))
+    clearance_margin = max(0.14, min(float(robot_clearance), 0.15))
+    standoff = max(clearance_margin, 0.05)
+    xs, ys, free = _build_free_space_grid(
+        obstacles=obstacles,
+        arena_half=float(arena_half),
+        clearance_margin=clearance_margin,
+    )
+    start_cell = _nearest_free_cell(
+        free=free,
+        xs=xs,
+        ys=ys,
+        point_xy=np.zeros(2, dtype=np.float32),
+    )
+
+    best_normal = _wall_candidate_normals(obs)[0]
+    best_score = -float("inf")
+    for nx, ny in _wall_candidate_normals(obs):
+        sample_xy = np.asarray(
+            [
+                float(obs.pos[0]) + float(nx) * (half_thickness + standoff),
+                float(obs.pos[1]) + float(ny) * (half_thickness + standoff),
+            ],
+            dtype=np.float32,
+        )
+        clearance = _point_clearance_xy(sample_xy, obstacles)
+        goal_cell = _nearest_free_cell(free=free, xs=xs, ys=ys, point_xy=sample_xy)
+        reachable = (
+            start_cell is not None
+            and goal_cell is not None
+            and _has_free_path(free, start_cell, goal_cell)
+        )
+        # Tie-break toward the side closer to the origin corridor the mazes are
+        # designed around, while still preferring the more open face first.
+        score = (
+            (10.0 if reachable else 0.0)
+            + float(clearance)
+            - 0.10 * float(np.linalg.norm(sample_xy))
+        )
+        if score > best_score:
+            best_score = score
+            best_normal = (float(nx), float(ny))
+
+    return best_normal
+
+
 @dataclass
 class MazeResult:
     """Output of a maze generator: walls + optional beacon placements."""
@@ -549,11 +721,12 @@ def generate_maze(
         for i, wi in enumerate(host_indices):
             w = walls[wi]
             identity = beacon_identities[i % len(beacon_identities)]
-            # Determine wall facing direction from wall shape
-            if w.size[0] < w.size[1]:  # thin in X → faces along X
-                normal = (1.0, 0.0) if w.pos[0] < cx else (-1.0, 0.0)
-            else:  # thin in Y → faces along Y
-                normal = (0.0, 1.0) if w.pos[1] < cy else (0.0, -1.0)
+            normal = _choose_accessible_wall_face(
+                obs=w,
+                obstacles=walls,
+                robot_clearance=float(robot_clearance),
+                arena_half=float(arena_half),
+            )
             b = make_beacon_panel(w.pos, normal, identity, rng)
             beacons.append(b)
 

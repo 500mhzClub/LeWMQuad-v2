@@ -16,6 +16,7 @@ This script:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import os
@@ -368,8 +369,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--visible_beacon_assist_weight",
         type=float,
-        default=0.75,
-        help="Blend-in weight for a simple drive-toward-visible-beacon controller.",
+        default=0.0,
+        help="Optional simulator-label assist for visible beacons. Disabled by default to keep inference perception-only.",
     )
     parser.add_argument(
         "--visible_beacon_forward_speed",
@@ -550,6 +551,146 @@ def sample_spawn_xy(
 
     dists = np.linalg.norm(candidates[safe_ids], axis=1)
     return candidates[safe_ids[int(np.argmin(dists))]]
+
+
+def build_navigation_grid(
+    obstacle_layout,
+    arena_half: float,
+    clearance_margin: float,
+    resolution: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    xs = np.arange(-arena_half, arena_half + 0.5 * resolution, resolution, dtype=np.float32)
+    ys = np.arange(-arena_half, arena_half + 0.5 * resolution, resolution, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
+    points = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1)
+    clearance = compute_clearance(points, obstacle_layout).reshape(len(ys), len(xs))
+    free = clearance >= float(clearance_margin)
+    return xs, ys, free
+
+
+def nearest_free_cell(
+    free: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    point_xy: np.ndarray,
+    max_search_radius: int = 8,
+) -> tuple[int, int] | None:
+    ix = int(np.argmin(np.abs(xs - float(point_xy[0]))))
+    iy = int(np.argmin(np.abs(ys - float(point_xy[1]))))
+    if bool(free[iy, ix]):
+        return iy, ix
+
+    h, w = free.shape
+    best_cell: tuple[int, int] | None = None
+    best_dist = float("inf")
+    for radius in range(1, max_search_radius + 1):
+        y0 = max(0, iy - radius)
+        y1 = min(h, iy + radius + 1)
+        x0 = max(0, ix - radius)
+        x1 = min(w, ix + radius + 1)
+        for cy in range(y0, y1):
+            for cx in range(x0, x1):
+                if not bool(free[cy, cx]):
+                    continue
+                dist = float((xs[cx] - point_xy[0]) ** 2 + (ys[cy] - point_xy[1]) ** 2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_cell = (cy, cx)
+        if best_cell is not None:
+            return best_cell
+    return None
+
+
+def shortest_free_grid_steps(
+    free: np.ndarray,
+    start_cell: tuple[int, int],
+    goal_cell: tuple[int, int],
+) -> int | None:
+    if start_cell == goal_cell:
+        return 0
+
+    h, w = free.shape
+    dist = np.full((h, w), -1, dtype=np.int32)
+    q: deque[tuple[int, int]] = deque([start_cell])
+    dist[start_cell] = 0
+    neighbors = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (-1, 1),
+        (1, -1),
+        (1, 1),
+    ]
+
+    while q:
+        cy, cx = q.popleft()
+        next_dist = int(dist[cy, cx]) + 1
+        for dy, dx in neighbors:
+            ny = cy + dy
+            nx = cx + dx
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+            if dist[ny, nx] >= 0 or not bool(free[ny, nx]):
+                continue
+            if (ny, nx) == goal_cell:
+                return next_dist
+            dist[ny, nx] = next_dist
+            q.append((ny, nx))
+    return None
+
+
+def validate_target_beacon_path(
+    spawn_xy: np.ndarray,
+    obstacle_layout,
+    beacon_layout: BeaconLayout,
+    arena_half: float,
+    success_range: float,
+    clearance_margin: float,
+) -> tuple[bool, dict[str, Any]]:
+    if not beacon_layout.beacons:
+        return True, {}
+
+    beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
+    nearest_idx = int(np.argmin(np.linalg.norm(beacon_xy - spawn_xy[None, :], axis=1)))
+    target_beacon = beacon_layout.beacons[nearest_idx]
+
+    standoff = max(0.10, min(float(clearance_margin), float(success_range) - 0.05))
+    approach_xy = (
+        np.asarray(target_beacon.pos[:2], dtype=np.float32)
+        + np.asarray(target_beacon.normal, dtype=np.float32) * standoff
+    )
+
+    xs, ys, free = build_navigation_grid(
+        obstacle_layout=obstacle_layout,
+        arena_half=float(arena_half),
+        clearance_margin=float(clearance_margin),
+    )
+    start_cell = nearest_free_cell(free, xs, ys, np.asarray(spawn_xy, dtype=np.float32))
+    goal_cell = nearest_free_cell(free, xs, ys, approach_xy)
+    if start_cell is None or goal_cell is None:
+        return False, {
+            "target_beacon_index": nearest_idx,
+            "target_beacon_approach_xy": [float(approach_xy[0]), float(approach_xy[1])],
+            "target_beacon_path_steps": None,
+        }
+
+    path_steps = shortest_free_grid_steps(free, start_cell, goal_cell)
+    if path_steps is None:
+        return False, {
+            "target_beacon_index": nearest_idx,
+            "target_beacon_approach_xy": [float(approach_xy[0]), float(approach_xy[1])],
+            "target_beacon_path_steps": None,
+        }
+
+    resolution = float(xs[1] - xs[0]) if len(xs) > 1 else 0.0
+    return True, {
+        "target_beacon_index": nearest_idx,
+        "target_beacon_approach_xy": [float(approach_xy[0]), float(approach_xy[1])],
+        "target_beacon_path_steps": int(path_steps),
+        "target_beacon_path_length_m": float(path_steps * resolution),
+    }
 
 
 def choose_spawn_pose(
@@ -733,6 +874,20 @@ def generate_scene_with_spawn(
             continue
 
         spawn_meta = dict(spawn_meta)
+        path_ok, path_meta = validate_target_beacon_path(
+            spawn_xy=np.asarray(spawn_xy, dtype=np.float32),
+            obstacle_layout=obstacle_layout,
+            beacon_layout=beacon_layout,
+            arena_half=float(args.arena_half),
+            success_range=float(args.success_range),
+            clearance_margin=max(
+                0.14,
+                min(float(args.spawn_clearance), float(RobotSimConfig.collision_margin)),
+            ),
+        )
+        if not path_ok:
+            continue
+        spawn_meta.update(path_meta)
         spawn_meta["scene_seed"] = scene_seed
         spawn_meta["scene_attempt"] = attempt
         spawn_meta["maze_style"] = maze_style
@@ -1488,7 +1643,8 @@ def main() -> None:
             f"beacon_range={spawn_meta['spawn_beacon_range']:.2f} "
             f"beacon_visible={spawn_meta['spawn_beacon_visible']} "
             f"traversability={spawn_meta.get('spawn_traversability', float('nan')):.1f} "
-            f"origin_dist={spawn_meta.get('spawn_dist_to_origin', float('nan')):.2f}"
+            f"origin_dist={spawn_meta.get('spawn_dist_to_origin', float('nan')):.2f} "
+            f"path_len={spawn_meta.get('target_beacon_path_length_m', float('nan')):.2f}m"
         )
         print(f"Video export: {','.join(video_formats)} @ {args.video_fps} fps")
         print(
