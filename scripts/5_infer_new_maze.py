@@ -113,6 +113,7 @@ class PlanningStats:
 @dataclass
 class ObservationBundle:
     frame_hwc: np.ndarray
+    frame_substituted: bool
     z_raw: torch.Tensor
     z_proj: torch.Tensor
     proprio: torch.Tensor
@@ -830,7 +831,8 @@ def render_egocentric_frame(
     ego_cam,
     obstacle_layout,
     camera_cfg,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    fallback_frame_hwc: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
     pos_np, quat_np = sync_render_robot(physics_robot, physics_act_dofs, ego_robot, ego_act_dofs)
     cam_pos, cam_lookat, cam_up, cam_forward = egocentric_camera_pose(pos_np, quat_np, camera_cfg)
     cam_rot = camera_rotation_matrix(quat_np, camera_cfg.pitch_rad)
@@ -843,8 +845,19 @@ def render_egocentric_frame(
         if retract_dist > 0.0:
             safety = camera_safety_metrics(cam_pos, cam_forward, obstacle_layout, camera_cfg, cam_rot=cam_rot)
         if bool(safety["unsafe"]):
+            if fallback_frame_hwc is not None:
+                print(
+                    "Unsafe egocentric frame after retraction; substituting previous clean frame "
+                    f"at pos=({pos_np[0]:+.2f}, {pos_np[1]:+.2f}) "
+                    f"inside_wall={bool(safety['inside_wall'])} "
+                    f"clearance={float(safety['clearance']):.3f} "
+                    f"frustum_min_hit={float(safety['frustum_min_hit']):.3f}"
+                )
+                fallback = np.ascontiguousarray(np.asarray(fallback_frame_hwc, dtype=np.uint8))
+                return fallback.copy(), pos_np, quat_np, True
             raise RuntimeError(
-                "Camera remained unsafe after retraction. "
+                "Camera remained unsafe after retraction with no fallback frame available. "
+                f"inside_wall={bool(safety['inside_wall'])}, "
                 f"clearance={float(safety['clearance']):.3f}, "
                 f"frustum_min_hit={float(safety['frustum_min_hit']):.3f}"
             )
@@ -854,7 +867,7 @@ def render_egocentric_frame(
     rgb = render_out[0]
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
-    return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)), pos_np, quat_np
+    return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)), pos_np, quat_np, False
 
 
 def render_third_person_frame(
@@ -909,8 +922,9 @@ def observe(
     planning_device: torch.device,
     q0,
     prev_action: torch.Tensor,
+    fallback_frame_hwc: np.ndarray | None = None,
 ) -> ObservationBundle:
-    frame_hwc, pos_np, quat_np = render_egocentric_frame(
+    frame_hwc, pos_np, quat_np, frame_substituted = render_egocentric_frame(
         physics_robot=physics_robot,
         physics_act_dofs=physics_act_dofs,
         ego_robot=ego_robot,
@@ -918,6 +932,7 @@ def observe(
         ego_cam=ego_cam,
         obstacle_layout=obstacle_layout,
         camera_cfg=camera_cfg,
+        fallback_frame_hwc=fallback_frame_hwc,
     )
     proprio, _pos_np_dup, _quat_np_dup = collect_proprio(physics_robot, physics_act_dofs, q0, prev_action)
     yaw_rad = float(quat_to_yaw(quat_np))
@@ -940,6 +955,7 @@ def observe(
 
     return ObservationBundle(
         frame_hwc=frame_hwc,
+        frame_substituted=frame_substituted,
         z_raw=z_raw.detach(),
         z_proj=z_proj.detach(),
         proprio=proprio.detach(),
@@ -1380,6 +1396,8 @@ def main() -> None:
     ego_frames_hwc: list[np.ndarray] = []
     third_person_frames_hwc: list[np.ndarray] = []
     combined_frames_hwc: list[np.ndarray] = []
+    last_clean_ego_frame: np.ndarray | None = None
+    ego_frame_substitutions = 0
     path_xy: list[list[float]] = []
     nominal_cmds: list[list[float]] = []
     active_cmds: list[list[float]] = []
@@ -1505,7 +1523,11 @@ def main() -> None:
             planning_device=planning_device,
             q0=q0,
             prev_action=runtime.prev_action,
+            fallback_frame_hwc=last_clean_ego_frame,
         )
+        if obs.frame_substituted:
+            ego_frame_substitutions += 1
+        last_clean_ego_frame = obs.frame_hwc.copy()
         third_person_frame = render_third_person_frame(
             physics_robot=physics_robot,
             physics_act_dofs=physics_act_dofs,
@@ -1597,7 +1619,15 @@ def main() -> None:
                 planning_device=planning_device,
                 q0=q0,
                 prev_action=runtime.prev_action,
+                fallback_frame_hwc=last_clean_ego_frame,
             )
+            if obs.frame_substituted:
+                ego_frame_substitutions += 1
+                print(
+                    f"Step {step:03d} | substituted egocentric frame to match training-time sanitization "
+                    f"(count={ego_frame_substitutions})"
+                )
+            last_clean_ego_frame = obs.frame_hwc.copy()
             third_person_frame = render_third_person_frame(
                 physics_robot=physics_robot,
                 physics_act_dofs=physics_act_dofs,
@@ -1610,7 +1640,7 @@ def main() -> None:
                 lookahead=args.lookahead,
             )
 
-            pos_xy = torch.tensor([obs.pos_np[:2]], dtype=torch.float32)
+            pos_xy = torch.from_numpy(np.asarray(obs.pos_np[:2], dtype=np.float32)).unsqueeze(0)
             collided = bool(detect_collisions(pos_xy, obstacle_layout, margin=sim_cfg.collision_margin)[0].item())
             fallen = bool(obs.pos_np[2] < sim_cfg.min_z)
 
@@ -1700,6 +1730,7 @@ def main() -> None:
         "collision_count": int(collision_count),
         "beacon_view_dist": args.beacon_view_dist,
         "beacon_n_views": int(args.beacon_n_views),
+        "ego_frame_substitutions": int(ego_frame_substitutions),
         "path_xy": path_xy,
         "nominal_cmds": nominal_cmds,
         "active_cmds": active_cmds,
