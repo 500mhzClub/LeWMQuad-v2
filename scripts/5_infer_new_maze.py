@@ -84,6 +84,16 @@ THIRD_PERSON_URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
 ROBOT_SPAWN_Z = 0.12
 MAZE_STYLE_CHOICES = ["random", *MAZE_STYLES]
 BEACON_IDENTITY_NAMES = list(BEACON_FAMILIES.keys())
+RANDOM_INFERENCE_MAZE_STYLES = [
+    "t_junction",
+    "crossroads",
+    "s_bend",
+    "zigzag",
+    "one_turn",
+    "two_turn",
+    "multi_room",
+    "branching",
+]
 
 
 @dataclass(frozen=True)
@@ -568,6 +578,37 @@ def build_navigation_grid(
     return xs, ys, free
 
 
+def compute_enclosure_score(
+    robot_xy: np.ndarray,
+    obstacle_layout,
+    collision_margin: float,
+    max_radius: float = 0.75,
+    radial_step: float = 0.05,
+    n_directions: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    if robot_xy.shape[0] == 0:
+        return (
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=np.int32),
+        )
+
+    angles = np.linspace(0.0, 2.0 * math.pi, num=n_directions, endpoint=False, dtype=np.float32)
+    radii = np.arange(radial_step, max_radius + 0.5 * radial_step, radial_step, dtype=np.float32)
+    hit_radius = np.full((robot_xy.shape[0], n_directions), float(max_radius + radial_step), dtype=np.float32)
+
+    for dir_idx, ang in enumerate(angles):
+        direction = np.asarray([math.cos(float(ang)), math.sin(float(ang))], dtype=np.float32)
+        for radius in radii:
+            pts = robot_xy + direction[None, :] * float(radius)
+            clearance = compute_clearance(pts, obstacle_layout)
+            newly_hit = (hit_radius[:, dir_idx] > max_radius) & (clearance < float(collision_margin))
+            hit_radius[newly_hit, dir_idx] = float(radius)
+
+    norm = np.clip(1.0 - np.minimum(hit_radius, max_radius) / max_radius, 0.0, 1.0)
+    blocked = (hit_radius <= max_radius).sum(axis=1).astype(np.int32)
+    return norm.mean(axis=1).astype(np.float32), blocked
+
+
 def nearest_free_cell(
     free: np.ndarray,
     xs: np.ndarray,
@@ -599,6 +640,66 @@ def nearest_free_cell(
         if best_cell is not None:
             return best_cell
     return None
+
+
+def select_spawn_headings(
+    robot_xy: np.ndarray,
+    obstacle_layout,
+    beacon_layout: BeaconLayout,
+    allow_visible_start: bool,
+    fov_deg: float,
+    safe_clearance: float,
+    n_headings: int = 12,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if robot_xy.shape[0] == 0:
+        return (
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=bool),
+        )
+
+    headings = np.linspace(-math.pi, math.pi, num=n_headings, endpoint=False, dtype=np.float32)
+    yaw_grid = np.broadcast_to(headings[None, :], (robot_xy.shape[0], n_headings))
+    xy_grid = np.broadcast_to(robot_xy[:, None, :], (robot_xy.shape[0], n_headings, 2))
+    flat_xy = xy_grid.reshape(-1, 2)
+    flat_yaw = yaw_grid.reshape(-1)
+
+    traversability = compute_traversability(
+        robot_xy=flat_xy,
+        robot_yaw=flat_yaw,
+        layout=obstacle_layout,
+        horizon=12,
+        step_size=0.05,
+        collision_margin=max(float(safe_clearance), 0.15),
+    ).reshape(robot_xy.shape[0], n_headings).astype(np.float32)
+
+    if beacon_layout.beacons:
+        labels = compute_beacon_labels(
+            robot_xy=flat_xy,
+            robot_yaw=flat_yaw,
+            beacon_layout=beacon_layout,
+            fov_deg=fov_deg,
+        )
+        visible = np.asarray(labels["beacon_visible"], dtype=bool).reshape(robot_xy.shape[0], n_headings)
+    else:
+        visible = np.zeros((robot_xy.shape[0], n_headings), dtype=bool)
+
+    if allow_visible_start:
+        heading_score = traversability + 2.0 * visible.astype(np.float32)
+    else:
+        heading_score = traversability.copy()
+        heading_score[visible] = -1e9
+
+    best_idx = np.argmax(heading_score, axis=1)
+    best_score = heading_score[np.arange(robot_xy.shape[0]), best_idx]
+    valid = best_score > -1e8
+    best_yaw = headings[best_idx]
+    best_traversability = traversability[np.arange(robot_xy.shape[0]), best_idx]
+    best_visible = visible[np.arange(robot_xy.shape[0]), best_idx]
+
+    if allow_visible_start:
+        return best_yaw.astype(np.float32), best_traversability.astype(np.float32), valid
+    return best_yaw.astype(np.float32), best_traversability.astype(np.float32), valid & (~best_visible)
 
 
 def shortest_free_grid_steps(
@@ -733,10 +834,20 @@ def choose_spawn_pose(
 
     safe_xy = candidates[safe_mask.cpu().numpy()]
     clearance = compute_clearance(safe_xy, obstacle_layout)
+    enclosure, blocked_sectors = compute_enclosure_score(
+        robot_xy=safe_xy,
+        obstacle_layout=obstacle_layout,
+        collision_margin=max(float(safe_clearance), 0.15),
+        max_radius=min(0.90, max(0.55, float(max_spawn_clearance) + 0.15)),
+    )
     maze_like = clearance <= float(max_spawn_clearance)
     if np.any(maze_like):
         safe_xy = safe_xy[maze_like]
         clearance = clearance[maze_like]
+        enclosure = enclosure[maze_like]
+        blocked_sectors = blocked_sectors[maze_like]
+    if safe_xy.shape[0] == 0:
+        return None, None, {}
 
     if obstacle_layout.obstacles:
         obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
@@ -753,37 +864,49 @@ def choose_spawn_pose(
         dists = np.linalg.norm(deltas, axis=-1)
         nearest_idx = np.argmin(dists, axis=1)
         nearest_dist = dists[np.arange(dists.shape[0]), nearest_idx]
-
         nearest_beacon_xy = beacon_xy[nearest_idx]
-        if allow_visible_start:
-            yaw = np.arctan2(
-                nearest_beacon_xy[:, 1] - safe_xy[:, 1],
-                nearest_beacon_xy[:, 0] - safe_xy[:, 0],
-            ).astype(np.float32)
-            visible = np.ones(len(safe_xy), dtype=bool)
-        else:
-            yaw = np.arctan2(
-                safe_xy[:, 1] - nearest_beacon_xy[:, 1],
-                safe_xy[:, 0] - nearest_beacon_xy[:, 0],
-            ).astype(np.float32)
-            labels = compute_beacon_labels(
-                robot_xy=safe_xy,
-                robot_yaw=yaw,
-                beacon_layout=beacon_layout,
-                fov_deg=fov_deg,
-            )
-            visible = np.asarray(labels["beacon_visible"], dtype=bool)
-            hidden = ~visible
-            if not np.any(hidden):
-                return None, None, {}
-            safe_xy = safe_xy[hidden]
-            clearance = clearance[hidden]
-            nearest_idx = nearest_idx[hidden]
-            nearest_dist = nearest_dist[hidden]
-            yaw = yaw[hidden]
-            visible = visible[hidden]
-
+        yaw, heading_traversability, heading_valid = select_spawn_headings(
+            robot_xy=safe_xy,
+            obstacle_layout=obstacle_layout,
+            beacon_layout=beacon_layout,
+            allow_visible_start=allow_visible_start,
+            fov_deg=fov_deg,
+            safe_clearance=float(safe_clearance),
+        )
+        if not np.any(heading_valid):
+            return None, None, {}
+        safe_xy = safe_xy[heading_valid]
+        clearance = clearance[heading_valid]
+        enclosure = enclosure[heading_valid]
+        blocked_sectors = blocked_sectors[heading_valid]
+        nearest_idx = nearest_idx[heading_valid]
+        nearest_dist = nearest_dist[heading_valid]
+        yaw = yaw[heading_valid]
+        heading_traversability = heading_traversability[heading_valid]
         nearest_beacon_xy = beacon_xy[nearest_idx]
+        labels = compute_beacon_labels(
+            robot_xy=safe_xy,
+            robot_yaw=yaw,
+            beacon_layout=beacon_layout,
+            fov_deg=fov_deg,
+        )
+        visible = np.asarray(labels["beacon_visible"], dtype=bool)
+
+        enclosed_mask = (enclosure >= 0.22) & (blocked_sectors >= 2)
+        if np.any(enclosed_mask):
+            safe_xy = safe_xy[enclosed_mask]
+            clearance = clearance[enclosed_mask]
+            enclosure = enclosure[enclosed_mask]
+            blocked_sectors = blocked_sectors[enclosed_mask]
+            nearest_idx = nearest_idx[enclosed_mask]
+            nearest_dist = nearest_dist[enclosed_mask]
+            yaw = yaw[enclosed_mask]
+            heading_traversability = heading_traversability[enclosed_mask]
+            visible = visible[enclosed_mask]
+            nearest_beacon_xy = beacon_xy[nearest_idx]
+        if safe_xy.shape[0] == 0:
+            return None, None, {}
+
         traversability = compute_traversability(
             robot_xy=safe_xy,
             robot_yaw=yaw,
@@ -792,35 +915,62 @@ def choose_spawn_pose(
             step_size=0.05,
             collision_margin=max(float(safe_clearance), 0.15),
         ).astype(np.float32)
-        dist_to_origin = np.linalg.norm(safe_xy, axis=1)
         dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
         target_clearance = min(float(max_spawn_clearance), 0.30)
-        target_traversability = 6.0
+        target_traversability = 7.0
         beacon_too_close = np.maximum(float(min_spawn_beacon_range) - nearest_dist, 0.0)
+        beacon_too_far = np.maximum(nearest_dist - 2.5, 0.0)
         score = (
-            -2.50 * dist_to_origin
-            -0.30 * dist_to_core
-            -0.80 * np.abs(clearance - target_clearance)
+            4.00 * enclosure
+            +0.35 * blocked_sectors.astype(np.float32)
+            -0.20 * dist_to_core
+            -0.55 * np.abs(clearance - target_clearance)
             -0.90 * beacon_too_close
-            -0.45 * np.abs(traversability - target_traversability)
+            -0.40 * beacon_too_far
+            -0.30 * np.abs(traversability - target_traversability)
+            +0.45 * heading_traversability
         )
         best = int(np.argmax(score))
         return safe_xy[best], float(yaw[best]), {
             "spawn_beacon_range": float(nearest_dist[best]),
             "spawn_clearance": float(clearance[best]),
             "spawn_traversability": float(traversability[best]),
+            "spawn_heading_traversability": float(heading_traversability[best]),
+            "spawn_enclosure": float(enclosure[best]),
+            "spawn_blocked_sectors": int(blocked_sectors[best]),
             "spawn_beacon_visible": bool(visible[best]),
-            "spawn_dist_to_origin": float(dist_to_origin[best]),
             "spawn_dist_to_maze_core": float(dist_to_core[best]),
             "spawn_nearest_beacon_xy": [float(nearest_beacon_xy[best, 0]), float(nearest_beacon_xy[best, 1])],
         }
 
     dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
-    dist_to_origin = np.linalg.norm(safe_xy, axis=1)
     target_clearance = min(float(max_spawn_clearance), 0.30)
-    score = -2.50 * dist_to_origin - 0.30 * dist_to_core - 0.80 * np.abs(clearance - target_clearance)
+    yaw_arr, heading_traversability, heading_valid = select_spawn_headings(
+        robot_xy=safe_xy,
+        obstacle_layout=obstacle_layout,
+        beacon_layout=beacon_layout,
+        allow_visible_start=True,
+        fov_deg=fov_deg,
+        safe_clearance=float(safe_clearance),
+    )
+    safe_xy = safe_xy[heading_valid]
+    clearance = clearance[heading_valid]
+    enclosure = enclosure[heading_valid]
+    blocked_sectors = blocked_sectors[heading_valid]
+    dist_to_core = dist_to_core[heading_valid]
+    yaw_arr = yaw_arr[heading_valid]
+    heading_traversability = heading_traversability[heading_valid]
+    if safe_xy.shape[0] == 0:
+        return None, None, {}
+    score = (
+        4.00 * enclosure
+        +0.35 * blocked_sectors.astype(np.float32)
+        -0.20 * dist_to_core
+        -0.55 * np.abs(clearance - target_clearance)
+        +0.45 * heading_traversability
+    )
     best = int(np.argmax(score))
-    yaw = float(rng.uniform(-math.pi, math.pi))
+    yaw = float(yaw_arr[best])
     traversability = compute_traversability(
         robot_xy=safe_xy[[best]],
         robot_yaw=np.asarray([yaw], dtype=np.float32),
@@ -833,8 +983,10 @@ def choose_spawn_pose(
         "spawn_beacon_range": float("inf"),
         "spawn_clearance": float(clearance[best]),
         "spawn_traversability": float(traversability[0]),
+        "spawn_heading_traversability": float(heading_traversability[best]),
+        "spawn_enclosure": float(enclosure[best]),
+        "spawn_blocked_sectors": int(blocked_sectors[best]),
         "spawn_beacon_visible": False,
-        "spawn_dist_to_origin": float(dist_to_origin[best]),
         "spawn_dist_to_maze_core": float(dist_to_core[best]),
     }
 
@@ -846,7 +998,11 @@ def generate_scene_with_spawn(
     for attempt in range(max(1, int(args.scene_attempts))):
         scene_seed = int(args.seed + 1009 * attempt)
         scene_rng = np.random.RandomState(scene_seed)
-        maze_style = str(scene_rng.choice(MAZE_STYLES)) if args.maze_style == "random" else str(args.maze_style)
+        if args.maze_style == "random":
+            style_pool = RANDOM_INFERENCE_MAZE_STYLES if int(args.n_beacons) > 0 else MAZE_STYLES
+            maze_style = str(scene_rng.choice(style_pool))
+        else:
+            maze_style = str(args.maze_style)
         obstacle_layout, beacon_layout = generate_composite_scene(
             seed=scene_seed,
             maze_style=maze_style,
@@ -1643,7 +1799,9 @@ def main() -> None:
             f"beacon_range={spawn_meta['spawn_beacon_range']:.2f} "
             f"beacon_visible={spawn_meta['spawn_beacon_visible']} "
             f"traversability={spawn_meta.get('spawn_traversability', float('nan')):.1f} "
-            f"origin_dist={spawn_meta.get('spawn_dist_to_origin', float('nan')):.2f} "
+            f"heading_traversability={spawn_meta.get('spawn_heading_traversability', float('nan')):.1f} "
+            f"enclosure={spawn_meta.get('spawn_enclosure', float('nan')):.2f} "
+            f"blocked_sectors={spawn_meta.get('spawn_blocked_sectors', -1)} "
             f"path_len={spawn_meta.get('target_beacon_path_length_m', float('nan')):.2f}m"
         )
         print(f"Video export: {','.join(video_formats)} @ {args.video_fps} fps")
