@@ -47,7 +47,7 @@ from lewm.camera_utils import (
 )
 from lewm.checkpoint_utils import clean_state_dict, load_ppo_checkpoint
 from lewm.genesis_utils import init_genesis_once, to_numpy
-from lewm.label_utils import compute_beacon_labels, compute_clearance
+from lewm.label_utils import compute_beacon_labels, compute_clearance, compute_traversability
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import MAZE_STYLES, generate_composite_scene
 from lewm.models import (
@@ -215,11 +215,25 @@ class CEMPlanner:
             else:
                 scored_rollouts = self.world_model.plan_rollout(z0_batch, samples)
 
-            costs = self.scorer.score(scored_rollouts, z_goal_batch)
+            safety_cost = self.scorer.safety_head.score_trajectory(scored_rollouts)
+            costs = safety_cost
+            if self.scorer.goal_head is not None and z_goal_batch is not None:
+                costs = costs + self.scorer.goal_weight * self.scorer.goal_head.score_trajectory(
+                    scored_rollouts, z_goal_batch,
+                )
+            if self.scorer.exploration is not None:
+                bonus = self.scorer.exploration(
+                    scored_rollouts.reshape(self.n_candidates * self.horizon, -1),
+                ).reshape(self.n_candidates, self.horizon)
+                costs = costs - self.scorer.exploration_weight * bonus.sum(dim=-1)
+
+            # Let the learned safety head veto blind forward/exploration bias.
+            safety_mean = safety_cost / float(max(1, self.horizon))
+            bonus_gate = 1.0 / (1.0 + safety_mean.detach())
 
             if self.forward_reward_weight > 0.0:
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
-                costs = costs - self.forward_reward_weight * forward_bonus
+                costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
 
             if self.novelty_weight > 0.0 and visited_proj is not None and visited_proj.numel() > 0:
                 visited = F.normalize(
@@ -233,7 +247,7 @@ class CEMPlanner:
                 sim = pred @ visited.transpose(0, 1)
                 novelty = 1.0 - sim.max(dim=1).values
                 novelty_bonus = novelty.reshape(self.n_candidates, self.horizon).sum(dim=-1)
-                costs = costs - self.novelty_weight * novelty_bonus
+                costs = costs - self.novelty_weight * bonus_gate * novelty_bonus
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -314,7 +328,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow the beacon to be visible at the initial spawn. Default is hidden-start exploration.",
     )
-    parser.add_argument("--steps", type=int, default=240, help="Maximum executed planning steps.")
+    parser.add_argument("--steps", type=int, default=480, help="Maximum executed planning steps.")
     parser.add_argument("--success_range", type=float, default=0.40, help="Stop when target beacon is this close.")
     parser.add_argument(
         "--terminate_on_collision",
@@ -342,13 +356,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--forward_reward_weight",
         type=float,
-        default=0.35,
+        default=0.10,
         help="Reward for positive forward command during planning.",
     )
     parser.add_argument(
         "--novelty_weight",
         type=float,
-        default=0.20,
+        default=0.05,
         help="Reward for plans that move away from already-visited latent states.",
     )
     parser.add_argument(
@@ -626,18 +640,29 @@ def choose_spawn_pose(
             visible = visible[hidden]
 
         nearest_beacon_xy = beacon_xy[nearest_idx]
+        traversability = compute_traversability(
+            robot_xy=safe_xy,
+            robot_yaw=yaw,
+            layout=obstacle_layout,
+            horizon=10,
+            step_size=0.05,
+            collision_margin=max(float(safe_clearance), 0.15),
+        ).astype(np.float32)
         dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
         target_clearance = min(float(max_spawn_clearance), 0.30)
         target_beacon_range = max(float(min_spawn_beacon_range), 1.4)
+        target_traversability = 6.0
         score = (
             -1.25 * dist_to_core
             -0.80 * np.abs(clearance - target_clearance)
             -0.20 * np.abs(nearest_dist - target_beacon_range)
+            -0.45 * np.abs(traversability - target_traversability)
         )
         best = int(np.argmax(score))
         return safe_xy[best], float(yaw[best]), {
             "spawn_beacon_range": float(nearest_dist[best]),
             "spawn_clearance": float(clearance[best]),
+            "spawn_traversability": float(traversability[best]),
             "spawn_beacon_visible": bool(visible[best]),
             "spawn_dist_to_maze_core": float(dist_to_core[best]),
             "spawn_nearest_beacon_xy": [float(nearest_beacon_xy[best, 0]), float(nearest_beacon_xy[best, 1])],
@@ -648,9 +673,18 @@ def choose_spawn_pose(
     score = -1.25 * dist_to_core - 0.80 * np.abs(clearance - target_clearance)
     best = int(np.argmax(score))
     yaw = float(rng.uniform(-math.pi, math.pi))
+    traversability = compute_traversability(
+        robot_xy=safe_xy[[best]],
+        robot_yaw=np.asarray([yaw], dtype=np.float32),
+        layout=obstacle_layout,
+        horizon=10,
+        step_size=0.05,
+        collision_margin=max(float(safe_clearance), 0.15),
+    )
     return safe_xy[best], yaw, {
         "spawn_beacon_range": float("inf"),
         "spawn_clearance": float(clearance[best]),
+        "spawn_traversability": float(traversability[0]),
         "spawn_beacon_visible": False,
         "spawn_dist_to_maze_core": float(dist_to_core[best]),
     }
@@ -1444,7 +1478,8 @@ def main() -> None:
             f"Spawn: pos=({float(spawn_xy[0]):+.2f}, {float(spawn_xy[1]):+.2f}) "
             f"yaw={math.degrees(float(spawn_yaw)):+.1f}deg "
             f"beacon_range={spawn_meta['spawn_beacon_range']:.2f} "
-            f"beacon_visible={spawn_meta['spawn_beacon_visible']}"
+            f"beacon_visible={spawn_meta['spawn_beacon_visible']} "
+            f"traversability={spawn_meta.get('spawn_traversability', float('nan')):.1f}"
         )
         print(f"Video export: {','.join(video_formats)} @ {args.video_fps} fps")
         print(
@@ -1502,7 +1537,7 @@ def main() -> None:
             print(
                 f"Hidden breadcrumb: target={pretty_beacon(target_beacon_id)} "
                 f"views={args.beacon_n_views} view_dist={args.beacon_view_dist:.2f}m "
-                f"spawn_range={target_spawn_range:.2f}m"
+                f"beacon_range={target_spawn_range:.2f}m"
             )
 
         runtime = RuntimeState(
