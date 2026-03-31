@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""Run latent-space planning on a brand-new maze with CEM.
+"""Perception-only maze exploration with CEM planning.
 
-This script:
-  1. Generates a novel maze with beacon panels.
-  2. Builds a Genesis physics scene plus two render scenes:
-     - egocentric render scene with the base shell hidden, matching training.
-     - third-person render scene with the full robot visible.
-  3. Loads the frozen PPO low-level controller, LeWorldModel encoder/predictor,
-     and the trained TrajectoryScorer heads.
-  4. Replans every step with Cross-Entropy Method over 3D velocity commands
-     ``[vx, vy, yaw_rate]``.
-  5. Pre-encodes hidden breadcrumb latents for the maze beacons before rollout.
-  6. Saves egocentric, third-person, side-by-side videos, and a top-down trajectory plot.
+Pure perception — no oracle labels in the planning loop.
+
+Pipeline:
+  1. Generate an enclosed grid maze with hidden beacons.
+  2. Render one front-face view of the target beacon → encode as breadcrumb.
+  3. Spawn robot at the maze start cell.
+  4. Main loop: render ego frame → encode → CEM plan → PPO execute → step.
+  5. Post-loop: oracle evaluation for metrics, export video + trajectory.
 """
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import json
 import math
 import os
@@ -34,11 +30,11 @@ if REPO_ROOT not in sys.path:
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from lewm.beacon_utils import BEACON_FAMILIES, BeaconLayout
 from lewm.camera_utils import (
+    EgoCameraConfig,
     add_egocentric_camera_args,
     camera_rotation_matrix,
     camera_safety_metrics,
@@ -48,9 +44,8 @@ from lewm.camera_utils import (
 )
 from lewm.checkpoint_utils import clean_state_dict, load_ppo_checkpoint
 from lewm.genesis_utils import init_genesis_once, to_numpy
-from lewm.label_utils import compute_beacon_labels, compute_clearance, compute_traversability
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
-from lewm.maze_utils import MAZE_STYLES, generate_composite_scene
+from lewm.maze_utils import generate_enclosed_maze
 from lewm.models import (
     ActorCritic,
     ExplorationBonus,
@@ -66,35 +61,25 @@ if hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("high")
 
 
+# ---- Constants ----------------------------------------------------------- #
+
 JOINTS_ACTUATED = [
     "lf_hip_joint",  "lh_hip_joint",  "rf_hip_joint",  "rh_hip_joint",
     "lf_thigh_joint", "lh_thigh_joint", "rf_thigh_joint", "rh_thigh_joint",
     "lf_calf_joint", "lh_calf_joint", "rf_calf_joint", "rh_calf_joint",
 ]
-
 Q0_VALUES = [
     0.06, 0.06, -0.06, -0.06,
     0.85, 0.85, 0.85, 0.85,
     -1.75, -1.75, -1.75, -1.75,
 ]
-
 PHYSICS_URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
 EGO_RENDER_URDF_PATH = "assets/mini_pupper/mini_pupper_render.urdf"
-THIRD_PERSON_URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
 ROBOT_SPAWN_Z = 0.12
-MAZE_STYLE_CHOICES = ["random", *MAZE_STYLES]
 BEACON_IDENTITY_NAMES = list(BEACON_FAMILIES.keys())
-RANDOM_INFERENCE_MAZE_STYLES = [
-    "t_junction",
-    "crossroads",
-    "s_bend",
-    "zigzag",
-    "one_turn",
-    "two_turn",
-    "multi_room",
-    "branching",
-]
 
+
+# ---- Dataclasses --------------------------------------------------------- #
 
 @dataclass(frozen=True)
 class RobotSimConfig:
@@ -103,14 +88,7 @@ class RobotSimConfig:
     action_scale: float = 0.30
     decimation: int = 4
     collision_margin: float = 0.15
-    safe_clearance: float = 0.40
     min_z: float = 0.04
-
-
-@dataclass
-class RuntimeState:
-    prev_action: torch.Tensor
-    latency_buffer: torch.Tensor
 
 
 @dataclass
@@ -121,24 +99,10 @@ class PlanningStats:
     elite_cost: float
 
 
-@dataclass
-class ObservationBundle:
-    frame_hwc: np.ndarray
-    frame_substituted: bool
-    z_raw: torch.Tensor
-    z_proj: torch.Tensor
-    proprio: torch.Tensor
-    pos_np: np.ndarray
-    quat_np: np.ndarray
-    yaw_rad: float
-    beacon_visible: bool
-    beacon_identity: int
-    beacon_range: float
-    beacon_bearing: float
-
+# ---- CEM planner --------------------------------------------------------- #
 
 class CEMPlanner:
-    """CEM over command sequences in latent space."""
+    """CEM over velocity-command sequences scored in latent space."""
 
     def __init__(
         self,
@@ -152,8 +116,6 @@ class CEMPlanner:
         cmd_high: torch.Tensor,
         init_std: torch.Tensor,
         min_std: torch.Tensor,
-        forward_reward_weight: float,
-        novelty_weight: float,
         device: torch.device,
     ):
         self.world_model = world_model
@@ -166,8 +128,6 @@ class CEMPlanner:
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
-        self.forward_reward_weight = float(forward_reward_weight)
-        self.novelty_weight = float(novelty_weight)
         self.device = device
         self._warm_start: torch.Tensor | None = None
 
@@ -189,8 +149,6 @@ class CEMPlanner:
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None = None,
         last_cmd: torch.Tensor | None = None,
-        queued_cmd: torch.Tensor | None = None,
-        visited_proj: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, PlanningStats]:
         mean = self._initial_mean(last_cmd)
         std = self.init_std.unsqueeze(0).repeat(self.horizon, 1)
@@ -201,8 +159,8 @@ class CEMPlanner:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
             raise ValueError(f"Expected z_start_raw shape (1, D), got {tuple(z0.shape)}")
-
         z0_batch = z0.repeat(self.n_candidates, 1)
+
         z_goal_batch = None
         if z_goal_proj is not None:
             z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).repeat(self.n_candidates, 1)
@@ -212,53 +170,12 @@ class CEMPlanner:
                 self.n_candidates, self.horizon, 3, device=self.device,
             )
             samples = samples.clamp(self.cmd_low.view(1, 1, 3), self.cmd_high.view(1, 1, 3))
-            samples[0] = mean
+            samples[0] = mean  # always evaluate the current mean
 
-            if queued_cmd is not None:
-                queued = queued_cmd.to(device=self.device, dtype=torch.float32).reshape(1, 1, 3)
-                queued = queued.expand(self.n_candidates, -1, -1)
-                rollout_cmds = torch.cat([queued, samples], dim=1)
-                # The PPO controller executes the previously queued command on the
-                # next physics step. Include that prefix so CEM doesn't assume the
-                # newly sampled command affects the very next latent transition.
-                z_rollouts = self.world_model.plan_rollout(z0_batch, rollout_cmds)
-                scored_rollouts = z_rollouts[:, 1:, :]
-            else:
-                scored_rollouts = self.world_model.plan_rollout(z0_batch, samples)
+            z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
 
-            safety_cost = self.scorer.safety_head.score_trajectory(scored_rollouts)
-            costs = safety_cost
-            if self.scorer.goal_head is not None and z_goal_batch is not None:
-                costs = costs + self.scorer.goal_weight * self.scorer.goal_head.score_trajectory(
-                    scored_rollouts, z_goal_batch,
-                )
-            if self.scorer.exploration is not None:
-                bonus = self.scorer.exploration(
-                    scored_rollouts.reshape(self.n_candidates * self.horizon, -1),
-                ).reshape(self.n_candidates, self.horizon)
-                costs = costs - self.scorer.exploration_weight * bonus.sum(dim=-1)
-
-            # Let the learned safety head veto blind forward/exploration bias.
-            safety_mean = safety_cost / float(max(1, self.horizon))
-            bonus_gate = 1.0 / (1.0 + safety_mean.detach())
-
-            if self.forward_reward_weight > 0.0:
-                forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
-                costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
-
-            if self.novelty_weight > 0.0 and visited_proj is not None and visited_proj.numel() > 0:
-                visited = F.normalize(
-                    visited_proj.to(device=self.device, dtype=torch.float32),
-                    dim=-1,
-                )
-                pred = F.normalize(
-                    scored_rollouts.reshape(self.n_candidates * self.horizon, -1),
-                    dim=-1,
-                )
-                sim = pred @ visited.transpose(0, 1)
-                novelty = 1.0 - sim.max(dim=1).values
-                novelty_bonus = novelty.reshape(self.n_candidates, self.horizon).sum(dim=-1)
-                costs = costs - self.novelty_weight * bonus_gate * novelty_bonus
+            # Full TrajectoryScorer: safety + goal + exploration
+            costs = self.scorer.score(z_rollouts, z_goal=z_goal_batch if z_goal_batch is not None else None)
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -269,17 +186,16 @@ class CEMPlanner:
             elite_idx = torch.topk(costs, k=self.n_elite, largest=False).indices
             elite = samples[elite_idx]
             elite_costs = costs[elite_idx]
-
             mean = elite.mean(dim=0)
             std = elite.std(dim=0, unbiased=False).clamp_min(self.min_std)
             elite_mean_cost = float(elite_costs.mean().item())
 
+        # Warm-start: shift sequence forward by one step
         shifted = torch.cat([best_seq[1:], best_seq[-1:].clone()], dim=0)
         self._warm_start = shifted.detach()
 
         if best_costs is None:
             best_costs = torch.tensor([best_cost], device=self.device, dtype=torch.float32)
-
         stats = PlanningStats(
             best_cost=float(best_cost),
             mean_cost=float(best_costs.mean().item()),
@@ -289,169 +205,59 @@ class CEMPlanner:
         return best_seq, stats
 
 
+# ---- Argument parsing ---------------------------------------------------- #
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run CEM planning on a new maze.")
-    parser.add_argument("--ppo_ckpt", type=str, required=True, help="Frozen PPO checkpoint path.")
-    parser.add_argument("--wm_ckpt", type=str, required=True, help="Frozen LeWorldModel checkpoint path.")
-    parser.add_argument("--scorer_ckpt", type=str, required=True, help="TrajectoryScorer checkpoint path.")
-    parser.add_argument("--device", type=str, default="cuda", help="Planning device.")
-    parser.add_argument("--sim_backend", type=str, default="auto", help="Genesis backend.")
-    parser.add_argument("--seed", type=int, default=0, help="Scene and planner RNG seed.")
-    parser.add_argument(
-        "--maze_style",
-        type=str,
-        default="random",
-        choices=MAZE_STYLE_CHOICES,
-        help="Maze style or 'random'.",
-    )
-    parser.add_argument("--n_beacons", type=int, default=1, help="Number of maze beacons.")
-    parser.add_argument("--n_distractors", type=int, default=0, help="Number of distractor patches.")
-    parser.add_argument("--n_free_obstacles", type=int, default=2, help="Additional free obstacles.")
-    parser.add_argument("--arena_half", type=float, default=3.0, help="Arena half-extent.")
-    parser.add_argument("--scene_attempts", type=int, default=64, help="Maximum retries to find a valid nontrivial scene.")
-    parser.add_argument("--min_obstacles", type=int, default=4, help="Reject generated scenes with fewer obstacles.")
-    parser.add_argument(
-        "--spawn_range",
-        type=float,
-        default=2.0,
-        help="Sample spawn positions within +/- this XY range, matching the sibling maze eval.",
-    )
-    parser.add_argument(
-        "--spawn_clearance",
-        type=float,
-        default=0.20,
-        help="Spawn collision margin. Lower than the old open-space bias so corridor spawns are allowed.",
-    )
-    parser.add_argument(
-        "--max_spawn_clearance",
-        type=float,
-        default=0.75,
-        help="Prefer spawn points near maze walls/corridors instead of large open floor when possible.",
-    )
-    parser.add_argument(
-        "--min_spawn_beacon_range",
-        type=float,
-        default=1.2,
-        help="Require the chosen spawn to be at least this far from the nearest beacon.",
-    )
-    parser.add_argument(
-        "--allow_visible_start",
-        action="store_true",
-        help="Allow the beacon to be visible at the initial spawn. Default is hidden-start exploration.",
-    )
-    parser.add_argument("--steps", type=int, default=480, help="Maximum executed planning steps.")
-    parser.add_argument("--success_range", type=float, default=0.40, help="Stop when target beacon is this close.")
-    parser.add_argument(
-        "--terminate_on_collision",
-        action="store_true",
-        help="Stop the rollout on first collision. Default is to keep going and replan.",
-    )
-    parser.add_argument(
-        "--beacon_view_dist",
-        type=float,
-        default=0.5,
-        help="Distance from which to view beacons during hidden breadcrumb pre-encoding.",
-    )
-    parser.add_argument(
-        "--beacon_n_views",
-        type=int,
-        default=4,
-        help="Number of viewpoints per beacon for hidden breadcrumb pre-encoding.",
-    )
-    parser.add_argument("--show_viewer", action="store_true", help="Open the Genesis viewer.")
-    parser.add_argument("--ppo_obs_noise_std", type=float, default=0.0, help="Optional noise on PPO proprio.")
-    parser.add_argument("--plan_horizon", type=int, default=12, help="Number of commands per CEM rollout.")
-    parser.add_argument("--n_candidates", type=int, default=512, help="CEM candidate sequences per iteration.")
-    parser.add_argument("--cem_iters", type=int, default=4, help="CEM refinement iterations.")
-    parser.add_argument("--elite_frac", type=float, default=0.125, help="Elite fraction for CEM.")
-    parser.add_argument(
-        "--forward_reward_weight",
-        type=float,
-        default=0.10,
-        help="Reward for positive forward command during planning.",
-    )
-    parser.add_argument(
-        "--novelty_weight",
-        type=float,
-        default=0.05,
-        help="Reward for plans that move away from already-visited latent states.",
-    )
-    parser.add_argument(
-        "--visible_beacon_assist_weight",
-        type=float,
-        default=0.0,
-        help="Optional simulator-label assist for visible beacons. Disabled by default to keep inference perception-only.",
-    )
-    parser.add_argument(
-        "--visible_beacon_forward_speed",
-        type=float,
-        default=0.35,
-        help="Forward speed target for visible-beacon assist.",
-    )
-    parser.add_argument(
-        "--visible_beacon_yaw_gain",
-        type=float,
-        default=1.75,
-        help="Yaw-rate gain from beacon bearing for visible-beacon assist.",
-    )
-    parser.add_argument(
-        "--cmd_low",
-        type=float,
-        nargs=3,
-        default=(-0.10, -0.25, -1.20),
-        metavar=("VX", "VY", "WZ"),
-        help="Lower command bounds.",
-    )
-    parser.add_argument(
-        "--cmd_high",
-        type=float,
-        nargs=3,
-        default=(0.60, 0.25, 1.20),
-        metavar=("VX", "VY", "WZ"),
-        help="Upper command bounds.",
-    )
-    parser.add_argument(
-        "--cem_init_std",
-        type=float,
-        nargs=3,
-        default=(0.25, 0.12, 0.50),
-        metavar=("VX", "VY", "WZ"),
-        help="Initial CEM sampling std.",
-    )
-    parser.add_argument(
-        "--cem_min_std",
-        type=float,
-        nargs=3,
-        default=(0.05, 0.04, 0.10),
-        metavar=("VX", "VY", "WZ"),
-        help="Minimum per-dimension CEM std.",
-    )
-    parser.add_argument("--out_dir", type=str, default=None, help="Output directory for visuals and logs.")
-    parser.add_argument("--gif_stride", type=int, default=1, help="Keep every Nth frame in the exported video.")
-    parser.add_argument("--no_gif", action="store_true", help="Skip video exports.")
-    parser.add_argument(
-        "--video_format",
-        type=str,
-        default="auto",
-        choices=("auto", "mp4", "gif", "both"),
-        help="Video export format.",
-    )
-    parser.add_argument(
-        "--video_fps",
-        type=int,
-        default=25,
-        help="Export FPS. 25 matches dt=0.01 with decimation=4.",
-    )
-    parser.add_argument("--no_topdown", action="store_true", help="Skip top-down trajectory export.")
-    parser.add_argument("--third_person_res", type=int, default=384, help="Third-person render resolution.")
-    parser.add_argument("--third_person_fov", type=float, default=60.0, help="Third-person camera field of view.")
-    parser.add_argument("--chase_dist", type=float, default=1.0, help="Third-person chase distance.")
-    parser.add_argument("--chase_height", type=float, default=0.55, help="Third-person camera height.")
-    parser.add_argument("--side_offset", type=float, default=0.25, help="Third-person lateral offset.")
-    parser.add_argument("--lookahead", type=float, default=0.20, help="Third-person look-ahead distance.")
+    parser = argparse.ArgumentParser(description="Perception-only maze exploration with CEM planning.")
+    # Checkpoints
+    parser.add_argument("--ppo_ckpt", type=str, required=True)
+    parser.add_argument("--wm_ckpt", type=str, required=True)
+    parser.add_argument("--scorer_ckpt", type=str, required=True)
+    # Maze generation
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--grid_rows", type=int, default=4)
+    parser.add_argument("--grid_cols", type=int, default=4)
+    parser.add_argument("--cell_size", type=float, default=0.55)
+    parser.add_argument("--wall_thickness", type=float, default=0.20)
+    parser.add_argument("--n_beacons", type=int, default=2)
+    parser.add_argument("--n_distractors", type=int, default=0)
+    parser.add_argument("--target_beacon", type=str, default=None,
+                        help="Beacon colour to seek (default: furthest from start)")
+    # Simulation
+    parser.add_argument("--steps", type=int, default=480)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--sim_backend", type=str, default="auto")
+    parser.add_argument("--show_viewer", action="store_true")
+    # CEM planner
+    parser.add_argument("--plan_horizon", type=int, default=8)
+    parser.add_argument("--n_candidates", type=int, default=256)
+    parser.add_argument("--cem_iters", type=int, default=5)
+    parser.add_argument("--elite_frac", type=float, default=0.15)
+    parser.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
+    parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
+    parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
+    parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
+    # PPO noise
+    parser.add_argument("--ppo_obs_noise_std", type=float, default=0.0)
+    # Success / termination
+    parser.add_argument("--success_range", type=float, default=0.4)
+    parser.add_argument("--terminate_on_collision", action="store_true")
+    # Output
+    parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--no_gif", action="store_true")
+    parser.add_argument("--no_topdown", action="store_true")
+    parser.add_argument("--video_format", type=str, default="auto", choices=["auto", "mp4", "gif", "both"])
+    parser.add_argument("--video_fps", type=int, default=20)
+    parser.add_argument("--gif_stride", type=int, default=2)
+    # Camera
     add_egocentric_camera_args(parser)
+    # Breadcrumb view
+    parser.add_argument("--breadcrumb_view_dist", type=float, default=0.5)
+
     return parser.parse_args()
 
+
+# ---- Model loading ------------------------------------------------------- #
 
 def clean_load_state(module: torch.nn.Module, state_dict: dict[str, Any], *, strict: bool = True) -> None:
     missing, unexpected = module.load_state_dict(clean_state_dict(state_dict), strict=strict)
@@ -463,17 +269,13 @@ def infer_world_model_kwargs(model_state: dict[str, torch.Tensor]) -> dict[str, 
     pos_embed = model_state["encoder.vis_enc.pos_embed"]
     patch_weight = model_state["encoder.vis_enc.patch_embed.weight"]
     pred_pos_embed = model_state["predictor.pos_embed"]
-
     latent_dim = int(pos_embed.shape[-1])
     patch_size = int(patch_weight.shape[-1])
     n_tokens = int(pos_embed.shape[1] - 1)
     grid = int(round(math.sqrt(n_tokens)))
-    if grid * grid != n_tokens:
-        raise ValueError(f"Cannot infer image size from {n_tokens} patches")
     image_size = grid * patch_size
     max_seq_len = int(pred_pos_embed.shape[1])
     use_proprio = any(k.startswith("encoder.prop_enc.") for k in model_state)
-
     return {
         "latent_dim": latent_dim,
         "image_size": image_size,
@@ -541,533 +343,7 @@ def load_frozen_policy(ckpt_path: str, gs) -> ActorCritic:
     return model
 
 
-def sample_spawn_xy(
-    obstacle_layout,
-    safe_clearance: float,
-    rng: np.random.RandomState,
-    attempts: int = 2048,
-    span: float = 1.5,
-) -> np.ndarray:
-    origin = torch.zeros((1, 2), dtype=torch.float32)
-    if not bool(detect_collisions(origin, obstacle_layout, margin=safe_clearance)[0].item()):
-        return np.zeros(2, dtype=np.float32)
-
-    candidates = rng.uniform(-span, span, size=(attempts, 2)).astype(np.float32)
-    cand_t = torch.from_numpy(candidates)
-    safe_mask = ~detect_collisions(cand_t, obstacle_layout, margin=safe_clearance)
-    safe_ids = torch.nonzero(safe_mask).squeeze(-1).cpu().numpy()
-    if safe_ids.size == 0:
-        return np.zeros(2, dtype=np.float32)
-
-    dists = np.linalg.norm(candidates[safe_ids], axis=1)
-    return candidates[safe_ids[int(np.argmin(dists))]]
-
-
-def build_navigation_grid(
-    obstacle_layout,
-    arena_half: float,
-    clearance_margin: float,
-    resolution: float = 0.05,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    xs = np.arange(-arena_half, arena_half + 0.5 * resolution, resolution, dtype=np.float32)
-    ys = np.arange(-arena_half, arena_half + 0.5 * resolution, resolution, dtype=np.float32)
-    grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
-    points = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1)
-    clearance = compute_clearance(points, obstacle_layout).reshape(len(ys), len(xs))
-    free = clearance >= float(clearance_margin)
-    return xs, ys, free
-
-
-def compute_enclosure_score(
-    robot_xy: np.ndarray,
-    obstacle_layout,
-    collision_margin: float,
-    max_radius: float = 0.75,
-    radial_step: float = 0.05,
-    n_directions: int = 8,
-) -> tuple[np.ndarray, np.ndarray]:
-    if robot_xy.shape[0] == 0:
-        return (
-            np.zeros((0,), dtype=np.float32),
-            np.zeros((0,), dtype=np.int32),
-        )
-
-    angles = np.linspace(0.0, 2.0 * math.pi, num=n_directions, endpoint=False, dtype=np.float32)
-    radii = np.arange(radial_step, max_radius + 0.5 * radial_step, radial_step, dtype=np.float32)
-    hit_radius = np.full((robot_xy.shape[0], n_directions), float(max_radius + radial_step), dtype=np.float32)
-
-    for dir_idx, ang in enumerate(angles):
-        direction = np.asarray([math.cos(float(ang)), math.sin(float(ang))], dtype=np.float32)
-        for radius in radii:
-            pts = robot_xy + direction[None, :] * float(radius)
-            clearance = compute_clearance(pts, obstacle_layout)
-            newly_hit = (hit_radius[:, dir_idx] > max_radius) & (clearance < float(collision_margin))
-            hit_radius[newly_hit, dir_idx] = float(radius)
-
-    norm = np.clip(1.0 - np.minimum(hit_radius, max_radius) / max_radius, 0.0, 1.0)
-    blocked = (hit_radius <= max_radius).sum(axis=1).astype(np.int32)
-    return norm.mean(axis=1).astype(np.float32), blocked
-
-
-def nearest_free_cell(
-    free: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    point_xy: np.ndarray,
-    max_search_radius: int = 8,
-) -> tuple[int, int] | None:
-    ix = int(np.argmin(np.abs(xs - float(point_xy[0]))))
-    iy = int(np.argmin(np.abs(ys - float(point_xy[1]))))
-    if bool(free[iy, ix]):
-        return iy, ix
-
-    h, w = free.shape
-    best_cell: tuple[int, int] | None = None
-    best_dist = float("inf")
-    for radius in range(1, max_search_radius + 1):
-        y0 = max(0, iy - radius)
-        y1 = min(h, iy + radius + 1)
-        x0 = max(0, ix - radius)
-        x1 = min(w, ix + radius + 1)
-        for cy in range(y0, y1):
-            for cx in range(x0, x1):
-                if not bool(free[cy, cx]):
-                    continue
-                dist = float((xs[cx] - point_xy[0]) ** 2 + (ys[cy] - point_xy[1]) ** 2)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_cell = (cy, cx)
-        if best_cell is not None:
-            return best_cell
-    return None
-
-
-def select_spawn_headings(
-    robot_xy: np.ndarray,
-    obstacle_layout,
-    beacon_layout: BeaconLayout,
-    allow_visible_start: bool,
-    fov_deg: float,
-    safe_clearance: float,
-    n_headings: int = 12,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if robot_xy.shape[0] == 0:
-        return (
-            np.zeros((0,), dtype=np.float32),
-            np.zeros((0,), dtype=np.float32),
-            np.zeros((0,), dtype=bool),
-        )
-
-    headings = np.linspace(-math.pi, math.pi, num=n_headings, endpoint=False, dtype=np.float32)
-    yaw_grid = np.broadcast_to(headings[None, :], (robot_xy.shape[0], n_headings))
-    xy_grid = np.broadcast_to(robot_xy[:, None, :], (robot_xy.shape[0], n_headings, 2))
-    flat_xy = xy_grid.reshape(-1, 2)
-    flat_yaw = yaw_grid.reshape(-1)
-
-    traversability = compute_traversability(
-        robot_xy=flat_xy,
-        robot_yaw=flat_yaw,
-        layout=obstacle_layout,
-        horizon=12,
-        step_size=0.05,
-        collision_margin=max(float(safe_clearance), 0.15),
-    ).reshape(robot_xy.shape[0], n_headings).astype(np.float32)
-
-    if beacon_layout.beacons:
-        labels = compute_beacon_labels(
-            robot_xy=flat_xy,
-            robot_yaw=flat_yaw,
-            beacon_layout=beacon_layout,
-            fov_deg=fov_deg,
-        )
-        visible = np.asarray(labels["beacon_visible"], dtype=bool).reshape(robot_xy.shape[0], n_headings)
-    else:
-        visible = np.zeros((robot_xy.shape[0], n_headings), dtype=bool)
-
-    if allow_visible_start:
-        heading_score = traversability + 2.0 * visible.astype(np.float32)
-    else:
-        heading_score = traversability.copy()
-        heading_score[visible] = -1e9
-
-    best_idx = np.argmax(heading_score, axis=1)
-    best_score = heading_score[np.arange(robot_xy.shape[0]), best_idx]
-    valid = best_score > -1e8
-    best_yaw = headings[best_idx]
-    best_traversability = traversability[np.arange(robot_xy.shape[0]), best_idx]
-    best_visible = visible[np.arange(robot_xy.shape[0]), best_idx]
-
-    if allow_visible_start:
-        return best_yaw.astype(np.float32), best_traversability.astype(np.float32), valid
-    return best_yaw.astype(np.float32), best_traversability.astype(np.float32), valid & (~best_visible)
-
-
-def shortest_free_grid_steps(
-    free: np.ndarray,
-    start_cell: tuple[int, int],
-    goal_cell: tuple[int, int],
-) -> int | None:
-    if start_cell == goal_cell:
-        return 0
-
-    h, w = free.shape
-    dist = np.full((h, w), -1, dtype=np.int32)
-    q: deque[tuple[int, int]] = deque([start_cell])
-    dist[start_cell] = 0
-    neighbors = [
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
-        (-1, -1),
-        (-1, 1),
-        (1, -1),
-        (1, 1),
-    ]
-
-    while q:
-        cy, cx = q.popleft()
-        next_dist = int(dist[cy, cx]) + 1
-        for dy, dx in neighbors:
-            ny = cy + dy
-            nx = cx + dx
-            if ny < 0 or ny >= h or nx < 0 or nx >= w:
-                continue
-            if dist[ny, nx] >= 0 or not bool(free[ny, nx]):
-                continue
-            if (ny, nx) == goal_cell:
-                return next_dist
-            dist[ny, nx] = next_dist
-            q.append((ny, nx))
-    return None
-
-
-def validate_target_beacon_path(
-    spawn_xy: np.ndarray,
-    obstacle_layout,
-    beacon_layout: BeaconLayout,
-    arena_half: float,
-    success_range: float,
-    clearance_margin: float,
-) -> tuple[bool, dict[str, Any]]:
-    if not beacon_layout.beacons:
-        return True, {}
-
-    beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
-    nearest_idx = int(np.argmin(np.linalg.norm(beacon_xy - spawn_xy[None, :], axis=1)))
-    target_beacon = beacon_layout.beacons[nearest_idx]
-
-    standoff = max(0.10, min(float(clearance_margin), float(success_range) - 0.05))
-    approach_xy = (
-        np.asarray(target_beacon.pos[:2], dtype=np.float32)
-        + np.asarray(target_beacon.normal, dtype=np.float32) * standoff
-    )
-
-    xs, ys, free = build_navigation_grid(
-        obstacle_layout=obstacle_layout,
-        arena_half=float(arena_half),
-        clearance_margin=float(clearance_margin),
-    )
-    start_cell = nearest_free_cell(free, xs, ys, np.asarray(spawn_xy, dtype=np.float32))
-    goal_cell = nearest_free_cell(free, xs, ys, approach_xy)
-    if start_cell is None or goal_cell is None:
-        return False, {
-            "target_beacon_index": nearest_idx,
-            "target_beacon_approach_xy": [float(approach_xy[0]), float(approach_xy[1])],
-            "target_beacon_path_steps": None,
-        }
-
-    path_steps = shortest_free_grid_steps(free, start_cell, goal_cell)
-    if path_steps is None:
-        return False, {
-            "target_beacon_index": nearest_idx,
-            "target_beacon_approach_xy": [float(approach_xy[0]), float(approach_xy[1])],
-            "target_beacon_path_steps": None,
-        }
-
-    resolution = float(xs[1] - xs[0]) if len(xs) > 1 else 0.0
-    return True, {
-        "target_beacon_index": nearest_idx,
-        "target_beacon_approach_xy": [float(approach_xy[0]), float(approach_xy[1])],
-        "target_beacon_path_steps": int(path_steps),
-        "target_beacon_path_length_m": float(path_steps * resolution),
-    }
-
-
-def choose_spawn_pose(
-    obstacle_layout,
-    beacon_layout: BeaconLayout,
-    safe_clearance: float,
-    arena_half: float,
-    spawn_range: float,
-    max_spawn_clearance: float,
-    min_spawn_beacon_range: float,
-    allow_visible_start: bool,
-    fov_deg: float,
-    rng: np.random.RandomState,
-    n_candidates: int = 4096,
-) -> tuple[np.ndarray | None, float | None, dict[str, Any]]:
-    span = min(max(0.5, float(spawn_range)), max(0.5, float(arena_half) - 0.25))
-    local_span = min(span, 0.9)
-    local_candidates = rng.uniform(-local_span, local_span, size=(max(1, int(0.75 * n_candidates)), 2)).astype(np.float32)
-    global_candidates = rng.uniform(-span, span, size=(max(1, n_candidates - local_candidates.shape[0]), 2)).astype(np.float32)
-    origin_anchor = sample_spawn_xy(
-        obstacle_layout=obstacle_layout,
-        safe_clearance=float(safe_clearance),
-        rng=rng,
-        span=span,
-    )
-    candidates = np.concatenate([origin_anchor[None, :], local_candidates, global_candidates], axis=0)
-    specials = [np.zeros((1, 2), dtype=np.float32), origin_anchor[None, :]]
-    if obstacle_layout.obstacles:
-        obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
-        specials.append(obstacle_xy.mean(axis=0, keepdims=True).astype(np.float32))
-    if beacon_layout.beacons:
-        beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
-        specials.append(beacon_xy.mean(axis=0, keepdims=True).astype(np.float32))
-    candidates = np.concatenate([*specials, candidates], axis=0)
-
-    cand_t = torch.from_numpy(candidates)
-    safe_mask = ~detect_collisions(cand_t, obstacle_layout, margin=safe_clearance)
-    if not bool(safe_mask.any().item()):
-        return None, None, {}
-
-    safe_xy = candidates[safe_mask.cpu().numpy()]
-    clearance = compute_clearance(safe_xy, obstacle_layout)
-    enclosure, blocked_sectors = compute_enclosure_score(
-        robot_xy=safe_xy,
-        obstacle_layout=obstacle_layout,
-        collision_margin=max(float(safe_clearance), 0.15),
-        max_radius=min(0.90, max(0.55, float(max_spawn_clearance) + 0.15)),
-    )
-    maze_like = clearance <= float(max_spawn_clearance)
-    if np.any(maze_like):
-        safe_xy = safe_xy[maze_like]
-        clearance = clearance[maze_like]
-        enclosure = enclosure[maze_like]
-        blocked_sectors = blocked_sectors[maze_like]
-    if safe_xy.shape[0] == 0:
-        return None, None, {}
-
-    if obstacle_layout.obstacles:
-        obstacle_xy = np.asarray([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32)
-        maze_core = obstacle_xy.mean(axis=0)
-    elif beacon_layout.beacons:
-        beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
-        maze_core = beacon_xy.mean(axis=0)
-    else:
-        maze_core = np.zeros(2, dtype=np.float32)
-
-    if beacon_layout.beacons:
-        beacon_xy = np.asarray([b.pos[:2] for b in beacon_layout.beacons], dtype=np.float32)
-        deltas = beacon_xy[None, :, :] - safe_xy[:, None, :]
-        dists = np.linalg.norm(deltas, axis=-1)
-        nearest_idx = np.argmin(dists, axis=1)
-        nearest_dist = dists[np.arange(dists.shape[0]), nearest_idx]
-        nearest_beacon_xy = beacon_xy[nearest_idx]
-        yaw, heading_traversability, heading_valid = select_spawn_headings(
-            robot_xy=safe_xy,
-            obstacle_layout=obstacle_layout,
-            beacon_layout=beacon_layout,
-            allow_visible_start=allow_visible_start,
-            fov_deg=fov_deg,
-            safe_clearance=float(safe_clearance),
-        )
-        if not np.any(heading_valid):
-            return None, None, {}
-        safe_xy = safe_xy[heading_valid]
-        clearance = clearance[heading_valid]
-        enclosure = enclosure[heading_valid]
-        blocked_sectors = blocked_sectors[heading_valid]
-        nearest_idx = nearest_idx[heading_valid]
-        nearest_dist = nearest_dist[heading_valid]
-        yaw = yaw[heading_valid]
-        heading_traversability = heading_traversability[heading_valid]
-        nearest_beacon_xy = beacon_xy[nearest_idx]
-        labels = compute_beacon_labels(
-            robot_xy=safe_xy,
-            robot_yaw=yaw,
-            beacon_layout=beacon_layout,
-            fov_deg=fov_deg,
-        )
-        visible = np.asarray(labels["beacon_visible"], dtype=bool)
-
-        enclosed_mask = (enclosure >= 0.22) & (blocked_sectors >= 2)
-        if np.any(enclosed_mask):
-            safe_xy = safe_xy[enclosed_mask]
-            clearance = clearance[enclosed_mask]
-            enclosure = enclosure[enclosed_mask]
-            blocked_sectors = blocked_sectors[enclosed_mask]
-            nearest_idx = nearest_idx[enclosed_mask]
-            nearest_dist = nearest_dist[enclosed_mask]
-            yaw = yaw[enclosed_mask]
-            heading_traversability = heading_traversability[enclosed_mask]
-            visible = visible[enclosed_mask]
-            nearest_beacon_xy = beacon_xy[nearest_idx]
-        if safe_xy.shape[0] == 0:
-            return None, None, {}
-
-        traversability = compute_traversability(
-            robot_xy=safe_xy,
-            robot_yaw=yaw,
-            layout=obstacle_layout,
-            horizon=10,
-            step_size=0.05,
-            collision_margin=max(float(safe_clearance), 0.15),
-        ).astype(np.float32)
-        dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
-        target_clearance = min(float(max_spawn_clearance), 0.30)
-        target_traversability = 7.0
-        beacon_too_close = np.maximum(float(min_spawn_beacon_range) - nearest_dist, 0.0)
-        beacon_too_far = np.maximum(nearest_dist - 2.5, 0.0)
-        score = (
-            4.00 * enclosure
-            +0.35 * blocked_sectors.astype(np.float32)
-            -0.20 * dist_to_core
-            -0.55 * np.abs(clearance - target_clearance)
-            -0.90 * beacon_too_close
-            -0.40 * beacon_too_far
-            -0.30 * np.abs(traversability - target_traversability)
-            +0.45 * heading_traversability
-        )
-        best = int(np.argmax(score))
-        return safe_xy[best], float(yaw[best]), {
-            "spawn_beacon_range": float(nearest_dist[best]),
-            "spawn_clearance": float(clearance[best]),
-            "spawn_traversability": float(traversability[best]),
-            "spawn_heading_traversability": float(heading_traversability[best]),
-            "spawn_enclosure": float(enclosure[best]),
-            "spawn_blocked_sectors": int(blocked_sectors[best]),
-            "spawn_beacon_visible": bool(visible[best]),
-            "spawn_dist_to_maze_core": float(dist_to_core[best]),
-            "spawn_nearest_beacon_xy": [float(nearest_beacon_xy[best, 0]), float(nearest_beacon_xy[best, 1])],
-        }
-
-    dist_to_core = np.linalg.norm(safe_xy - maze_core[None, :], axis=1)
-    target_clearance = min(float(max_spawn_clearance), 0.30)
-    yaw_arr, heading_traversability, heading_valid = select_spawn_headings(
-        robot_xy=safe_xy,
-        obstacle_layout=obstacle_layout,
-        beacon_layout=beacon_layout,
-        allow_visible_start=True,
-        fov_deg=fov_deg,
-        safe_clearance=float(safe_clearance),
-    )
-    safe_xy = safe_xy[heading_valid]
-    clearance = clearance[heading_valid]
-    enclosure = enclosure[heading_valid]
-    blocked_sectors = blocked_sectors[heading_valid]
-    dist_to_core = dist_to_core[heading_valid]
-    yaw_arr = yaw_arr[heading_valid]
-    heading_traversability = heading_traversability[heading_valid]
-    if safe_xy.shape[0] == 0:
-        return None, None, {}
-    score = (
-        4.00 * enclosure
-        +0.35 * blocked_sectors.astype(np.float32)
-        -0.20 * dist_to_core
-        -0.55 * np.abs(clearance - target_clearance)
-        +0.45 * heading_traversability
-    )
-    best = int(np.argmax(score))
-    yaw = float(yaw_arr[best])
-    traversability = compute_traversability(
-        robot_xy=safe_xy[[best]],
-        robot_yaw=np.asarray([yaw], dtype=np.float32),
-        layout=obstacle_layout,
-        horizon=10,
-        step_size=0.05,
-        collision_margin=max(float(safe_clearance), 0.15),
-    )
-    return safe_xy[best], yaw, {
-        "spawn_beacon_range": float("inf"),
-        "spawn_clearance": float(clearance[best]),
-        "spawn_traversability": float(traversability[0]),
-        "spawn_heading_traversability": float(heading_traversability[best]),
-        "spawn_enclosure": float(enclosure[best]),
-        "spawn_blocked_sectors": int(blocked_sectors[best]),
-        "spawn_beacon_visible": False,
-        "spawn_dist_to_maze_core": float(dist_to_core[best]),
-    }
-
-
-def generate_scene_with_spawn(
-    args: argparse.Namespace,
-    camera_cfg,
-) -> tuple[Any, BeaconLayout, str, int, np.ndarray, float, dict[str, Any]]:
-    for attempt in range(max(1, int(args.scene_attempts))):
-        scene_seed = int(args.seed + 1009 * attempt)
-        scene_rng = np.random.RandomState(scene_seed)
-        if args.maze_style == "random":
-            style_pool = RANDOM_INFERENCE_MAZE_STYLES if int(args.n_beacons) > 0 else MAZE_STYLES
-            maze_style = str(scene_rng.choice(style_pool))
-        else:
-            maze_style = str(args.maze_style)
-        obstacle_layout, beacon_layout = generate_composite_scene(
-            seed=scene_seed,
-            maze_style=maze_style,
-            n_free_obstacles=args.n_free_obstacles,
-            n_beacons=args.n_beacons,
-            n_distractors=args.n_distractors,
-            arena_half=args.arena_half,
-        )
-        if len(obstacle_layout.obstacles) < int(args.min_obstacles):
-            continue
-
-        spawn_xy, spawn_yaw, spawn_meta = choose_spawn_pose(
-            obstacle_layout=obstacle_layout,
-            beacon_layout=beacon_layout,
-            safe_clearance=float(args.spawn_clearance),
-            arena_half=args.arena_half,
-            spawn_range=args.spawn_range,
-            max_spawn_clearance=args.max_spawn_clearance,
-            min_spawn_beacon_range=args.min_spawn_beacon_range,
-            allow_visible_start=args.allow_visible_start,
-            fov_deg=camera_cfg.fov_deg,
-            rng=scene_rng,
-        )
-        if spawn_xy is None or spawn_yaw is None:
-            continue
-
-        spawn_meta = dict(spawn_meta)
-        path_ok, path_meta = validate_target_beacon_path(
-            spawn_xy=np.asarray(spawn_xy, dtype=np.float32),
-            obstacle_layout=obstacle_layout,
-            beacon_layout=beacon_layout,
-            arena_half=float(args.arena_half),
-            success_range=float(args.success_range),
-            clearance_margin=max(
-                0.14,
-                min(float(args.spawn_clearance), float(RobotSimConfig.collision_margin)),
-            ),
-        )
-        if not path_ok:
-            continue
-        spawn_meta.update(path_meta)
-        spawn_meta["scene_seed"] = scene_seed
-        spawn_meta["scene_attempt"] = attempt
-        spawn_meta["maze_style"] = maze_style
-        return obstacle_layout, beacon_layout, maze_style, scene_seed, spawn_xy, spawn_yaw, spawn_meta
-
-    raise RuntimeError(
-        "Failed to generate a nontrivial scene that satisfies the spawn constraints. "
-        "Try lowering --min_obstacles, lowering --min_spawn_beacon_range, or passing --allow_visible_start."
-    )
-
-
-def spawn_heading(spawn_xy: np.ndarray, obstacle_layout, beacon_layout: BeaconLayout) -> float:
-    if beacon_layout.beacons:
-        target = np.array(beacon_layout.beacons[0].pos[:2], dtype=np.float32)
-    elif obstacle_layout.obstacles:
-        target = np.mean(
-            np.array([obs.pos[:2] for obs in obstacle_layout.obstacles], dtype=np.float32),
-            axis=0,
-        )
-    else:
-        target = np.array([1.0, 0.0], dtype=np.float32)
-    delta = target - np.asarray(spawn_xy, dtype=np.float32)
-    return float(math.atan2(float(delta[1]), float(delta[0])))
-
+# ---- Scene building ------------------------------------------------------ #
 
 def build_physics_scene(gs, torch_mod, args, obstacle_layout, beacon_layout):
     cfg = RobotSimConfig()
@@ -1085,10 +361,6 @@ def build_physics_scene(gs, torch_mod, args, obstacle_layout, beacon_layout):
     scene.build(n_envs=1)
 
     name_to_joint = {j.name: j for j in robot.joints}
-    missing = [name for name in JOINTS_ACTUATED if name not in name_to_joint]
-    if missing:
-        raise RuntimeError(f"Missing joints in URDF: {missing}")
-
     dof_idx = [list(name_to_joint[name].dofs_idx_local)[0] for name in JOINTS_ACTUATED]
     act_dofs = torch_mod.tensor(dof_idx, device=gs.device, dtype=torch_mod.int64)
     q0 = torch_mod.tensor(Q0_VALUES, device=gs.device, dtype=torch_mod.float32)
@@ -1101,16 +373,7 @@ def build_physics_scene(gs, torch_mod, args, obstacle_layout, beacon_layout):
     return scene, robot, act_dofs, q0, cfg
 
 
-def build_render_scene(
-    gs,
-    torch_mod,
-    urdf_path: str,
-    obstacle_layout,
-    beacon_layout,
-    img_res: int,
-    fov: float,
-    near: float,
-):
+def build_render_scene(gs, torch_mod, urdf_path, obstacle_layout, beacon_layout, img_res, fov, near):
     scene = gs.Scene(show_viewer=False)
     scene.add_entity(gs.morphs.Plane())
     add_obstacles_to_scene(scene, obstacle_layout)
@@ -1119,7 +382,6 @@ def build_render_scene(
             gs.morphs.Box(pos=obs.pos, size=obs.size, fixed=True),
             surface=gs.surfaces.Rough(color=obs.color),
         )
-
     robot = scene.add_entity(
         gs.morphs.URDF(file=urdf_path, fixed=False, merge_fixed_links=False),
     )
@@ -1127,20 +389,17 @@ def build_render_scene(
     scene.build(n_envs=1)
 
     name_to_joint = {j.name: j for j in robot.joints}
-    missing = [name for name in JOINTS_ACTUATED if name not in name_to_joint]
-    if missing:
-        raise RuntimeError(f"Missing joints in render URDF {urdf_path}: {missing}")
-
     dof_idx = [list(name_to_joint[name].dofs_idx_local)[0] for name in JOINTS_ACTUATED]
     act_dofs = torch_mod.tensor(dof_idx, device=gs.device, dtype=torch_mod.int64)
     return scene, robot, cam, act_dofs
 
 
+# ---- Robot helpers ------------------------------------------------------- #
+
 def reset_robot(robot, act_dofs, q0, spawn_xy: np.ndarray, yaw_rad: float, gs, torch_mod) -> None:
     pos = torch_mod.tensor(
         [[float(spawn_xy[0]), float(spawn_xy[1]), ROBOT_SPAWN_Z]],
-        device=gs.device,
-        dtype=torch_mod.float32,
+        device=gs.device, dtype=torch_mod.float32,
     )
     quat = torch_mod.tensor(yaw_to_quat(yaw_rad), device=gs.device, dtype=torch_mod.float32).unsqueeze(0)
     robot.set_pos(pos, zero_velocity=True)
@@ -1161,12 +420,7 @@ def collect_proprio(robot, act_dofs, q0, prev_action: torch.Tensor) -> tuple[tor
     return proprio, to_numpy(pos[0]), to_numpy(quat[0])
 
 
-def sync_render_robot(
-    src_robot,
-    src_act_dofs,
-    dst_robot,
-    dst_act_dofs,
-) -> tuple[np.ndarray, np.ndarray]:
+def sync_render_robot(src_robot, src_act_dofs, dst_robot, dst_act_dofs) -> tuple[np.ndarray, np.ndarray]:
     pos = src_robot.get_pos()
     quat = src_robot.get_quat()
     q = src_robot.get_dofs_position(src_act_dofs)
@@ -1176,16 +430,15 @@ def sync_render_robot(
     return to_numpy(pos[0]), to_numpy(quat[0])
 
 
+# ---- Rendering ----------------------------------------------------------- #
+
 def render_egocentric_frame(
-    physics_robot,
-    physics_act_dofs,
-    ego_robot,
-    ego_act_dofs,
-    ego_cam,
-    obstacle_layout,
-    camera_cfg,
+    physics_robot, physics_act_dofs,
+    ego_robot, ego_act_dofs, ego_cam,
+    obstacle_layout, camera_cfg: EgoCameraConfig,
     fallback_frame_hwc: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Render an egocentric frame with camera safety retraction."""
     pos_np, quat_np = sync_render_robot(physics_robot, physics_act_dofs, ego_robot, ego_act_dofs)
     cam_pos, cam_lookat, cam_up, cam_forward = egocentric_camera_pose(pos_np, quat_np, camera_cfg)
     cam_rot = camera_rotation_matrix(quat_np, camera_cfg.pitch_rad)
@@ -1199,20 +452,10 @@ def render_egocentric_frame(
             safety = camera_safety_metrics(cam_pos, cam_forward, obstacle_layout, camera_cfg, cam_rot=cam_rot)
         if bool(safety["unsafe"]):
             if fallback_frame_hwc is not None:
-                print(
-                    "Unsafe egocentric frame after retraction; substituting previous clean frame "
-                    f"at pos=({pos_np[0]:+.2f}, {pos_np[1]:+.2f}) "
-                    f"inside_wall={bool(safety['inside_wall'])} "
-                    f"clearance={float(safety['clearance']):.3f} "
-                    f"frustum_min_hit={float(safety['frustum_min_hit']):.3f}"
-                )
-                fallback = np.ascontiguousarray(np.asarray(fallback_frame_hwc, dtype=np.uint8))
-                return fallback.copy(), pos_np, quat_np, True
+                return np.ascontiguousarray(fallback_frame_hwc.copy()), pos_np, quat_np, True
             raise RuntimeError(
-                "Camera remained unsafe after retraction with no fallback frame available. "
-                f"inside_wall={bool(safety['inside_wall'])}, "
-                f"clearance={float(safety['clearance']):.3f}, "
-                f"frustum_min_hit={float(safety['frustum_min_hit']):.3f}"
+                f"Camera unsafe after retraction with no fallback: "
+                f"inside_wall={bool(safety['inside_wall'])}, clearance={float(safety['clearance']):.3f}"
             )
 
     ego_cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=cam_up)
@@ -1223,124 +466,59 @@ def render_egocentric_frame(
     return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)), pos_np, quat_np, False
 
 
-def render_third_person_frame(
-    physics_robot,
-    physics_act_dofs,
-    render_robot,
-    render_act_dofs,
-    cam,
-    chase_dist: float,
-    chase_height: float,
-    side_offset: float,
-    lookahead: float,
-) -> np.ndarray:
-    pos_np, quat_np = sync_render_robot(physics_robot, physics_act_dofs, render_robot, render_act_dofs)
-
-    w, x, y, z = [float(v) for v in quat_np]
-    fw = np.array([
-        1.0 - 2.0 * (y * y + z * z),
-        2.0 * (x * y + w * z),
-        0.0,
-    ], dtype=np.float32)
-    fw_norm = float(np.linalg.norm(fw[:2]))
-    if fw_norm < 1e-6:
-        fw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    else:
-        fw /= fw_norm
-    side = np.array([-fw[1], fw[0], 0.0], dtype=np.float32)
-    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
-    cam_pos = pos_np - chase_dist * fw + chase_height * up + side_offset * side
-    cam_lookat = pos_np + lookahead * fw + 0.18 * up
-    cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=up)
-
-    render_out = cam.render(rgb=True, force_render=True)
-    rgb = render_out[0]
-    if hasattr(rgb, "cpu"):
-        rgb = rgb.cpu().numpy()
-    return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
-
+# ---- Observation (perception-only, no oracle labels) --------------------- #
 
 @torch.no_grad()
 def observe(
-    physics_robot,
-    physics_act_dofs,
-    ego_robot,
-    ego_act_dofs,
-    ego_cam,
-    obstacle_layout,
-    beacon_layout: BeaconLayout,
-    camera_cfg,
-    world_model: LeWorldModel,
-    planning_device: torch.device,
-    q0,
-    prev_action: torch.Tensor,
+    physics_robot, physics_act_dofs,
+    ego_robot, ego_act_dofs, ego_cam,
+    obstacle_layout, camera_cfg: EgoCameraConfig,
+    world_model: LeWorldModel, planning_device: torch.device,
+    q0, prev_action: torch.Tensor,
     fallback_frame_hwc: np.ndarray | None = None,
-) -> ObservationBundle:
+) -> dict[str, Any]:
+    """Render + encode. Returns a dict with frame, latents, proprioception, pose."""
     frame_hwc, pos_np, quat_np, frame_substituted = render_egocentric_frame(
-        physics_robot=physics_robot,
-        physics_act_dofs=physics_act_dofs,
-        ego_robot=ego_robot,
-        ego_act_dofs=ego_act_dofs,
-        ego_cam=ego_cam,
-        obstacle_layout=obstacle_layout,
-        camera_cfg=camera_cfg,
-        fallback_frame_hwc=fallback_frame_hwc,
+        physics_robot, physics_act_dofs,
+        ego_robot, ego_act_dofs, ego_cam,
+        obstacle_layout, camera_cfg, fallback_frame_hwc,
     )
-    proprio, _pos_np_dup, _quat_np_dup = collect_proprio(physics_robot, physics_act_dofs, q0, prev_action)
+    proprio, _, _ = collect_proprio(physics_robot, physics_act_dofs, q0, prev_action)
     yaw_rad = float(quat_to_yaw(quat_np))
 
-    beacon_labels = compute_beacon_labels(
-        robot_xy=np.asarray([pos_np[:2]], dtype=np.float32),
-        robot_yaw=np.asarray([yaw_rad], dtype=np.float32),
-        beacon_layout=beacon_layout,
-        fov_deg=camera_cfg.fov_deg,
-    )
-
-    frame_hwc = np.ascontiguousarray(frame_hwc)
     frame_chw = np.ascontiguousarray(np.transpose(frame_hwc, (2, 0, 1)))
     vision = torch.from_numpy(frame_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
-    proprio_enc = None
-    if world_model.encoder.use_proprio:
-        proprio_enc = proprio.to(planning_device)
-
+    proprio_enc = proprio.to(planning_device) if world_model.encoder.use_proprio else None
     z_raw, z_proj = world_model.encode(vision, proprio_enc)
 
-    return ObservationBundle(
-        frame_hwc=frame_hwc,
-        frame_substituted=frame_substituted,
-        z_raw=z_raw.detach(),
-        z_proj=z_proj.detach(),
-        proprio=proprio.detach(),
-        pos_np=pos_np,
-        quat_np=quat_np,
-        yaw_rad=yaw_rad,
-        beacon_visible=bool(beacon_labels["beacon_visible"][0]),
-        beacon_identity=int(beacon_labels["beacon_identity"][0]),
-        beacon_range=float(beacon_labels["beacon_range"][0]),
-        beacon_bearing=float(beacon_labels["beacon_bearing"][0]),
-    )
+    return {
+        "frame_hwc": frame_hwc,
+        "frame_substituted": frame_substituted,
+        "z_raw": z_raw.detach(),
+        "z_proj": z_proj.detach(),
+        "proprio": proprio.detach(),
+        "pos_np": pos_np,
+        "quat_np": quat_np,
+        "yaw_rad": yaw_rad,
+    }
 
+
+# ---- Breadcrumb encoding (single front-face view) ----------------------- #
 
 @torch.no_grad()
-def pre_encode_beacons(
+def encode_breadcrumb(
     world_model: LeWorldModel,
-    render_scene,
-    render_robot,
-    render_act_dofs,
-    cam,
-    beacon_layout: BeaconLayout,
-    view_dist: float,
-    n_views: int,
+    render_scene, render_robot, render_act_dofs, cam,
+    beacon, view_dist: float,
     planning_device: torch.device,
-    q0,
-    gs,
-    torch_mod,
-) -> dict[int, torch.Tensor]:
-    """Render each beacon from multiple viewpoints and average its projected latent."""
-    if world_model.encoder.use_proprio:
-        raise RuntimeError("Hidden beacon pre-encoding requires a visual-only encoder.")
+    q0, gs, torch_mod,
+) -> torch.Tensor:
+    """Render one front-face view of a beacon and encode it as a breadcrumb latent.
 
+    This is the task specification — equivalent to showing a photo of the target
+    to the robot before deployment. Not an oracle cheat.
+    """
+    # Park the robot out of view
     render_robot.set_pos(
         torch_mod.tensor([[999.0, 999.0, -10.0]], device=gs.device, dtype=torch_mod.float32),
         zero_velocity=True,
@@ -1353,98 +531,44 @@ def pre_encode_beacons(
     render_robot.set_dofs_velocity(torch_mod.zeros((1, 12), device=gs.device), render_act_dofs)
     render_scene.step()
 
-    targets: dict[int, torch.Tensor] = {}
-    n_views = max(1, int(n_views))
-    for beacon in beacon_layout.beacons:
-        beacon_id = beacon_name_to_id(beacon.identity)
-        if beacon_id < 0:
-            continue
+    bx, by, bz = [float(v) for v in beacon.pos]
+    nx, ny = [float(v) for v in beacon.normal]
+    # Camera positioned directly in front of the beacon face
+    angle = math.atan2(ny, nx) + math.pi
+    cam_pos = np.array([
+        bx + view_dist * math.cos(angle),
+        by + view_dist * math.sin(angle),
+        bz + 0.05,
+    ], dtype=np.float32)
+    cam.set_pose(
+        pos=cam_pos,
+        lookat=np.array([bx, by, bz], dtype=np.float32),
+        up=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    render_scene.step()
 
-        bx, by, bz = [float(v) for v in beacon.pos]
-        nx, ny = [float(v) for v in beacon.normal]
-        latents: list[torch.Tensor] = []
-        base_angle = math.atan2(ny, nx) + math.pi
-
-        for view_idx in range(n_views):
-            angle_offset = (view_idx / max(n_views - 1, 1) - 0.5) * math.pi * 0.6
-            view_angle = base_angle + angle_offset
-            cam_pos = np.array(
-                [
-                    bx + float(view_dist) * math.cos(view_angle),
-                    by + float(view_dist) * math.sin(view_angle),
-                    bz + 0.05,
-                ],
-                dtype=np.float32,
-            )
-            cam.set_pose(
-                pos=cam_pos,
-                lookat=np.array([bx, by, bz], dtype=np.float32),
-                up=np.array([0.0, 0.0, 1.0], dtype=np.float32),
-            )
-            render_scene.step()
-
-            render_out = cam.render(rgb=True, force_render=True)
-            rgb = render_out[0]
-            if hasattr(rgb, "cpu"):
-                rgb = rgb.cpu().numpy()
-            rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
-            rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
-            vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
-            _, z_proj = world_model.encode(vis_t, None)
-            latents.append(z_proj.squeeze(0).detach())
-
-        if latents:
-            targets[beacon_id] = torch.stack(latents, dim=0).mean(dim=0)
-
-    return targets
+    render_out = cam.render(rgb=True, force_render=True)
+    rgb = render_out[0]
+    if hasattr(rgb, "cpu"):
+        rgb = rgb.cpu().numpy()
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+    rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
+    vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
+    _, z_proj = world_model.encode(vis_t, None)
+    return z_proj.squeeze(0).detach()
 
 
-def select_hidden_breadcrumb(
-    beacon_layout: BeaconLayout,
-    beacon_targets: dict[int, torch.Tensor],
-    spawn_xy: np.ndarray,
-) -> tuple[int | None, torch.Tensor | None, list[float] | None, float | None]:
-    """Pick the closest beacon with a pre-encoded latent target."""
-    if not beacon_layout.beacons or not beacon_targets:
-        return None, None, None, None
+# ---- PPO execution ------------------------------------------------------- #
 
-    spawn_xy = np.asarray(spawn_xy, dtype=np.float32)
-    best: tuple[float, int, torch.Tensor, list[float]] | None = None
-    for beacon in beacon_layout.beacons:
-        beacon_id = beacon_name_to_id(beacon.identity)
-        z_goal = beacon_targets.get(beacon_id)
-        if beacon_id < 0 or z_goal is None:
-            continue
-        beacon_xy = np.asarray(beacon.pos[:2], dtype=np.float32)
-        dist = float(np.linalg.norm(beacon_xy - spawn_xy))
-        target_xy = [float(beacon_xy[0]), float(beacon_xy[1])]
-        candidate = (dist, beacon_id, z_goal.detach().clone(), target_xy)
-        if best is None or candidate[0] < best[0]:
-            best = candidate
-
-    if best is None:
-        return None, None, None, None
-    return best[1], best[2], best[3], best[0]
-
-
-def execute_nominal_command(
-    scene,
-    robot,
-    policy: ActorCritic,
-    act_dofs,
-    q0,
-    runtime: RuntimeState,
+def execute_command(
+    scene, robot, policy: ActorCritic,
+    act_dofs, q0, prev_action: torch.Tensor,
     nominal_cmd: torch.Tensor,
     sim_cfg: RobotSimConfig,
-    obs_noise_std: float,
-    gs,
-    torch_mod,
+    obs_noise_std: float, gs, torch_mod,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    runtime.latency_buffer = torch.roll(runtime.latency_buffer, shifts=-1, dims=0)
-    runtime.latency_buffer[-1] = nominal_cmd.to(device=gs.device, dtype=torch_mod.float32).view(1, 3)
-    active_cmd = runtime.latency_buffer[0]
-
-    proprio, _pos_np, _quat_np = collect_proprio(robot, act_dofs, q0, runtime.prev_action)
+    """Execute one planning step through the PPO low-level controller."""
+    proprio, _, _ = collect_proprio(robot, act_dofs, q0, prev_action)
     ppo_proprio = proprio
     if obs_noise_std > 0.0:
         noise = torch_mod.randn_like(ppo_proprio) * obs_noise_std
@@ -1452,9 +576,9 @@ def execute_nominal_command(
         noise[:, 5:11] *= 5.0
         ppo_proprio = ppo_proprio + noise
 
-    obs = torch.cat([ppo_proprio, active_cmd], dim=1)
-    actions = policy.act_deterministic(obs)
-    runtime.prev_action = actions.detach().clone()
+    cmd = nominal_cmd.to(device=gs.device, dtype=torch_mod.float32).view(1, 3)
+    obs_tensor = torch.cat([ppo_proprio, cmd], dim=1)
+    actions = policy.act_deterministic(obs_tensor)
 
     q_tgt = q0.unsqueeze(0) + sim_cfg.action_scale * actions
     q_tgt[:, 0:4] = torch_mod.clamp(q_tgt[:, 0:4], -0.8, 0.8)
@@ -1465,15 +589,17 @@ def execute_nominal_command(
     for _ in range(sim_cfg.decimation):
         scene.step()
 
-    return active_cmd.detach().clone(), actions.detach().clone()
+    return cmd.detach().clone(), actions.detach().clone()
 
+
+# ---- Visualization ------------------------------------------------------ #
 
 def color255(rgb: tuple[float, float, float]) -> tuple[int, int, int]:
     return tuple(int(max(0.0, min(1.0, c)) * 255) for c in rgb)
 
 
-def compute_plot_bounds(obstacle_layout, beacon_layout, path_xy: list[list[float]], arena_half: float) -> float:
-    max_extent = float(arena_half)
+def compute_plot_bounds(obstacle_layout, beacon_layout, path_xy: list[list[float]]) -> float:
+    max_extent = 0.5
     for obs in obstacle_layout.obstacles:
         max_extent = max(
             max_extent,
@@ -1493,21 +619,17 @@ def compute_plot_bounds(obstacle_layout, beacon_layout, path_xy: list[list[float
 
 def world_to_canvas(x: float, y: float, half_extent: float, size: int) -> tuple[float, float]:
     scale = (size - 1) / (2.0 * half_extent)
-    px = (x + half_extent) * scale
-    py = (half_extent - y) * scale
-    return float(px), float(py)
+    return (x + half_extent) * scale, (half_extent - y) * scale
 
 
 def draw_topdown_trajectory(
     out_path: str,
-    obstacle_layout,
-    beacon_layout: BeaconLayout,
+    obstacle_layout, beacon_layout: BeaconLayout,
     path_xy: list[list[float]],
     breadcrumb_xy: list[float] | None,
-    arena_half: float,
 ) -> None:
     size = 900
-    half_extent = compute_plot_bounds(obstacle_layout, beacon_layout, path_xy, arena_half)
+    half_extent = compute_plot_bounds(obstacle_layout, beacon_layout, path_xy)
     img = Image.new("RGB", (size, size), color=(250, 248, 242))
     draw = ImageDraw.Draw(img)
 
@@ -1551,29 +673,16 @@ def draw_topdown_trajectory(
     img.save(out_path)
 
 
+# ---- Video export -------------------------------------------------------- #
+
 def encode_mp4(out_path: str, frames_hwc: list[np.ndarray], fps: int) -> None:
     if not frames_hwc:
         return
     height, width = frames_hwc[0].shape[:2]
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        str(fps),
-        "-i",
-        "-",
-        "-an",
-        "-vcodec",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        out_path,
+        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+        "-an", "-vcodec", "libx264", "-pix_fmt", "yuv420p", out_path,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdin is not None
@@ -1591,19 +700,19 @@ def encode_mp4(out_path: str, frames_hwc: list[np.ndarray], fps: int) -> None:
 
 
 def resolve_video_formats(requested: str) -> list[str]:
-    requested = requested.strip().lower()
     has_ffmpeg = shutil.which("ffmpeg") is not None
+    requested = requested.strip().lower()
     if requested == "auto":
         return ["mp4"] if has_ffmpeg else ["gif"]
     if requested == "mp4":
         if not has_ffmpeg:
-            raise RuntimeError("ffmpeg not found on PATH; use --video_format gif or install ffmpeg")
+            raise RuntimeError("ffmpeg not found; use --video_format gif")
         return ["mp4"]
     if requested == "gif":
         return ["gif"]
     if requested == "both":
         if not has_ffmpeg:
-            raise RuntimeError("ffmpeg not found on PATH; cannot use --video_format both")
+            raise RuntimeError("ffmpeg not found; cannot use --video_format both")
         return ["mp4", "gif"]
     raise ValueError(f"Unsupported video format: {requested}")
 
@@ -1614,39 +723,20 @@ def save_gif(out_path: str, frames_hwc: list[np.ndarray], stride: int, fps: int)
     if not frames:
         return
     duration_ms = max(1, round(1000 * keep / max(1, fps)))
-    frames[0].save(
-        out_path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=duration_ms,
-        loop=0,
-    )
+    frames[0].save(out_path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
 
 
 def export_video(out_stem: str, frames_hwc: list[np.ndarray], stride: int, fps: int, formats: list[str]) -> None:
     if not frames_hwc:
         return
-    kept = [np.ascontiguousarray(frame, dtype=np.uint8) for frame in frames_hwc[:: max(1, int(stride))]]
+    kept = [np.ascontiguousarray(f, dtype=np.uint8) for f in frames_hwc[:: max(1, int(stride))]]
     if "mp4" in formats:
         encode_mp4(f"{out_stem}.mp4", kept, max(1, round(fps / max(1, int(stride)))))
     if "gif" in formats:
         save_gif(f"{out_stem}.gif", frames_hwc, stride, fps)
 
 
-def resize_frame(frame_hwc: np.ndarray, target_res: int) -> np.ndarray:
-    if frame_hwc.shape[0] == target_res and frame_hwc.shape[1] == target_res:
-        return frame_hwc
-    return np.asarray(
-        Image.fromarray(frame_hwc).resize((target_res, target_res), Image.Resampling.BILINEAR),
-        dtype=np.uint8,
-    )
-
-
-def build_side_by_side_frame(first_person_hwc: np.ndarray, third_person_hwc: np.ndarray) -> np.ndarray:
-    ego = resize_frame(first_person_hwc, third_person_hwc.shape[0])
-    divider = np.full((third_person_hwc.shape[0], 8, 3), 12, dtype=np.uint8)
-    return np.concatenate([ego, divider, third_person_hwc], axis=1)
-
+# ---- Helpers ------------------------------------------------------------- #
 
 def beacon_name_to_id(identity: str) -> int:
     try:
@@ -1656,118 +746,109 @@ def beacon_name_to_id(identity: str) -> int:
 
 
 def pretty_beacon(beacon_id: int) -> str:
-    if beacon_id < 0:
-        return "none"
-    if beacon_id >= len(BEACON_IDENTITY_NAMES):
-        return str(beacon_id)
-    return f"{beacon_id}:{BEACON_IDENTITY_NAMES[beacon_id]}"
+    if 0 <= beacon_id < len(BEACON_IDENTITY_NAMES):
+        return f"{beacon_id}:{BEACON_IDENTITY_NAMES[beacon_id]}"
+    return "none"
 
 
-def apply_visible_beacon_assist(
-    nominal_cmd: torch.Tensor,
-    obs: ObservationBundle,
-    target_beacon_id: int | None,
-    args: argparse.Namespace,
-    cmd_low: torch.Tensor,
-    cmd_high: torch.Tensor,
-) -> torch.Tensor:
-    if (
-        args.visible_beacon_assist_weight <= 0.0
-        or not obs.beacon_visible
-        or target_beacon_id is None
-        or obs.beacon_identity != target_beacon_id
-    ):
-        return nominal_cmd
-
-    w = float(max(0.0, min(1.0, args.visible_beacon_assist_weight)))
-    forward = float(args.visible_beacon_forward_speed) * max(0.0, math.cos(float(obs.beacon_bearing)))
-    yaw = float(obs.beacon_bearing) * float(args.visible_beacon_yaw_gain)
-    yaw = max(float(cmd_low[2].item()), min(float(cmd_high[2].item()), yaw))
-
-    assist = torch.tensor([forward, 0.0, yaw], device=nominal_cmd.device, dtype=nominal_cmd.dtype)
-    blended = (1.0 - w) * nominal_cmd + w * assist
-    return blended.clamp(cmd_low, cmd_high)
-
+# ---- Main ---------------------------------------------------------------- #
 
 def main() -> None:
     args = parse_args()
-    if args.plan_horizon < 1:
-        raise ValueError("--plan_horizon must be >= 1")
-    if args.n_candidates < 1:
-        raise ValueError("--n_candidates must be >= 1")
-    if args.cem_iters < 1:
-        raise ValueError("--cem_iters must be >= 1")
-    if not (0.0 < args.elite_frac <= 1.0):
-        raise ValueError("--elite_frac must be in (0, 1]")
-    if args.video_fps < 1:
-        raise ValueError("--video_fps must be >= 1")
     if args.out_dir is None:
         args.out_dir = os.path.join("inference_runs", f"maze_seed_{args.seed:04d}")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not os.path.isfile(args.ppo_ckpt):
-        raise FileNotFoundError(f"PPO checkpoint not found: {args.ppo_ckpt}")
-    if not os.path.isfile(args.wm_ckpt):
-        raise FileNotFoundError(f"World-model checkpoint not found: {args.wm_ckpt}")
-    if not os.path.isfile(args.scorer_ckpt):
-        raise FileNotFoundError(f"TrajectoryScorer checkpoint not found: {args.scorer_ckpt}")
+    for ckpt_name, ckpt_path in [("PPO", args.ppo_ckpt), ("WM", args.wm_ckpt), ("Scorer", args.scorer_ckpt)]:
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"{ckpt_name} checkpoint not found: {ckpt_path}")
 
     planning_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    # ---- 1. Load models ----
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
     scorer, scorer_meta = load_trajectory_scorer(args.scorer_ckpt, planning_device)
-    if int(scorer_meta.get("latent_dim", wm_meta["latent_dim"])) != int(wm_meta["latent_dim"]):
-        raise RuntimeError("Latent-dimension mismatch between world model and trajectory scorer")
-
     camera_cfg = ego_camera_config_from_args(args)
-    obstacle_layout, beacon_layout, maze_style, scene_seed, spawn_xy, spawn_yaw, spawn_meta = generate_scene_with_spawn(
-        args=args,
-        camera_cfg=camera_cfg,
-    )
     video_formats = resolve_video_formats(args.video_format)
+
+    # ---- 2. Generate enclosed maze ----
+    obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
+        seed=args.seed,
+        grid_rows=args.grid_rows,
+        grid_cols=args.grid_cols,
+        cell_size=args.cell_size,
+        wall_thickness=args.wall_thickness,
+        n_beacons=args.n_beacons,
+        n_distractors=args.n_distractors,
+    )
+    maze_step = args.cell_size + args.wall_thickness
+    grid_ox = -(args.grid_cols - 1) * maze_step / 2.0
+    grid_oy = -(args.grid_rows - 1) * maze_step / 2.0
+    spawn_xy = np.array([
+        grid_ox + start_cell[1] * maze_step,
+        grid_oy + start_cell[0] * maze_step,
+    ], dtype=np.float32)
+
+    # Select target beacon (furthest from spawn by default)
+    target_beacon = None
+    if args.target_beacon is not None:
+        for b in beacon_layout.beacons:
+            if b.identity == args.target_beacon:
+                target_beacon = b
+                break
+    if target_beacon is None and beacon_layout.beacons:
+        # Pick the beacon furthest from spawn
+        best_dist = -1.0
+        for b in beacon_layout.beacons:
+            bxy = np.array(b.pos[:2], dtype=np.float32)
+            d = float(np.linalg.norm(bxy - spawn_xy))
+            if d > best_dist:
+                best_dist = d
+                target_beacon = b
+
+    # Choose spawn heading: face toward first corridor opening
+    spawn_yaw = 0.0
+    if target_beacon is not None:
+        dx = float(target_beacon.pos[0]) - float(spawn_xy[0])
+        dy = float(target_beacon.pos[1]) - float(spawn_xy[1])
+        spawn_yaw = math.atan2(dy, dx)
+
+    target_beacon_id = beacon_name_to_id(target_beacon.identity) if target_beacon else None
+    breadcrumb_xy = [float(target_beacon.pos[0]), float(target_beacon.pos[1])] if target_beacon else None
+
+    print(
+        f"Maze: {args.grid_rows}x{args.grid_cols} grid, seed={args.seed}, "
+        f"obstacles={len(obstacle_layout.obstacles)}, beacons={len(beacon_layout.beacons)}"
+    )
+    print(
+        f"Spawn: cell=({start_cell[0]},{start_cell[1]}) "
+        f"pos=({spawn_xy[0]:+.2f}, {spawn_xy[1]:+.2f}) yaw={math.degrees(spawn_yaw):+.1f}deg"
+    )
+    if target_beacon:
+        print(
+            f"Target beacon: {target_beacon.identity} at "
+            f"({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})"
+        )
+
+    # ---- 3. Build Genesis scenes ----
     cmd_low_t = torch.tensor(args.cmd_low, dtype=torch.float32, device=planning_device)
     cmd_high_t = torch.tensor(args.cmd_high, dtype=torch.float32, device=planning_device)
 
-    planner = CEMPlanner(
-        world_model=world_model,
-        scorer=scorer,
-        horizon=args.plan_horizon,
-        n_candidates=args.n_candidates,
-        cem_iters=args.cem_iters,
-        elite_frac=args.elite_frac,
-        cmd_low=cmd_low_t,
-        cmd_high=cmd_high_t,
-        init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
-        min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
-        forward_reward_weight=args.forward_reward_weight,
-        novelty_weight=args.novelty_weight,
-        device=planning_device,
-    )
-
     ego_frames_hwc: list[np.ndarray] = []
-    third_person_frames_hwc: list[np.ndarray] = []
-    combined_frames_hwc: list[np.ndarray] = []
+    path_xy: list[list[float]] = []
+    plan_costs: list[float] = []
+    nominal_cmds: list[list[float]] = []
     last_clean_ego_frame: np.ndarray | None = None
     ego_frame_substitutions = 0
-    path_xy: list[list[float]] = []
-    nominal_cmds: list[list[float]] = []
-    active_cmds: list[list[float]] = []
-    plan_costs: list[float] = []
-    breadcrumb_xy: list[float] | None = None
-    breadcrumb_step: int | None = None
-    breadcrumb_source = "none"
-    target_beacon_id: int | None = None
-    z_breadcrumb: torch.Tensor | None = None
-    visited_proj_history: list[torch.Tensor] = []
     collision_count = 0
     terminate_reason = "max_steps"
 
     t0 = time.time()
     physics_scene = None
     ego_scene = None
-    third_person_scene = None
     try:
         import genesis as gs
 
@@ -1778,45 +859,18 @@ def main() -> None:
         print(f"Genesis device:  {gs.device}")
         print(
             f"World model: latent_dim={wm_meta['latent_dim']} image_size={wm_meta['image_size']} "
-            f"patch={wm_meta['patch_size']} seq={wm_meta['max_seq_len']} use_proprio={wm_meta['use_proprio']}"
+            f"use_proprio={wm_meta['use_proprio']}"
         )
         print(
-            f"Scorer weights: goal={scorer.goal_weight:.3f} exploration={scorer.exploration_weight:.3f}"
+            f"Scorer: goal_weight={scorer.goal_weight:.3f} "
+            f"exploration_weight={scorer.exploration_weight:.3f}"
         )
-        print(
-            f"Planner extras: forward_reward={args.forward_reward_weight:.3f} "
-            f"novelty_weight={args.novelty_weight:.3f} "
-            f"visible_beacon_assist={args.visible_beacon_assist_weight:.3f}"
-        )
-        print(
-            f"Scene: maze_style={maze_style} scene_seed={scene_seed} "
-            f"obstacles={len(obstacle_layout.obstacles)} "
-            f"beacons={len(beacon_layout.beacons)} distractors={len(beacon_layout.distractors)}"
-        )
-        print(
-            f"Spawn: pos=({float(spawn_xy[0]):+.2f}, {float(spawn_xy[1]):+.2f}) "
-            f"yaw={math.degrees(float(spawn_yaw)):+.1f}deg "
-            f"beacon_range={spawn_meta['spawn_beacon_range']:.2f} "
-            f"beacon_visible={spawn_meta['spawn_beacon_visible']} "
-            f"traversability={spawn_meta.get('spawn_traversability', float('nan')):.1f} "
-            f"heading_traversability={spawn_meta.get('spawn_heading_traversability', float('nan')):.1f} "
-            f"enclosure={spawn_meta.get('spawn_enclosure', float('nan')):.2f} "
-            f"blocked_sectors={spawn_meta.get('spawn_blocked_sectors', -1)} "
-            f"path_len={spawn_meta.get('target_beacon_path_length_m', float('nan')):.2f}m"
-        )
-        print(f"Video export: {','.join(video_formats)} @ {args.video_fps} fps")
-        print(
-            f"Egocentric render URDF: {EGO_RENDER_URDF_PATH} "
-            f"(matches training: base shell hidden)"
-        )
-        print(f"Third-person render URDF: {THIRD_PERSON_URDF_PATH}")
 
         physics_scene, physics_robot, physics_act_dofs, q0, sim_cfg = build_physics_scene(
             gs, torch, args, obstacle_layout, beacon_layout,
         )
         ego_scene, ego_robot, ego_cam, ego_act_dofs = build_render_scene(
-            gs=gs,
-            torch_mod=torch,
+            gs=gs, torch_mod=torch,
             urdf_path=EGO_RENDER_URDF_PATH,
             obstacle_layout=obstacle_layout,
             beacon_layout=beacon_layout,
@@ -1824,227 +878,140 @@ def main() -> None:
             fov=camera_cfg.fov_deg,
             near=camera_cfg.near_plane,
         )
-        third_person_scene, third_person_robot, third_person_cam, third_person_act_dofs = build_render_scene(
-            gs=gs,
-            torch_mod=torch,
-            urdf_path=THIRD_PERSON_URDF_PATH,
-            obstacle_layout=obstacle_layout,
-            beacon_layout=beacon_layout,
-            img_res=args.third_person_res,
-            fov=args.third_person_fov,
-            near=0.01,
-        )
-        reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
-        beacon_targets = pre_encode_beacons(
-            world_model=world_model,
-            render_scene=ego_scene,
-            render_robot=ego_robot,
-            render_act_dofs=ego_act_dofs,
-            cam=ego_cam,
-            beacon_layout=beacon_layout,
-            view_dist=args.beacon_view_dist,
-            n_views=args.beacon_n_views,
-            planning_device=planning_device,
-            q0=q0,
-            gs=gs,
-            torch_mod=torch,
-        )
-        target_beacon_id, z_breadcrumb, breadcrumb_xy, target_spawn_range = select_hidden_breadcrumb(
-            beacon_layout=beacon_layout,
-            beacon_targets=beacon_targets,
-            spawn_xy=spawn_xy,
-        )
-        if z_breadcrumb is not None:
-            breadcrumb_step = -1
-            breadcrumb_source = "preencoded"
-            print(
-                f"Hidden breadcrumb: target={pretty_beacon(target_beacon_id)} "
-                f"views={args.beacon_n_views} view_dist={args.beacon_view_dist:.2f}m "
-                f"beacon_range={target_spawn_range:.2f}m"
+
+        # ---- 4. Encode breadcrumb ----
+        z_breadcrumb: torch.Tensor | None = None
+        if target_beacon is not None:
+            z_breadcrumb = encode_breadcrumb(
+                world_model=world_model,
+                render_scene=ego_scene,
+                render_robot=ego_robot,
+                render_act_dofs=ego_act_dofs,
+                cam=ego_cam,
+                beacon=target_beacon,
+                view_dist=args.breadcrumb_view_dist,
+                planning_device=planning_device,
+                q0=q0, gs=gs, torch_mod=torch,
             )
+            print(f"Breadcrumb encoded: z_norm={float(z_breadcrumb.norm()):.3f}")
 
-        runtime = RuntimeState(
-            prev_action=torch.zeros((1, 12), device=gs.device, dtype=torch.float32),
-            latency_buffer=torch.zeros((2, 1, 3), device=gs.device, dtype=torch.float32),
-        )
+        # ---- 5. Spawn robot ----
+        reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
-        obs = observe(
-            physics_robot=physics_robot,
-            physics_act_dofs=physics_act_dofs,
-            ego_robot=ego_robot,
-            ego_act_dofs=ego_act_dofs,
-            ego_cam=ego_cam,
-            obstacle_layout=obstacle_layout,
-            beacon_layout=beacon_layout,
-            camera_cfg=camera_cfg,
+        planner = CEMPlanner(
             world_model=world_model,
-            planning_device=planning_device,
-            q0=q0,
-            prev_action=runtime.prev_action,
-            fallback_frame_hwc=last_clean_ego_frame,
+            scorer=scorer,
+            horizon=args.plan_horizon,
+            n_candidates=args.n_candidates,
+            cem_iters=args.cem_iters,
+            elite_frac=args.elite_frac,
+            cmd_low=cmd_low_t,
+            cmd_high=cmd_high_t,
+            init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
+            min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
+            device=planning_device,
         )
-        if obs.frame_substituted:
-            ego_frame_substitutions += 1
-        last_clean_ego_frame = obs.frame_hwc.copy()
-        third_person_frame = render_third_person_frame(
-            physics_robot=physics_robot,
-            physics_act_dofs=physics_act_dofs,
-            render_robot=third_person_robot,
-            render_act_dofs=third_person_act_dofs,
-            cam=third_person_cam,
-            chase_dist=args.chase_dist,
-            chase_height=args.chase_height,
-            side_offset=args.side_offset,
-            lookahead=args.lookahead,
-        )
-        ego_frames_hwc.append(obs.frame_hwc)
-        third_person_frames_hwc.append(third_person_frame)
-        combined_frames_hwc.append(build_side_by_side_frame(obs.frame_hwc, third_person_frame))
-        path_xy.append([float(obs.pos_np[0]), float(obs.pos_np[1])])
-        visited_proj_history.append(obs.z_proj.detach().clone())
 
+        prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
         last_nominal_cmd = torch.zeros(3, device=planning_device, dtype=torch.float32)
-        prev_collided = False
 
+        # ---- 6. Initial observation ----
+        obs = observe(
+            physics_robot, physics_act_dofs,
+            ego_robot, ego_act_dofs, ego_cam,
+            obstacle_layout, camera_cfg,
+            world_model, planning_device,
+            q0, prev_action,
+        )
+        last_clean_ego_frame = obs["frame_hwc"].copy()
+        ego_frames_hwc.append(obs["frame_hwc"])
+        path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+
+        # ---- 7. Main loop ----
         for step in range(args.steps):
-            if z_breadcrumb is None and obs.beacon_visible:
-                z_breadcrumb = obs.z_proj.detach().clone()
-                target_beacon_id = obs.beacon_identity
-                breadcrumb_xy = [float(obs.pos_np[0]), float(obs.pos_np[1])]
-                breadcrumb_step = step
-                breadcrumb_source = "live_capture"
-                print(
-                    f"Step {step:03d} | captured breadcrumb for beacon {pretty_beacon(target_beacon_id)} "
-                    f"at range={obs.beacon_range:.3f}m"
-                )
-
-            if (
-                target_beacon_id is not None
-                and obs.beacon_visible
-                and obs.beacon_identity == target_beacon_id
-                and obs.beacon_range <= args.success_range
-            ):
-                terminate_reason = "goal_reached"
-                print(
-                    f"Step {step:03d} | reached beacon {pretty_beacon(target_beacon_id)} "
-                    f"at range={obs.beacon_range:.3f}m"
-                )
-                break
-
+            # Plan
             plan_seq, plan_stats = planner.plan(
-                z_start_raw=obs.z_raw,
+                z_start_raw=obs["z_raw"],
                 z_goal_proj=z_breadcrumb,
                 last_cmd=last_nominal_cmd,
-                queued_cmd=runtime.latency_buffer[-1, 0].to(planning_device),
-                visited_proj=torch.cat(visited_proj_history[-256:], dim=0),
             )
             nominal_cmd = plan_seq[0]
-            nominal_cmd = apply_visible_beacon_assist(
-                nominal_cmd=nominal_cmd,
-                obs=obs,
-                target_beacon_id=target_beacon_id,
-                args=args,
-                cmd_low=cmd_low_t,
-                cmd_high=cmd_high_t,
-            )
             last_nominal_cmd = nominal_cmd.detach().clone()
-            nominal_cmd_vals = [float(v) for v in nominal_cmd.detach().cpu().tolist()]
+            cmd_vals = [float(v) for v in nominal_cmd.detach().cpu().tolist()]
 
-            active_cmd, _actions = execute_nominal_command(
+            # Execute
+            active_cmd, actions = execute_command(
                 scene=physics_scene,
                 robot=physics_robot,
                 policy=policy,
                 act_dofs=physics_act_dofs,
                 q0=q0,
-                runtime=runtime,
+                prev_action=prev_action,
                 nominal_cmd=nominal_cmd.to(gs.device),
                 sim_cfg=sim_cfg,
                 obs_noise_std=args.ppo_obs_noise_std,
-                gs=gs,
-                torch_mod=torch,
+                gs=gs, torch_mod=torch,
             )
+            prev_action = actions.detach().clone()
 
+            # Observe
             obs = observe(
-                physics_robot=physics_robot,
-                physics_act_dofs=physics_act_dofs,
-                ego_robot=ego_robot,
-                ego_act_dofs=ego_act_dofs,
-                ego_cam=ego_cam,
-                obstacle_layout=obstacle_layout,
-                beacon_layout=beacon_layout,
-                camera_cfg=camera_cfg,
-                world_model=world_model,
-                planning_device=planning_device,
-                q0=q0,
-                prev_action=runtime.prev_action,
-                fallback_frame_hwc=last_clean_ego_frame,
+                physics_robot, physics_act_dofs,
+                ego_robot, ego_act_dofs, ego_cam,
+                obstacle_layout, camera_cfg,
+                world_model, planning_device,
+                q0, prev_action, last_clean_ego_frame,
             )
-            if obs.frame_substituted:
+            if obs["frame_substituted"]:
                 ego_frame_substitutions += 1
-                print(
-                    f"Step {step:03d} | substituted egocentric frame to match training-time sanitization "
-                    f"(count={ego_frame_substitutions})"
-                )
-            last_clean_ego_frame = obs.frame_hwc.copy()
-            third_person_frame = render_third_person_frame(
-                physics_robot=physics_robot,
-                physics_act_dofs=physics_act_dofs,
-                render_robot=third_person_robot,
-                render_act_dofs=third_person_act_dofs,
-                cam=third_person_cam,
-                chase_dist=args.chase_dist,
-                chase_height=args.chase_height,
-                side_offset=args.side_offset,
-                lookahead=args.lookahead,
-            )
+            else:
+                last_clean_ego_frame = obs["frame_hwc"].copy()
 
-            pos_xy = torch.from_numpy(np.asarray(obs.pos_np[:2], dtype=np.float32)).unsqueeze(0)
-            collided = bool(detect_collisions(pos_xy, obstacle_layout, margin=sim_cfg.collision_margin)[0].item())
-            fallen = bool(obs.pos_np[2] < sim_cfg.min_z)
-
-            ego_frames_hwc.append(obs.frame_hwc)
-            third_person_frames_hwc.append(third_person_frame)
-            combined_frames_hwc.append(build_side_by_side_frame(obs.frame_hwc, third_person_frame))
-            path_xy.append([float(obs.pos_np[0]), float(obs.pos_np[1])])
-            visited_proj_history.append(obs.z_proj.detach().clone())
-            nominal_cmds.append(nominal_cmd_vals)
-            active_cmds.append([float(v) for v in active_cmd[0].detach().cpu().tolist()])
+            # Log
+            ego_frames_hwc.append(obs["frame_hwc"])
+            path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+            nominal_cmds.append(cmd_vals)
             plan_costs.append(float(plan_stats.best_cost))
 
+            # Collision / termination checks
+            pos_xy = torch.from_numpy(np.asarray(obs["pos_np"][:2], dtype=np.float32)).unsqueeze(0)
+            collided = bool(detect_collisions(pos_xy, obstacle_layout, margin=sim_cfg.collision_margin)[0].item())
+            fallen = bool(obs["pos_np"][2] < sim_cfg.min_z)
+
+            # Oracle success check (post-hoc metric, NOT used for planning)
+            reached = False
+            if target_beacon is not None:
+                target_xy = np.array(target_beacon.pos[:2], dtype=np.float32)
+                dist_to_target = float(np.linalg.norm(obs["pos_np"][:2] - target_xy))
+                if dist_to_target <= args.success_range:
+                    reached = True
+                    terminate_reason = "goal_reached"
+                    print(f"Step {step:03d} | REACHED beacon {target_beacon.identity} at dist={dist_to_target:.3f}m")
+                    break
+
             print(
-                f"Step {step:03d} | pos=({obs.pos_np[0]:+.2f}, {obs.pos_np[1]:+.2f}) "
-                f"yaw={math.degrees(obs.yaw_rad):+6.1f}deg "
-                f"cmd=[{nominal_cmd_vals[0]:+.2f}, {nominal_cmd_vals[1]:+.2f}, {nominal_cmd_vals[2]:+.2f}] "
-                f"cost={plan_stats.best_cost:.3f} "
-                f"beacon={pretty_beacon(obs.beacon_identity)} "
-                f"range={'inf' if not obs.beacon_visible else f'{obs.beacon_range:.2f}'} "
-                f"crumb={'yes' if z_breadcrumb is not None else 'no'}"
+                f"Step {step:03d} | pos=({obs['pos_np'][0]:+.2f}, {obs['pos_np'][1]:+.2f}) "
+                f"yaw={math.degrees(obs['yaw_rad']):+6.1f}deg "
+                f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
+                f"cost={plan_stats.best_cost:.3f}"
             )
 
             if fallen:
                 terminate_reason = "fallen"
-                print(f"Step {step:03d} | terminating after fall")
+                print(f"Step {step:03d} | terminating: robot fell")
                 break
             if collided:
                 collision_count += 1
                 if args.terminate_on_collision:
                     terminate_reason = "collision"
-                    print(f"Step {step:03d} | terminating after collision")
+                    print(f"Step {step:03d} | terminating: collision")
                     break
-                if not prev_collided:
-                    planner.reset()
-                    last_nominal_cmd.zero_()
-                    print(
-                        f"Step {step:03d} | collision detected, clearing planner state and continuing "
-                        f"(count={collision_count})"
-                    )
-            prev_collided = collided
+                planner.reset()
+                last_nominal_cmd.zero_()
+
     finally:
         try:
             import genesis as gs
-
-            if third_person_scene is not None:
-                third_person_scene.destroy()
             if ego_scene is not None:
                 ego_scene.destroy()
             if physics_scene is not None:
@@ -2056,74 +1023,35 @@ def main() -> None:
 
     elapsed = time.time() - t0
 
+    # ---- 8. Export ----
     summary = {
-        "seed": int(args.seed),
-        "scene_seed": int(scene_seed),
-        "maze_style": maze_style,
-        "maze_style_requested": args.maze_style,
-        "n_obstacles": int(len(obstacle_layout.obstacles)),
-        "n_beacons": int(len(beacon_layout.beacons)),
-        "n_distractors": int(len(beacon_layout.distractors)),
-        "min_obstacles": int(args.min_obstacles),
-        "min_spawn_beacon_range": float(args.min_spawn_beacon_range),
-        "allow_visible_start": bool(args.allow_visible_start),
+        "seed": args.seed,
+        "grid_rows": args.grid_rows,
+        "grid_cols": args.grid_cols,
+        "n_obstacles": len(obstacle_layout.obstacles),
+        "n_beacons": len(beacon_layout.beacons),
+        "target_beacon": target_beacon.identity if target_beacon else None,
         "terminate_reason": terminate_reason,
         "elapsed_sec": elapsed,
         "steps_executed": len(nominal_cmds),
-        "breadcrumb_step": breadcrumb_step,
-        "breadcrumb_source": breadcrumb_source,
-        "target_beacon_id": target_beacon_id,
-        "target_beacon_name": pretty_beacon(target_beacon_id if target_beacon_id is not None else -1),
+        "collision_count": collision_count,
+        "ego_frame_substitutions": ego_frame_substitutions,
         "spawn_xy": [float(spawn_xy[0]), float(spawn_xy[1])],
         "spawn_yaw_rad": float(spawn_yaw),
-        "spawn_meta": spawn_meta,
-        "ego_render_urdf": EGO_RENDER_URDF_PATH,
-        "third_person_render_urdf": THIRD_PERSON_URDF_PATH,
-        "video_format": args.video_format,
-        "video_fps": args.video_fps,
-        "forward_reward_weight": args.forward_reward_weight,
-        "novelty_weight": args.novelty_weight,
-        "visible_beacon_assist_weight": args.visible_beacon_assist_weight,
-        "terminate_on_collision": bool(args.terminate_on_collision),
-        "collision_count": int(collision_count),
-        "beacon_view_dist": args.beacon_view_dist,
-        "beacon_n_views": int(args.beacon_n_views),
-        "ego_frame_substitutions": int(ego_frame_substitutions),
+        "breadcrumb_xy": breadcrumb_xy,
         "path_xy": path_xy,
         "nominal_cmds": nominal_cmds,
-        "active_cmds": active_cmds,
         "plan_costs": plan_costs,
         "beacons": [
-            {
-                "identity": beacon.identity,
-                "pos": [float(v) for v in beacon.pos],
-                "normal": [float(v) for v in beacon.normal],
-            }
-            for beacon in beacon_layout.beacons
+            {"identity": b.identity, "pos": [float(v) for v in b.pos], "normal": [float(v) for v in b.normal]}
+            for b in beacon_layout.beacons
         ],
     }
-
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     if not args.no_gif and ego_frames_hwc:
         export_video(str(out_dir / "ego_rollout"), ego_frames_hwc, args.gif_stride, args.video_fps, video_formats)
-    if not args.no_gif and third_person_frames_hwc:
-        export_video(
-            str(out_dir / "third_person_rollout"),
-            third_person_frames_hwc,
-            args.gif_stride,
-            args.video_fps,
-            video_formats,
-        )
-    if not args.no_gif and combined_frames_hwc:
-        export_video(
-            str(out_dir / "side_by_side_rollout"),
-            combined_frames_hwc,
-            args.gif_stride,
-            args.video_fps,
-            video_formats,
-        )
 
     if not args.no_topdown and path_xy:
         draw_topdown_trajectory(
@@ -2132,12 +1060,10 @@ def main() -> None:
             beacon_layout=beacon_layout,
             path_xy=path_xy,
             breadcrumb_xy=breadcrumb_xy,
-            arena_half=args.arena_half,
         )
 
-    print(f"Finished in {elapsed:.1f}s")
+    print(f"Finished in {elapsed:.1f}s | {terminate_reason} | collisions={collision_count}")
     print(f"Outputs: {out_dir}")
-    print(f"Termination: {terminate_reason}")
 
 
 if __name__ == "__main__":

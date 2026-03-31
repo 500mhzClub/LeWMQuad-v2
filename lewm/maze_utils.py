@@ -803,3 +803,331 @@ def generate_composite_scene(
     beacon_layout = BL(beacons=maze.beacons, distractors=distractors)
 
     return obstacle_layout, beacon_layout
+
+
+# --------------------------------------------------------------------------- #
+# Enclosed grid maze  (recursive backtracking)
+# --------------------------------------------------------------------------- #
+
+def generate_enclosed_maze(
+    seed: int | None = None,
+    grid_rows: int = 4,
+    grid_cols: int = 4,
+    cell_size: float = 0.55,
+    wall_thickness: float = 0.20,
+    wall_height_range: Tuple[float, float] = (0.20, 0.35),
+    n_beacons: int = 2,
+    beacon_identities: Optional[List[str]] = None,
+    n_distractors: int = 0,
+) -> Tuple[ObstacleLayout, BeaconLayout, Tuple[int, int]]:
+    """Generate a fully-enclosed grid maze using recursive backtracking.
+
+    Every cell is reachable.  Beacons are placed at the dead-end cells
+    furthest from the start cell.
+
+    Args:
+        seed: RNG seed.
+        grid_rows: number of cell rows.
+        grid_cols: number of cell columns.
+        cell_size: interior size of each cell (metres).
+        wall_thickness: wall panel thickness (metres).
+        wall_height_range: (min, max) wall height.
+        n_beacons: how many beacons to place.
+        beacon_identities: explicit colour names; random if ``None``.
+        n_distractors: coloured distractor patches to add.
+
+    Returns:
+        ``(obstacle_layout, beacon_layout, start_cell)`` where
+        ``start_cell`` is the (row, col) of the cell nearest the origin
+        (good default robot spawn location).
+    """
+    from .beacon_utils import (
+        BEACON_FAMILIES,
+        BeaconLayout as BL,
+        generate_beacon_layout,
+        make_distractor_patch,
+    )
+
+    rng = np.random.RandomState(seed)
+    step = cell_size + wall_thickness  # centre-to-centre distance
+
+    # Grid origin offset so the maze is roughly centred around world (0,0).
+    ox = -(grid_cols - 1) * step / 2.0
+    oy = -(grid_rows - 1) * step / 2.0
+
+    # ---- 1. Carve the maze with recursive backtracking (iterative) ----
+    # Walls stored as sets of edges between adjacent cells.
+    # h_walls[r][c] = True  → horizontal wall present between row r-1 and r at col c
+    # v_walls[r][c] = True  → vertical wall present between col c-1 and c at row r
+    h_walls = [[True] * grid_cols for _ in range(grid_rows + 1)]
+    v_walls = [[True] * (grid_cols + 1) for _ in range(grid_rows)]
+
+    visited = [[False] * grid_cols for _ in range(grid_rows)]
+
+    # Start cell: nearest to world origin
+    def _cell_world_xy(r: int, c: int) -> Tuple[float, float]:
+        return (ox + c * step, oy + r * step)
+
+    best_r, best_c, best_dist = 0, 0, float("inf")
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            wx, wy = _cell_world_xy(r, c)
+            d = wx * wx + wy * wy
+            if d < best_dist:
+                best_r, best_c, best_dist = r, c, d
+    start_cell = (best_r, best_c)
+
+    # Iterative DFS (avoids Python recursion limit on large grids)
+    stack: List[Tuple[int, int]] = [start_cell]
+    visited[start_cell[0]][start_cell[1]] = True
+    while stack:
+        r, c = stack[-1]
+        neighbors = []
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < grid_rows and 0 <= nc < grid_cols and not visited[nr][nc]:
+                neighbors.append((nr, nc, dr, dc))
+        if not neighbors:
+            stack.pop()
+            continue
+        nr, nc, dr, dc = neighbors[int(rng.randint(len(neighbors)))]
+        # Remove the wall between (r,c) and (nr,nc)
+        if dr == -1:  # neighbor above → horizontal wall at row r
+            h_walls[r][c] = False
+        elif dr == 1:  # neighbor below → horizontal wall at row r+1
+            h_walls[r + 1][c] = False
+        elif dc == -1:  # neighbor left → vertical wall at col c
+            v_walls[r][c] = False
+        elif dc == 1:  # neighbor right → vertical wall at col c+1
+            v_walls[r][c + 1] = False
+        visited[nr][nc] = True
+        stack.append((nr, nc))
+
+    # ---- 2. Convert remaining walls to ObstacleSpec boxes ----
+    height = float(rng.uniform(wall_height_range[0], wall_height_range[1]))
+    color = _random_color(rng)
+    obstacles: List[ObstacleSpec] = []
+
+    # Horizontal walls: between row r-1 and r at column c.
+    # Each segment sits at the boundary y = oy + r*step - step/2
+    for r in range(grid_rows + 1):
+        c_start: Optional[int] = None
+        for c in range(grid_cols):
+            if h_walls[r][c]:
+                if c_start is None:
+                    c_start = c
+            else:
+                if c_start is not None:
+                    _emit_h_wall(obstacles, c_start, c - 1, r, ox, oy, step,
+                                 cell_size, wall_thickness, height, color)
+                    c_start = None
+        if c_start is not None:
+            _emit_h_wall(obstacles, c_start, grid_cols - 1, r, ox, oy, step,
+                         cell_size, wall_thickness, height, color)
+
+    # Vertical walls: between col c-1 and c at row r.
+    for c in range(grid_cols + 1):
+        r_start: Optional[int] = None
+        for r in range(grid_rows):
+            if v_walls[r][c]:
+                if r_start is None:
+                    r_start = r
+            else:
+                if r_start is not None:
+                    _emit_v_wall(obstacles, r_start, r - 1, c, ox, oy, step,
+                                 cell_size, wall_thickness, height, color)
+                    r_start = None
+        if r_start is not None:
+            _emit_v_wall(obstacles, r_start, grid_rows - 1, c, ox, oy, step,
+                         cell_size, wall_thickness, height, color)
+
+    # Perimeter walls — four continuous segments around the entire grid
+    total_x = grid_cols * step + wall_thickness
+    total_y = grid_rows * step + wall_thickness
+    cx_mid = ox + (grid_cols - 1) * step / 2.0
+    cy_mid = oy + (grid_rows - 1) * step / 2.0
+    hz = height / 2.0
+    perim_color = _random_color(rng)
+    # Bottom perimeter (y_min)
+    y_bot = oy - step / 2.0
+    obstacles.append(ObstacleSpec(
+        pos=(cx_mid, y_bot, hz), size=(total_x, wall_thickness, height), color=perim_color))
+    # Top perimeter (y_max)
+    y_top = oy + (grid_rows - 1) * step + step / 2.0
+    obstacles.append(ObstacleSpec(
+        pos=(cx_mid, y_top, hz), size=(total_x, wall_thickness, height), color=perim_color))
+    # Left perimeter (x_min)
+    x_left = ox - step / 2.0
+    obstacles.append(ObstacleSpec(
+        pos=(x_left, cy_mid, hz), size=(wall_thickness, total_y, height), color=perim_color))
+    # Right perimeter (x_max)
+    x_right = ox + (grid_cols - 1) * step + step / 2.0
+    obstacles.append(ObstacleSpec(
+        pos=(x_right, cy_mid, hz), size=(wall_thickness, total_y, height), color=perim_color))
+
+    obstacle_layout = ObstacleLayout(obstacles)
+
+    # ---- 3. Find dead-ends furthest from start via BFS ----
+    dist_map = [[-1] * grid_cols for _ in range(grid_rows)]
+    dist_map[start_cell[0]][start_cell[1]] = 0
+    bfs_queue: List[Tuple[int, int]] = [start_cell]
+    head = 0
+    while head < len(bfs_queue):
+        r, c = bfs_queue[head]
+        head += 1
+        d = dist_map[r][c]
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < grid_rows and 0 <= nc < grid_cols):
+                continue
+            if dist_map[nr][nc] >= 0:
+                continue
+            # Check that the wall between (r,c) and (nr,nc) is removed
+            if dr == -1 and h_walls[r][c]:
+                continue
+            if dr == 1 and h_walls[r + 1][c]:
+                continue
+            if dc == -1 and v_walls[r][c]:
+                continue
+            if dc == 1 and v_walls[r][c + 1]:
+                continue
+            dist_map[nr][nc] = d + 1
+            bfs_queue.append((nr, nc))
+
+    # Identify dead-end cells (only 1 open neighbor), sorted by distance descending
+    dead_ends: List[Tuple[int, int, int]] = []  # (dist, row, col)
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            if (r, c) == start_cell:
+                continue
+            openings = 0
+            if r > 0 and not h_walls[r][c]:
+                openings += 1
+            if r < grid_rows - 1 and not h_walls[r + 1][c]:
+                openings += 1
+            if c > 0 and not v_walls[r][c]:
+                openings += 1
+            if c < grid_cols - 1 and not v_walls[r][c + 1]:
+                openings += 1
+            if openings == 1:
+                dead_ends.append((dist_map[r][c], r, c))
+    dead_ends.sort(key=lambda x: -x[0])
+
+    # ---- 4. Place beacons at dead-end wall faces ----
+    if beacon_identities is None:
+        all_ids = list(BEACON_FAMILIES.keys())
+        beacon_identities = list(rng.choice(all_ids, size=min(n_beacons, len(all_ids)), replace=False))
+
+    beacon_specs: List[BeaconSpec] = []
+    used_cells: set[Tuple[int, int]] = set()
+    for i in range(n_beacons):
+        if i >= len(dead_ends):
+            break
+        _, br, bc = dead_ends[i]
+        if (br, bc) in used_cells:
+            continue
+        used_cells.add((br, bc))
+        identity = beacon_identities[i % len(beacon_identities)]
+
+        # Find the closed wall of this dead-end to mount the beacon on
+        wall_pos, wall_normal = _dead_end_wall_face(
+            br, bc, h_walls, v_walls, grid_rows, grid_cols, ox, oy, step, height,
+        )
+        b = make_beacon_panel(wall_pos, wall_normal, identity, rng)
+        beacon_specs.append(b)
+
+    # Optional distractor patches
+    distractors: List[ObstacleSpec] = []
+    if n_distractors > 0:
+        identities = [b.identity for b in beacon_specs] if beacon_specs else list(BEACON_FAMILIES.keys())
+        for _ in range(n_distractors):
+            r_d = int(rng.randint(grid_rows))
+            c_d = int(rng.randint(grid_cols))
+            wx, wy = _cell_world_xy(r_d, c_d)
+            pos = (float(wx), float(wy), float(rng.uniform(0.08, height * 0.8)))
+            near = rng.choice(identities)
+            distractors.append(make_distractor_patch(pos, rng, near_identity=near))
+
+    beacon_layout = BL(beacons=beacon_specs, distractors=distractors)
+    return obstacle_layout, beacon_layout, start_cell
+
+
+def _emit_h_wall(
+    obstacles: List[ObstacleSpec],
+    c_start: int, c_end: int, r: int,
+    ox: float, oy: float, step: float,
+    cell_size: float, wall_thickness: float, height: float,
+    color: Tuple[float, float, float],
+) -> None:
+    """Emit a merged horizontal wall segment spanning columns c_start..c_end at row boundary r."""
+    x0 = ox + c_start * step - cell_size / 2.0
+    x1 = ox + c_end * step + cell_size / 2.0
+    cx = (x0 + x1) / 2.0
+    cy = oy + r * step - step / 2.0
+    length = x1 - x0
+    hz = height / 2.0
+    obstacles.append(ObstacleSpec(
+        pos=(cx, cy, hz),
+        size=(length, wall_thickness, height),
+        color=color,
+    ))
+
+
+def _emit_v_wall(
+    obstacles: List[ObstacleSpec],
+    r_start: int, r_end: int, c: int,
+    ox: float, oy: float, step: float,
+    cell_size: float, wall_thickness: float, height: float,
+    color: Tuple[float, float, float],
+) -> None:
+    """Emit a merged vertical wall segment spanning rows r_start..r_end at column boundary c."""
+    y0 = oy + r_start * step - cell_size / 2.0
+    y1 = oy + r_end * step + cell_size / 2.0
+    cy = (y0 + y1) / 2.0
+    cx = ox + c * step - step / 2.0
+    length = y1 - y0
+    hz = height / 2.0
+    obstacles.append(ObstacleSpec(
+        pos=(cx, cy, hz),
+        size=(wall_thickness, length, height),
+        color=color,
+    ))
+
+
+def _dead_end_wall_face(
+    r: int, c: int,
+    h_walls, v_walls,
+    grid_rows: int, grid_cols: int,
+    ox: float, oy: float, step: float, height: float,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float]]:
+    """Find the closed wall of a dead-end cell and return (wall_centre, outward_normal).
+
+    The beacon is placed facing *into* the cell (normal points toward cell centre).
+    """
+    cx, cy = ox + c * step, oy + r * step
+    hz = height / 2.0
+    half_cell = step / 2.0
+
+    # Check which walls are still present (closed)
+    # Top wall: h_walls[r+1][c]
+    if r < grid_rows - 1 and h_walls[r + 1][c]:
+        # Wall above this cell — beacon faces downward (-y)
+        return (cx, cy + half_cell, hz), (0.0, -1.0)
+    # Bottom wall: h_walls[r][c]
+    if r > 0 and h_walls[r][c]:
+        return (cx, cy - half_cell, hz), (0.0, 1.0)
+    # Right wall: v_walls[r][c+1]
+    if c < grid_cols - 1 and v_walls[r][c + 1]:
+        return (cx + half_cell, cy, hz), (-1.0, 0.0)
+    # Left wall: v_walls[r][c]
+    if c > 0 and v_walls[r][c]:
+        return (cx - half_cell, cy, hz), (1.0, 0.0)
+
+    # Perimeter walls as fallback
+    if r == 0:
+        return (cx, cy - half_cell, hz), (0.0, 1.0)
+    if r == grid_rows - 1:
+        return (cx, cy + half_cell, hz), (0.0, -1.0)
+    if c == 0:
+        return (cx - half_cell, cy, hz), (1.0, 0.0)
+    return (cx + half_cell, cy, hz), (-1.0, 0.0)
