@@ -180,14 +180,21 @@ class CEMPlanner:
             # Full TrajectoryScorer: safety + goal + exploration
             costs = self.scorer.score(z_rollouts, z_goal=z_goal_batch if z_goal_batch is not None else None)
 
-            # Safety-gated forward reward: encourages forward motion but
-            # backs off when the safety head predicts danger ahead.
+            # Forward reward with soft safety gating: encourages forward
+            # motion while moderately backing off near walls.
             if self.forward_reward_weight > 0.0:
                 safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
                 safety_mean = safety_cost / float(max(1, self.horizon))
-                bonus_gate = 1.0 / (1.0 + safety_mean.detach())
+                # Soft gate: sigmoid-like, only suppresses at very high safety
+                bonus_gate = torch.exp(-0.3 * safety_mean.detach())
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
                 costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
+
+            # Yaw oscillation penalty: discourages indecisive spinning
+            yaw_penalty_weight = 0.15
+            yaw_rates = samples[:, :, 2]  # (N, H)
+            yaw_abs = yaw_rates.abs().sum(dim=-1)
+            costs = costs + yaw_penalty_weight * yaw_abs
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -229,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--grid_rows", type=int, default=4)
     parser.add_argument("--grid_cols", type=int, default=4)
-    parser.add_argument("--cell_size", type=float, default=0.55)
+    parser.add_argument("--cell_size", type=float, default=0.70)
     parser.add_argument("--wall_thickness", type=float, default=0.20)
     parser.add_argument("--n_beacons", type=int, default=2)
     parser.add_argument("--n_distractors", type=int, default=0)
@@ -247,9 +254,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--elite_frac", type=float, default=0.15)
     parser.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
     parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
-    parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
+    parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.25])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    parser.add_argument("--forward_reward_weight", type=float, default=0.5,
+    parser.add_argument("--forward_reward_weight", type=float, default=2.0,
                         help="Safety-gated forward velocity bonus (prevents backing up)")
     # PPO noise
     parser.add_argument("--ppo_obs_noise_std", type=float, default=0.0)

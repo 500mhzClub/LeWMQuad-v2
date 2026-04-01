@@ -905,7 +905,16 @@ def generate_enclosed_maze(
 
     # ---- 2. Convert remaining walls to ObstacleSpec boxes ----
     height = float(rng.uniform(wall_height_range[0], wall_height_range[1]))
-    color = _random_color(rng)
+
+    # Dark, desaturated wall colours that cannot be confused with beacons.
+    # Range: base 0.20-0.45 with slight tint → grey/brown/olive tones.
+    def _maze_wall_color() -> Tuple[float, float, float]:
+        base = rng.uniform(0.20, 0.45)
+        tint = rng.uniform(-0.06, 0.06, size=3)
+        c = np.clip(base + tint, 0.10, 0.55)
+        return (float(c[0]), float(c[1]), float(c[2]))
+
+    color = _maze_wall_color()
     obstacles: List[ObstacleSpec] = []
 
     # Horizontal walls: between row r-1 and r at column c.
@@ -947,7 +956,7 @@ def generate_enclosed_maze(
     cx_mid = ox + (grid_cols - 1) * step / 2.0
     cy_mid = oy + (grid_rows - 1) * step / 2.0
     hz = height / 2.0
-    perim_color = _random_color(rng)
+    perim_color = _maze_wall_color()
     # Bottom perimeter (y_min)
     y_bot = oy - step / 2.0
     obstacles.append(ObstacleSpec(
