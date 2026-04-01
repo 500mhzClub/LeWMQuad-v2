@@ -178,26 +178,49 @@ class CEMPlanner:
 
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
 
-            # Full TrajectoryScorer: safety + goal + exploration
-            costs = self.scorer.score(z_rollouts, z_goal=z_goal_batch if z_goal_batch is not None else None)
+            # --- Decomposed cost: safety-first, then exploration ---
+            # Safety always dominates; exploration only breaks ties
+            # among trajectories the world model considers safe.
 
-            # Forward reward gated by the world model's safety prediction:
-            # full bonus when corridor-safe, hard kill on collision prediction.
-            # Threshold 0.45: corridor navigation (mobility cost ~0.2-0.3) gets
-            # full reward; only actual contact predictions (>0.45) suppress it.
+            # 1. Safety cost
+            safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
+            safety_mean = safety_cost / float(max(1, self.horizon))
+
+            # 2. Goal attraction (when seeking a beacon)
+            goal_cost = torch.zeros_like(safety_cost)
+            if self.scorer.goal_head is not None and z_goal_batch is not None:
+                goal_cost = self.scorer.goal_weight * self.scorer.goal_head.score_trajectory(
+                    z_rollouts, z_goal_batch,
+                )
+
+            # 3. Forward reward gated by safety prediction
+            forward_term = torch.zeros_like(safety_cost)
             if self.forward_reward_weight > 0.0:
-                safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
-                safety_mean = safety_cost / float(max(1, self.horizon))
-                bonus_gate = torch.sigmoid(6.0 * (0.45 - safety_mean.detach()))
+                bonus_gate = torch.sigmoid(5.0 * (0.3 - safety_mean.detach()))
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
-                costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
+                forward_term = self.forward_reward_weight * bonus_gate * forward_bonus
 
-            # Yaw jerk penalty: penalises direction *changes* in yaw (oscillation)
-            # but NOT a sustained turn — allows clean corners, blocks spinning.
+            # 4. Yaw jerk penalty
+            yaw_term = torch.zeros_like(safety_cost)
             if self.yaw_penalty_weight > 0.0 and self.horizon > 1:
                 yaw_rates = samples[:, :, 2]          # (N, H)
                 yaw_jerk = (yaw_rates[:, 1:] - yaw_rates[:, :-1]).abs().sum(dim=-1)
-                costs = costs + self.yaw_penalty_weight * yaw_jerk
+                yaw_term = self.yaw_penalty_weight * yaw_jerk
+
+            # 5. Exploration — ONLY credited to safe trajectories
+            # Prevents novelty from pulling the robot into walls.
+            explore_term = torch.zeros_like(safety_cost)
+            if (self.scorer.exploration is not None
+                    and self.scorer.exploration_weight > 0):
+                N_cand, H_len, D_lat = z_rollouts.shape
+                bonus = self.scorer.exploration(
+                    z_rollouts.reshape(N_cand * H_len, D_lat),
+                ).reshape(N_cand, H_len).sum(dim=-1)
+                # Steep gate: ~1.0 when safe (mean<0.25), ~0 when risky (mean>0.45)
+                explore_gate = torch.sigmoid(8.0 * (0.35 - safety_mean.detach()))
+                explore_term = self.scorer.exploration_weight * explore_gate * bonus
+
+            costs = safety_cost + goal_cost + yaw_term - forward_term - explore_term
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -443,7 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.25])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    parser.add_argument("--forward_reward_weight", type=float, default=1.0,
+    parser.add_argument("--forward_reward_weight", type=float, default=0.8,
                         help="Forward velocity bonus weight")
     parser.add_argument("--exploration_weight", type=float, default=None,
                         help="Override exploration bonus weight from scorer checkpoint.")
