@@ -9,6 +9,7 @@ from .energy_head import (
     TrajectoryScorer,
     composite_energy_target,
     composite_safety_target,
+    consequence_safety_target,
     beacon_goal_target,
 )
 from .ppo import ActorCritic

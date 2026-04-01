@@ -173,6 +173,41 @@ def composite_safety_target(
     return w_safety * safety + w_mobility * mobility
 
 
+def consequence_safety_target(
+    clearance: torch.Tensor,
+    traversability: torch.Tensor,
+    collisions: torch.Tensor,
+    traversability_horizon: int = 10,
+    contact_clearance: float = 0.08,
+    w_contact: float = 0.4,
+    w_mobility: float = 0.6,
+) -> torch.Tensor:
+    """Consequence-based safety target — penalises *outcomes*, not proximity.
+
+    Unlike :func:`composite_safety_target` this does NOT create a repulsive
+    gradient around walls.  Walking parallel to a wall at 15 cm is fine;
+    only actual contact and dead-end situations are penalised.
+
+    Terms:
+        contact — actual collision flag OR clearance below physical-touch
+                  threshold.  Binary, not graded.
+        mobility — forward traversability, same as before.  Captures
+                   dead-ends and facing-wall situations without penalising
+                   corridor proximity.
+
+    Returns a value in [0, 1] where 0 = making progress freely.
+    """
+    # Contact: actual collision OR physically touching
+    contact = collisions.float().clamp(0, 1)
+    touching = (clearance < contact_clearance).float()
+    contact_term = torch.max(contact, touching)
+
+    # Mobility: 0 when open corridor, 1 when completely stuck
+    mobility = 1.0 - (traversability.float() / traversability_horizon).clamp(0, 1)
+
+    return w_contact * contact_term + w_mobility * mobility
+
+
 def beacon_goal_target(
     beacon_range: torch.Tensor,
     beacon_identity: torch.Tensor,

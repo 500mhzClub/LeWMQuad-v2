@@ -45,6 +45,7 @@ from lewm.models import (
     ExplorationBonus,
     TrajectoryScorer,
     composite_safety_target,
+    consequence_safety_target,
 )
 from lewm.data import StreamingJEPADataset
 from lewm.checkpoint_utils import clean_state_dict
@@ -85,9 +86,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--save_every", type=int, default=2000)
+    p.add_argument("--safety_mode", type=str, default="consequence",
+                   choices=["proximity", "consequence"],
+                   help="'proximity' = legacy clearance-gradient target, "
+                        "'consequence' = contact + mobility target.")
     p.add_argument("--w_safety", type=float, default=0.6)
     p.add_argument("--w_mobility", type=float, default=0.4)
     p.add_argument("--clearance_clip", type=float, default=1.0)
+    p.add_argument("--w_contact", type=float, default=0.4,
+                   help="Weight for contact term (consequence mode).")
+    p.add_argument("--contact_clearance", type=float, default=0.08,
+                   help="Clearance below which counts as physical contact (m).")
     # Goal head
     p.add_argument("--skip_goal", action="store_true",
                    help="Skip GoalEnergyHead training.")
@@ -141,7 +150,7 @@ def load_frozen_encoder(args, device):
 # --------------------------------------------------------------------- #
 
 SHARD_SAMPLES = 1_000_000  # ~750 MB per shard at dim=192
-CACHE_VERSION = 2          # bump to invalidate old caches
+CACHE_VERSION = 3          # v3: adds collisions to shards for consequence target
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -211,13 +220,14 @@ def extract_latents(args, device) -> str:
     st_buf: list[torch.Tensor] = []
     bid_buf: list[torch.Tensor] = []
     br_buf: list[torch.Tensor] = []
+    coll_buf: list[torch.Tensor] = []
     buf_samples = 0
     shard_idx = 0
     total_samples = 0
     pbar = None
 
     def flush_shard():
-        nonlocal z_buf, st_buf, bid_buf, br_buf, buf_samples, shard_idx, total_samples
+        nonlocal z_buf, st_buf, bid_buf, br_buf, coll_buf, buf_samples, shard_idx, total_samples
         if not z_buf:
             return
         shard_path = os.path.join(cache_dir, f"shard_{shard_idx:04d}.pt")
@@ -226,10 +236,11 @@ def extract_latents(args, device) -> str:
             "safety_target": torch.cat(st_buf),
             "beacon_identity": torch.cat(bid_buf),
             "beacon_range": torch.cat(br_buf),
+            "collisions": torch.cat(coll_buf),
         }, shard_path)
         total_samples += buf_samples
         progress_write(f"  Shard {shard_idx}: {buf_samples:,} samples -> {shard_path}", pbar)
-        z_buf, st_buf, bid_buf, br_buf = [], [], [], []
+        z_buf, st_buf, bid_buf, br_buf, coll_buf = [], [], [], [], []
         buf_samples = 0
         shard_idx += 1
 
@@ -256,14 +267,28 @@ def extract_latents(args, device) -> str:
 
             z_flat = z_proj.reshape(B * T, -1).float().cpu()
 
-            # Safety + mobility target (no beacon term)
-            safety_t = composite_safety_target(
-                clearance.float(), traversability,
-                clearance_clip=args.clearance_clip,
-                traversability_horizon=10,
-                w_safety=args.w_safety,
-                w_mobility=args.w_mobility,
-            ).reshape(B * T)
+            # Flatten collisions for this batch
+            coll_flat = collisions.float().reshape(B * T)
+
+            # Safety target — mode selects proximity vs consequence
+            if args.safety_mode == "consequence":
+                safety_t = consequence_safety_target(
+                    clearance.float().reshape(B * T),
+                    traversability.reshape(B * T),
+                    coll_flat,
+                    traversability_horizon=10,
+                    contact_clearance=args.contact_clearance,
+                    w_contact=args.w_contact,
+                    w_mobility=args.w_mobility,
+                )
+            else:
+                safety_t = composite_safety_target(
+                    clearance.float(), traversability,
+                    clearance_clip=args.clearance_clip,
+                    traversability_horizon=10,
+                    w_safety=args.w_safety,
+                    w_mobility=args.w_mobility,
+                ).reshape(B * T)
 
             # Beacon labels (flattened)
             if beacon_range is not None:
@@ -279,6 +304,7 @@ def extract_latents(args, device) -> str:
             st_buf.append(safety_t)
             bid_buf.append(bid_flat)
             br_buf.append(br_flat)
+            coll_buf.append(coll_flat)
             buf_samples += B * T
 
             if buf_samples >= SHARD_SAMPLES:
@@ -318,6 +344,9 @@ def load_cached_latents(cache_dir: str):
     bid = torch.cat(bid_all)
     br = torch.cat(br_all)
     print(f"Total: {z.shape[0]:,} samples, z={z.shape}")
+    # Report collision stats if available in v3 shards
+    n_contact = (st > 0.9).sum().item()
+    print(f"  High-energy samples (>0.9): {n_contact:,} ({100*n_contact/len(st):.1f}%)")
     return z, st, bid, br
 
 
@@ -665,7 +694,12 @@ def train(args):
     os.makedirs(args.log_dir, exist_ok=True)
 
     print(f"Training planning heads on {device}")
-    print(f"Safety weights: w_safety={args.w_safety}, w_mobility={args.w_mobility}")
+    print(f"Safety mode: {args.safety_mode}")
+    if args.safety_mode == "consequence":
+        print(f"  w_contact={args.w_contact}, w_mobility={args.w_mobility}, "
+              f"contact_clearance={args.contact_clearance}m")
+    else:
+        print(f"  w_safety={args.w_safety}, w_mobility={args.w_mobility}")
     print(f"Goal weight: {args.goal_weight}, Exploration weight: {args.exploration_weight}")
 
     # Phase 1: extract (or reuse cache)
@@ -702,6 +736,7 @@ def train(args):
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
         "exploration_feature_dim": args.exploration_feature_dim,
+        "safety_mode": args.safety_mode,
     }
     torch.save(scorer_data, scorer_path)
     print(f"\nTrajectoryScorer checkpoint saved: {scorer_path}")

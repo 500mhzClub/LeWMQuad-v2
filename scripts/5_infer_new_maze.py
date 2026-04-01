@@ -181,15 +181,12 @@ class CEMPlanner:
             # Full TrajectoryScorer: safety + goal + exploration
             costs = self.scorer.score(z_rollouts, z_goal=z_goal_batch if z_goal_batch is not None else None)
 
-            # Forward reward with soft safety gating: encourages forward
-            # motion while moderately backing off near walls.
+            # Forward reward: encourage forward motion.  The world model and
+            # consequence-trained energy head already penalise trajectories
+            # that lead to collisions — no safety gate needed.
             if self.forward_reward_weight > 0.0:
-                safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
-                safety_mean = safety_cost / float(max(1, self.horizon))
-                # Soft gate: sigmoid-like, only suppresses at very high safety
-                bonus_gate = torch.exp(-0.3 * safety_mean.detach())
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
-                costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
+                costs = costs - self.forward_reward_weight * forward_bonus
 
             # Yaw jerk penalty: penalises direction *changes* in yaw (oscillation)
             # but NOT a sustained turn — allows clean corners, blocks spinning.
@@ -1241,7 +1238,6 @@ def main() -> None:
         last_nominal_cmd = torch.zeros(3, device=planning_device, dtype=torch.float32)
         consecutive_collisions = 0
         forced_recovery_steps = 0
-        front_blocked_streak = 0
         recovery_spin_age = 0
 
         # ---- 6. Initial observation ----
@@ -1324,61 +1320,45 @@ def main() -> None:
         )
 
         # Recovery manoeuvre constants (outside loop — fixed for entire run)
-        CLEARANCE_FULL = 0.40   # beyond this: full forward weight
-        CLEARANCE_ZERO = 0.10   # at/below this: no forward reward
-        TURN_TRIGGER_CLEARANCE = 0.14
-        TURN_RELEASE_CLEARANCE = 0.26
-        TURN_MIN_DELTA_RAD = math.radians(35.0)
-        TURN_REPLAN_ADVANTAGE = 0.10
-        BLOCKED_STREAK_TRIGGER = 3
-        RECOVERY_TRIGGER = 3    # consecutive collision steps before committed pivot
-        RECOVERY_DURATION = 48  # committed spin; exit early once a safe heading opens
-        RECOVERY_MIN_SPIN_STEPS = 8
+        # Collision backstop only — no proactive pivot.  The planner
+        # handles turning via the consequence-trained energy head.
+        RECOVERY_TRIGGER = 3    # consecutive collision steps before backstop spin
+        RECOVERY_DURATION = 12  # short backstop spin (was 48)
+        RECOVERY_MIN_SPIN_STEPS = 4
+        TURN_RELEASE_CLEARANCE = 0.20
+        TURN_MIN_DELTA_RAD = math.radians(25.0)
         recovery_turn_sign = 1.0  # will be set at recovery trigger
 
         # ---- 7. Main loop ----
         for step in range(args.steps):
-            # --- Wall-aware forward bias scaling ---
-            # Ray-march forward to find clearance; scale down forward_reward_weight
-            # as the robot approaches a wall, reaching 0 when touching.
+            # --- Forward clearance (used for metrics + collision backstop only) ---
             clearance_plan = compute_forward_clearance(
                 obs["pos_np"][:2], obs["yaw_rad"], obstacle_layout,
             )
-            clearance_frac = max(0.0, min(1.0,
-                (clearance_plan - CLEARANCE_ZERO) / (CLEARANCE_FULL - CLEARANCE_ZERO)
-            ))
-            planner.forward_reward_weight = args.forward_reward_weight * clearance_frac
-            # Near a wall, suppress yaw jerk penalty so the robot can commit
-            # to a clean corner turn without the oscillation cost blocking it.
-            planner.yaw_penalty_weight = 0.10 * clearance_frac
-            front_blocked = clearance_plan <= TURN_TRIGGER_CLEARANCE
-            front_blocked_streak = front_blocked_streak + 1 if front_blocked else 0
+            # No clearance-based weight scaling — the consequence-trained
+            # energy head handles wall avoidance through the world model.
+            planner.forward_reward_weight = args.forward_reward_weight
+            planner.yaw_penalty_weight = 0.05
 
             escape_heading = obs["yaw_rad"]
             escape_clearance = clearance_plan
             escape_delta = 0.0
             escape_scan: list[tuple[float, float]] = []
-            if front_blocked or forced_recovery_steps > 0 or consecutive_collisions > 0:
+            if forced_recovery_steps > 0 or consecutive_collisions > 0:
                 escape_heading, escape_clearance, escape_delta, escape_scan = choose_escape_heading(
                     obs["pos_np"][:2], obs["yaw_rad"], obstacle_layout,
                 )
 
             use_forced_recovery = False
-            proactive_pivot = (
-                front_blocked_streak >= BLOCKED_STREAK_TRIGGER
-                and escape_clearance >= max(TURN_RELEASE_CLEARANCE, clearance_plan + TURN_REPLAN_ADVANTAGE)
-                and abs(escape_delta) >= TURN_MIN_DELTA_RAD
-            )
             collision_pivot = (
                 consecutive_collisions >= RECOVERY_TRIGGER
-                and escape_clearance >= clearance_plan + 0.04
                 and abs(escape_delta) >= TURN_MIN_DELTA_RAD
             )
 
-            # --- Committed pivot recovery when the forward corridor is blocked ---
+            # --- Collision backstop: short spin only on repeated collisions ---
             if forced_recovery_steps > 0:
                 if recovery_spin_age >= RECOVERY_MIN_SPIN_STEPS and clearance_plan >= TURN_RELEASE_CLEARANCE:
-                    print(f"Step {step:03d} | pivot exit clr={clearance_plan:.2f}m "
+                    print(f"Step {step:03d} | backstop exit clr={clearance_plan:.2f}m "
                           f"best={escape_clearance:.2f}m yaw_err={math.degrees(escape_delta):+.1f}deg")
                     forced_recovery_steps = 0
                     recovery_spin_age = 0
@@ -1386,7 +1366,7 @@ def main() -> None:
                     forced_recovery_steps -= 1
                     recovery_spin_age += 1
                     use_forced_recovery = True
-            elif proactive_pivot or collision_pivot:
+            elif collision_pivot:
                 forced_recovery_steps = RECOVERY_DURATION - 1
                 recovery_spin_age = 1
                 if abs(escape_delta) >= math.radians(12.0):
@@ -1397,19 +1377,13 @@ def main() -> None:
                 recovery_episode_count += 1
                 planner.reset()
                 last_nominal_cmd.zero_()
-                trigger_reason = (
-                    f"blocked x{front_blocked_streak}"
-                    if proactive_pivot else
-                    f"collisions x{consecutive_collisions}"
-                )
                 scan_str = " ".join(f"{deg:+.0f}:{clr:.2f}" for deg, clr in escape_scan)
                 print(
-                    f"Step {step:03d} | pivot trigger {trigger_reason} "
+                    f"Step {step:03d} | backstop trigger collisions x{consecutive_collisions} "
                     f"clr={clearance_plan:.2f}m -> best={escape_clearance:.2f}m "
                     f"delta={math.degrees(escape_delta):+.1f}deg sign={recovery_turn_sign:+.0f} "
                     f"scan=[{scan_str}]"
                 )
-                front_blocked_streak = 0
 
             if use_forced_recovery:
                 if abs(escape_delta) >= math.radians(10.0):
@@ -1419,7 +1393,7 @@ def main() -> None:
                 plan_stats = PlanningStats(best_cost=0.0, mean_cost=0.0,
                                            std_cost=0.0, elite_cost=0.0)
             else:
-                # Plan
+                # Plan — world model + consequence energy drives all navigation
                 plan_seq, plan_stats = planner.plan(
                     z_start_raw=obs["z_raw"],
                     z_goal_proj=z_breadcrumb,
@@ -1577,7 +1551,7 @@ def main() -> None:
                 "frame_substituted": bool(obs["frame_substituted"]),
                 "collided": bool(collided),
                 "fallen": bool(fallen),
-                "planning_front_blocked_streak": int(front_blocked_streak),
+                "planning_forced_recovery_steps": int(forced_recovery_steps),
                 "planning_escape_clearance_m": float(escape_clearance),
                 "planning_escape_delta_deg": float(math.degrees(escape_delta)),
                 "recovery_steps_remaining": int(forced_recovery_steps),
@@ -1611,7 +1585,7 @@ def main() -> None:
                 f"elite={plan_stats.elite_cost:.3f} clr={clearance_now:.2f}/{clearance_plan:.2f}m wd={wall_dist:.2f}m "
                 f"step={step_dist:.3f}m cum={cumulative_dist:.2f}m area={visited_area:.3f}m^2 "
                 f"cells={len(visited_cells)} coll={int(collided)} fall={int(fallen)} "
-                f"frame_sub={int(obs['frame_substituted'])} blocked={front_blocked_streak} "
+                f"frame_sub={int(obs['frame_substituted'])} "
                 f"escape={escape_clearance:.2f}@{math.degrees(escape_delta):+.0f}deg "
                 f"recovery={forced_recovery_steps} "
                 f"target=center:{dist_to_target_center:.2f} claim:{dist_to_target_claim:.2f} "
