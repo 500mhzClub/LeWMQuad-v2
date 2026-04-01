@@ -292,6 +292,52 @@ class ExplorationBonus(nn.Module):
         """Training loss — average prediction error over the batch."""
         return self.forward(z).mean()
 
+    @torch.no_grad()
+    def online_update(
+        self,
+        z: torch.Tensor,
+        lr: float = 1e-3,
+        n_steps: int = 1,
+    ) -> float:
+        """Finetune the predictor on observed latents so revisited states
+        lose their novelty bonus.  Call once per inference step with the
+        current observation's latent.
+
+        This is intentionally lightweight — one or a few SGD steps on a
+        tiny batch so it doesn't slow down the control loop.
+
+        Args:
+            z: (1, D) or (D,) latent from the current observation.
+            lr: learning rate for the online update.
+            n_steps: gradient steps per call.
+
+        Returns:
+            The prediction error (bonus) *before* the update.
+        """
+        z = z.detach()
+        if z.ndim == 1:
+            z = z.unsqueeze(0)
+
+        # Record bonus before update
+        bonus_before = self.forward(z).mean().item()
+
+        # Temporarily enable gradients for the predictor
+        for p in self.predictor.parameters():
+            p.requires_grad_(True)
+
+        for _ in range(n_steps):
+            t = self.target(z)
+            p = self.predictor(z)
+            loss = (p - t).square().mean()
+            grads = torch.autograd.grad(loss, self.predictor.parameters())
+            for param, grad in zip(self.predictor.parameters(), grads):
+                param.data.sub_(lr * grad)
+
+        for p in self.predictor.parameters():
+            p.requires_grad_(False)
+
+        return bonus_before
+
 
 # --------------------------------------------------------------------- #
 # Combined trajectory scorer for CEM / MPC planning

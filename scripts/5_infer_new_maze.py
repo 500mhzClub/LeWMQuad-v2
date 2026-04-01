@@ -440,7 +440,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.25])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     parser.add_argument("--forward_reward_weight", type=float, default=1.2,
-                        help="Safety-gated forward velocity bonus (prevents backing up)")
+                        help="Forward velocity bonus weight")
+    parser.add_argument("--exploration_weight", type=float, default=None,
+                        help="Override exploration bonus weight from scorer checkpoint.")
+    parser.add_argument("--rnd_online_lr", type=float, default=1e-3,
+                        help="Learning rate for online RND adaptation (0 to disable).")
     # PPO noise
     parser.add_argument("--ppo_obs_noise_std", type=float, default=0.0)
     # Success / termination
@@ -1031,6 +1035,8 @@ def main() -> None:
     # ---- 1. Load models ----
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
     scorer, scorer_meta = load_trajectory_scorer(args.scorer_ckpt, planning_device)
+    if args.exploration_weight is not None:
+        scorer.exploration_weight = args.exploration_weight
     camera_cfg = ego_camera_config_from_args(args)
     video_formats = resolve_video_formats(args.video_format)
 
@@ -1431,6 +1437,16 @@ def main() -> None:
                 ego_frame_substitutions += 1
             else:
                 last_clean_ego_frame = obs["frame_hwc"].copy()
+
+            # Online RND adaptation — teach predictor about this observation
+            # so revisited states progressively lose their novelty bonus.
+            if (args.rnd_online_lr > 0
+                    and scorer.exploration is not None
+                    and not obs["frame_substituted"]):
+                scorer.exploration.online_update(
+                    obs["z_proj"].to(planning_device),
+                    lr=args.rnd_online_lr,
+                )
 
             # Third-person render
             tp_frame = render_third_person_frame(
