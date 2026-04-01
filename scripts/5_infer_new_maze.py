@@ -178,37 +178,30 @@ class CEMPlanner:
 
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
 
-            # --- Decomposed cost: safety-first, then exploration ---
-            # Safety always dominates; exploration only breaks ties
-            # among trajectories the world model considers safe.
+            # --- Unified safety-budgeted cost ---
+            # Key invariant: the combined forward + exploration bonus is
+            # scaled by ONE safety gate.  This guarantees safety always
+            # retains proportional influence — no combination of bonus
+            # weights can overcome it.
 
-            # 1. Safety cost
+            # 1. Safety cost (always dominates)
             safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
             safety_mean = safety_cost / float(max(1, self.horizon))
 
-            # 2. Goal attraction (when seeking a beacon)
+            # 2. Goal attraction
             goal_cost = torch.zeros_like(safety_cost)
             if self.scorer.goal_head is not None and z_goal_batch is not None:
                 goal_cost = self.scorer.goal_weight * self.scorer.goal_head.score_trajectory(
                     z_rollouts, z_goal_batch,
                 )
 
-            # 3. Forward reward gated by safety prediction
+            # 3. Forward reward (raw, ungated)
             forward_term = torch.zeros_like(safety_cost)
             if self.forward_reward_weight > 0.0:
-                bonus_gate = torch.sigmoid(5.0 * (0.3 - safety_mean.detach()))
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
-                forward_term = self.forward_reward_weight * bonus_gate * forward_bonus
+                forward_term = self.forward_reward_weight * forward_bonus
 
-            # 4. Yaw jerk penalty
-            yaw_term = torch.zeros_like(safety_cost)
-            if self.yaw_penalty_weight > 0.0 and self.horizon > 1:
-                yaw_rates = samples[:, :, 2]          # (N, H)
-                yaw_jerk = (yaw_rates[:, 1:] - yaw_rates[:, :-1]).abs().sum(dim=-1)
-                yaw_term = self.yaw_penalty_weight * yaw_jerk
-
-            # 5. Exploration — ONLY credited to safe trajectories
-            # Prevents novelty from pulling the robot into walls.
+            # 4. Exploration bonus (raw, ungated)
             explore_term = torch.zeros_like(safety_cost)
             if (self.scorer.exploration is not None
                     and self.scorer.exploration_weight > 0):
@@ -216,11 +209,21 @@ class CEMPlanner:
                 bonus = self.scorer.exploration(
                     z_rollouts.reshape(N_cand * H_len, D_lat),
                 ).reshape(N_cand, H_len).sum(dim=-1)
-                # Steep gate: ~1.0 when safe (mean<0.25), ~0 when risky (mean>0.45)
-                explore_gate = torch.sigmoid(8.0 * (0.35 - safety_mean.detach()))
-                explore_term = self.scorer.exploration_weight * explore_gate * bonus
+                explore_term = self.scorer.exploration_weight * bonus
 
-            costs = safety_cost + goal_cost + yaw_term - forward_term - explore_term
+            # 5. Unified safety gate on ALL bonuses
+            # ~1.0 in safe corridors (mean<0.25), ~0 approaching walls (mean>0.55)
+            bonus_gate = torch.sigmoid(5.0 * (0.4 - safety_mean.detach()))
+            total_bonus = (forward_term + explore_term) * bonus_gate
+
+            # 6. Yaw jerk penalty
+            yaw_term = torch.zeros_like(safety_cost)
+            if self.yaw_penalty_weight > 0.0 and self.horizon > 1:
+                yaw_rates = samples[:, :, 2]          # (N, H)
+                yaw_jerk = (yaw_rates[:, 1:] - yaw_rates[:, :-1]).abs().sum(dim=-1)
+                yaw_term = self.yaw_penalty_weight * yaw_jerk
+
+            costs = safety_cost + goal_cost + yaw_term - total_bonus
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -459,14 +462,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show_viewer", action="store_true")
     # CEM planner
     parser.add_argument("--plan_horizon", type=int, default=8)
-    parser.add_argument("--n_candidates", type=int, default=256)
+    parser.add_argument("--n_candidates", type=int, default=384)
     parser.add_argument("--cem_iters", type=int, default=5)
     parser.add_argument("--elite_frac", type=float, default=0.15)
     parser.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
     parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.25])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    parser.add_argument("--forward_reward_weight", type=float, default=0.8,
+    parser.add_argument("--forward_reward_weight", type=float, default=1.0,
                         help="Forward velocity bonus weight")
     parser.add_argument("--exploration_weight", type=float, default=None,
                         help="Override exploration bonus weight from scorer checkpoint.")
