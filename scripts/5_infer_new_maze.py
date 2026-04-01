@@ -75,6 +75,7 @@ Q0_VALUES = [
 ]
 PHYSICS_URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
 EGO_RENDER_URDF_PATH = "assets/mini_pupper/mini_pupper_render.urdf"
+THIRD_PERSON_URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"  # full body visible
 ROBOT_SPAWN_Z = 0.12
 BEACON_IDENTITY_NAMES = list(BEACON_FAMILIES.keys())
 
@@ -116,6 +117,7 @@ class CEMPlanner:
         cmd_high: torch.Tensor,
         init_std: torch.Tensor,
         min_std: torch.Tensor,
+        forward_reward_weight: float,
         device: torch.device,
     ):
         self.world_model = world_model
@@ -128,6 +130,7 @@ class CEMPlanner:
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
+        self.forward_reward_weight = float(forward_reward_weight)
         self.device = device
         self._warm_start: torch.Tensor | None = None
 
@@ -176,6 +179,15 @@ class CEMPlanner:
 
             # Full TrajectoryScorer: safety + goal + exploration
             costs = self.scorer.score(z_rollouts, z_goal=z_goal_batch if z_goal_batch is not None else None)
+
+            # Safety-gated forward reward: encourages forward motion but
+            # backs off when the safety head predicts danger ahead.
+            if self.forward_reward_weight > 0.0:
+                safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
+                safety_mean = safety_cost / float(max(1, self.horizon))
+                bonus_gate = 1.0 / (1.0 + safety_mean.detach())
+                forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
+                costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -237,6 +249,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
+    parser.add_argument("--forward_reward_weight", type=float, default=0.5,
+                        help="Safety-gated forward velocity bonus (prevents backing up)")
     # PPO noise
     parser.add_argument("--ppo_obs_noise_std", type=float, default=0.0)
     # Success / termination
@@ -251,6 +265,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gif_stride", type=int, default=2)
     # Camera
     add_egocentric_camera_args(parser)
+    # Third-person camera
+    parser.add_argument("--third_person_res", type=int, default=480)
+    parser.add_argument("--third_person_fov", type=float, default=60.0)
+    parser.add_argument("--chase_dist", type=float, default=0.6)
+    parser.add_argument("--chase_height", type=float, default=0.45)
+    parser.add_argument("--side_offset", type=float, default=0.15)
+    parser.add_argument("--lookahead", type=float, default=0.3)
     # Breadcrumb view
     parser.add_argument("--breadcrumb_view_dist", type=float, default=0.5)
 
@@ -464,6 +485,55 @@ def render_egocentric_frame(
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
     return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)), pos_np, quat_np, False
+
+
+def render_third_person_frame(
+    physics_robot, physics_act_dofs,
+    render_robot, render_act_dofs, cam,
+    chase_dist: float, chase_height: float,
+    side_offset: float, lookahead: float,
+) -> np.ndarray:
+    """Chase-cam third-person view with the full robot body visible."""
+    pos_np, quat_np = sync_render_robot(physics_robot, physics_act_dofs, render_robot, render_act_dofs)
+
+    w, x, y, z = [float(v) for v in quat_np]
+    fw = np.array([
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y + w * z),
+        0.0,
+    ], dtype=np.float32)
+    fw_norm = float(np.linalg.norm(fw[:2]))
+    if fw_norm < 1e-6:
+        fw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        fw /= fw_norm
+    side = np.array([-fw[1], fw[0], 0.0], dtype=np.float32)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    cam_pos = pos_np - chase_dist * fw + chase_height * up + side_offset * side
+    cam_lookat = pos_np + lookahead * fw + 0.18 * up
+    cam.set_pose(pos=cam_pos, lookat=cam_lookat, up=up)
+
+    render_out = cam.render(rgb=True, force_render=True)
+    rgb = render_out[0]
+    if hasattr(rgb, "cpu"):
+        rgb = rgb.cpu().numpy()
+    return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+
+
+def resize_frame(frame_hwc: np.ndarray, target_res: int) -> np.ndarray:
+    if frame_hwc.shape[0] == target_res and frame_hwc.shape[1] == target_res:
+        return frame_hwc
+    return np.asarray(
+        Image.fromarray(frame_hwc).resize((target_res, target_res), Image.Resampling.BILINEAR),
+        dtype=np.uint8,
+    )
+
+
+def build_side_by_side_frame(first_person_hwc: np.ndarray, third_person_hwc: np.ndarray) -> np.ndarray:
+    ego = resize_frame(first_person_hwc, third_person_hwc.shape[0])
+    divider = np.full((third_person_hwc.shape[0], 8, 3), 12, dtype=np.uint8)
+    return np.concatenate([ego, divider, third_person_hwc], axis=1)
 
 
 # ---- Observation (perception-only, no oracle labels) --------------------- #
@@ -809,12 +879,26 @@ def main() -> None:
                 best_dist = d
                 target_beacon = b
 
-    # Choose spawn heading: face toward first corridor opening
+    # Choose spawn heading: face into the first open corridor, not toward the
+    # beacon through walls.  Probe each cardinal direction from the start cell
+    # and pick the one with the most clearance.
     spawn_yaw = 0.0
-    if target_beacon is not None:
-        dx = float(target_beacon.pos[0]) - float(spawn_xy[0])
-        dy = float(target_beacon.pos[1]) - float(spawn_xy[1])
-        spawn_yaw = math.atan2(dy, dx)
+    best_clearance = -1.0
+    from lewm.obstacle_utils import detect_collisions as _dc
+    for probe_yaw, label in [(0.0, "+X"), (math.pi / 2, "+Y"), (math.pi, "-X"), (-math.pi / 2, "-Y")]:
+        probe_xy = spawn_xy + 0.3 * np.array([math.cos(probe_yaw), math.sin(probe_yaw)], dtype=np.float32)
+        probe_t = torch.from_numpy(probe_xy.reshape(1, 2))
+        blocked = bool(_dc(probe_t, obstacle_layout, margin=0.12)[0].item())
+        if not blocked:
+            # Among open directions, prefer the one pointing toward the target
+            dir_score = 1.0
+            if target_beacon is not None:
+                dx = float(target_beacon.pos[0]) - float(spawn_xy[0])
+                dy = float(target_beacon.pos[1]) - float(spawn_xy[1])
+                dir_score = math.cos(probe_yaw - math.atan2(dy, dx))
+            if dir_score > best_clearance:
+                best_clearance = dir_score
+                spawn_yaw = probe_yaw
 
     target_beacon_id = beacon_name_to_id(target_beacon.identity) if target_beacon else None
     breadcrumb_xy = [float(target_beacon.pos[0]), float(target_beacon.pos[1])] if target_beacon else None
@@ -838,6 +922,8 @@ def main() -> None:
     cmd_high_t = torch.tensor(args.cmd_high, dtype=torch.float32, device=planning_device)
 
     ego_frames_hwc: list[np.ndarray] = []
+    third_person_frames_hwc: list[np.ndarray] = []
+    combined_frames_hwc: list[np.ndarray] = []
     path_xy: list[list[float]] = []
     plan_costs: list[float] = []
     nominal_cmds: list[list[float]] = []
@@ -849,6 +935,7 @@ def main() -> None:
     t0 = time.time()
     physics_scene = None
     ego_scene = None
+    third_person_scene = None
     try:
         import genesis as gs
 
@@ -863,7 +950,8 @@ def main() -> None:
         )
         print(
             f"Scorer: goal_weight={scorer.goal_weight:.3f} "
-            f"exploration_weight={scorer.exploration_weight:.3f}"
+            f"exploration_weight={scorer.exploration_weight:.3f} "
+            f"forward_reward={args.forward_reward_weight:.3f}"
         )
 
         physics_scene, physics_robot, physics_act_dofs, q0, sim_cfg = build_physics_scene(
@@ -877,6 +965,16 @@ def main() -> None:
             img_res=wm_meta["image_size"],
             fov=camera_cfg.fov_deg,
             near=camera_cfg.near_plane,
+        )
+        # Third-person scene: full robot URDF (body visible)
+        third_person_scene, tp_robot, tp_cam, tp_act_dofs = build_render_scene(
+            gs=gs, torch_mod=torch,
+            urdf_path=THIRD_PERSON_URDF_PATH,
+            obstacle_layout=obstacle_layout,
+            beacon_layout=beacon_layout,
+            img_res=args.third_person_res,
+            fov=args.third_person_fov,
+            near=0.01,
         )
 
         # ---- 4. Encode breadcrumb ----
@@ -909,6 +1007,7 @@ def main() -> None:
             cmd_high=cmd_high_t,
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
+            forward_reward_weight=args.forward_reward_weight,
             device=planning_device,
         )
 
@@ -925,6 +1024,13 @@ def main() -> None:
         )
         last_clean_ego_frame = obs["frame_hwc"].copy()
         ego_frames_hwc.append(obs["frame_hwc"])
+        tp_frame = render_third_person_frame(
+            physics_robot, physics_act_dofs,
+            tp_robot, tp_act_dofs, tp_cam,
+            args.chase_dist, args.chase_height, args.side_offset, args.lookahead,
+        )
+        third_person_frames_hwc.append(tp_frame)
+        combined_frames_hwc.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
 
         # ---- 7. Main loop ----
@@ -967,8 +1073,17 @@ def main() -> None:
             else:
                 last_clean_ego_frame = obs["frame_hwc"].copy()
 
+            # Third-person render
+            tp_frame = render_third_person_frame(
+                physics_robot, physics_act_dofs,
+                tp_robot, tp_act_dofs, tp_cam,
+                args.chase_dist, args.chase_height, args.side_offset, args.lookahead,
+            )
+
             # Log
             ego_frames_hwc.append(obs["frame_hwc"])
+            third_person_frames_hwc.append(tp_frame)
+            combined_frames_hwc.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
             path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
             nominal_cmds.append(cmd_vals)
             plan_costs.append(float(plan_stats.best_cost))
@@ -1012,6 +1127,8 @@ def main() -> None:
     finally:
         try:
             import genesis as gs
+            if third_person_scene is not None:
+                third_person_scene.destroy()
             if ego_scene is not None:
                 ego_scene.destroy()
             if physics_scene is not None:
@@ -1036,6 +1153,7 @@ def main() -> None:
         "steps_executed": len(nominal_cmds),
         "collision_count": collision_count,
         "ego_frame_substitutions": ego_frame_substitutions,
+        "forward_reward_weight": args.forward_reward_weight,
         "spawn_xy": [float(spawn_xy[0]), float(spawn_xy[1])],
         "spawn_yaw_rad": float(spawn_yaw),
         "breadcrumb_xy": breadcrumb_xy,
@@ -1052,6 +1170,10 @@ def main() -> None:
 
     if not args.no_gif and ego_frames_hwc:
         export_video(str(out_dir / "ego_rollout"), ego_frames_hwc, args.gif_stride, args.video_fps, video_formats)
+    if not args.no_gif and third_person_frames_hwc:
+        export_video(str(out_dir / "third_person_rollout"), third_person_frames_hwc, args.gif_stride, args.video_fps, video_formats)
+    if not args.no_gif and combined_frames_hwc:
+        export_video(str(out_dir / "side_by_side_rollout"), combined_frames_hwc, args.gif_stride, args.video_fps, video_formats)
 
     if not args.no_topdown and path_xy:
         draw_topdown_trajectory(
