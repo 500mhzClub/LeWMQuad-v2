@@ -256,6 +256,51 @@ def compute_forward_clearance(
     return float(max_dist)
 
 
+def has_line_of_sight(
+    a_xy: np.ndarray,
+    b_xy: np.ndarray,
+    obstacle_layout,
+    step_size: float = 0.03,
+    margin: float = 0.05,
+) -> bool:
+    """Return True if a straight XY path from *a* to *b* is clear of walls.
+
+    Uses the same AABB collision geometry as ``detect_collisions`` but with a
+    tighter margin — we only want to reject when a wall physically blocks the
+    line, not when there's a nearby wall the robot isn't behind.
+    """
+    diff = b_xy - a_xy
+    dist = float(np.linalg.norm(diff))
+    if dist < 1e-6:
+        return True
+    direction = diff / dist
+    n_steps = max(1, int(dist / step_size))
+    for i in range(1, n_steps + 1):
+        t = min(float(i * step_size), dist)
+        pt = torch.tensor(
+            [[a_xy[0] + direction[0] * t,
+              a_xy[1] + direction[1] * t]],
+            dtype=torch.float32,
+        )
+        if detect_collisions(pt, obstacle_layout, margin=margin)[0].item():
+            return False
+    return True
+
+
+def nearest_wall_distance(pos_xy: np.ndarray, obstacle_layout) -> float:
+    """Shortest distance from *pos_xy* to any wall AABB face (unsigned)."""
+    best = float("inf")
+    for obs in obstacle_layout.obstacles:
+        cx, cy = obs.pos[0], obs.pos[1]
+        hx, hy = obs.size[0] / 2.0, obs.size[1] / 2.0
+        dx = max(abs(pos_xy[0] - cx) - hx, 0.0)
+        dy = max(abs(pos_xy[1] - cy) - hy, 0.0)
+        d = math.sqrt(dx * dx + dy * dy)
+        if d < best:
+            best = d
+    return best
+
+
 # ---- Argument parsing ---------------------------------------------------- #
 
 def parse_args() -> argparse.Namespace:
@@ -942,19 +987,36 @@ def main() -> None:
     target_beacon_id = beacon_name_to_id(target_beacon.identity) if target_beacon else None
     breadcrumb_xy = [float(target_beacon.pos[0]), float(target_beacon.pos[1])] if target_beacon else None
 
-    print(
-        f"Maze: {args.grid_rows}x{args.grid_cols} grid, seed={args.seed}, "
-        f"obstacles={len(obstacle_layout.obstacles)}, beacons={len(beacon_layout.beacons)}"
-    )
-    print(
-        f"Spawn: cell=({start_cell[0]},{start_cell[1]}) "
-        f"pos=({spawn_xy[0]:+.2f}, {spawn_xy[1]:+.2f}) yaw={math.degrees(spawn_yaw):+.1f}deg"
-    )
-    if target_beacon:
-        print(
-            f"Target beacon: {target_beacon.identity} at "
-            f"({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})"
-        )
+    # ---- Comprehensive maze/beacon layout logging ----
+    print("=" * 72)
+    print(f"MAZE LAYOUT  seed={args.seed}  grid={args.grid_rows}x{args.grid_cols}  "
+          f"cell_size={args.cell_size:.2f}  wall_t={args.wall_thickness:.2f}")
+    print(f"  step={maze_step:.3f}m  grid_origin=({grid_ox:+.3f}, {grid_oy:+.3f})")
+    # Compute maze AABB from obstacle extremes
+    obs_xs = [o.pos[0] for o in obstacle_layout.obstacles]
+    obs_ys = [o.pos[1] for o in obstacle_layout.obstacles]
+    obs_hxs = [o.size[0] / 2.0 for o in obstacle_layout.obstacles]
+    obs_hys = [o.size[1] / 2.0 for o in obstacle_layout.obstacles]
+    maze_x_min = min(x - hx for x, hx in zip(obs_xs, obs_hxs))
+    maze_x_max = max(x + hx for x, hx in zip(obs_xs, obs_hxs))
+    maze_y_min = min(y - hy for y, hy in zip(obs_ys, obs_hys))
+    maze_y_max = max(y + hy for y, hy in zip(obs_ys, obs_hys))
+    print(f"  AABB x=[{maze_x_min:+.3f}, {maze_x_max:+.3f}]  "
+          f"y=[{maze_y_min:+.3f}, {maze_y_max:+.3f}]  "
+          f"total walls={len(obstacle_layout.obstacles)}")
+    print(f"SPAWN  cell=({start_cell[0]},{start_cell[1]})  "
+          f"pos=({spawn_xy[0]:+.3f}, {spawn_xy[1]:+.3f})  "
+          f"yaw={math.degrees(spawn_yaw):+.1f}deg")
+    print(f"BEACONS  count={len(beacon_layout.beacons)}  "
+          f"distractors={len(beacon_layout.distractors)}")
+    for i, b in enumerate(beacon_layout.beacons):
+        d_from_spawn = float(np.linalg.norm(np.array(b.pos[:2]) - spawn_xy))
+        los = has_line_of_sight(spawn_xy, np.array(b.pos[:2], dtype=np.float32), obstacle_layout)
+        tag = " ← TARGET" if (target_beacon and b.identity == target_beacon.identity) else ""
+        print(f"  [{i}] {b.identity:8s} pos=({b.pos[0]:+.3f}, {b.pos[1]:+.3f}, {b.pos[2]:+.3f})  "
+              f"normal=({b.normal[0]:+.2f}, {b.normal[1]:+.2f})  "
+              f"dist_spawn={d_from_spawn:.3f}m  LOS={'yes' if los else 'NO'}{tag}")
+    print("=" * 72)
 
     # ---- 3. Build Genesis scenes ----
     cmd_low_t = torch.tensor(args.cmd_low, dtype=torch.float32, device=planning_device)
@@ -1171,22 +1233,62 @@ def main() -> None:
             collided = bool(detect_collisions(pos_xy, obstacle_layout, margin=sim_cfg.collision_margin)[0].item())
             fallen = bool(obs["pos_np"][2] < sim_cfg.min_z)
 
+            # Per-step metrics
+            cur_xy = obs["pos_np"][:2]
+            cur_z = float(obs["pos_np"][2])
+            prev_xy = np.array(path_xy[-1], dtype=np.float32) if path_xy else cur_xy
+            step_dist = float(np.linalg.norm(cur_xy - prev_xy))
+            cumulative_dist += step_dist
+            wall_dist = nearest_wall_distance(cur_xy, obstacle_layout)
+            # Instantaneous speed (displacement per step)
+            speed = step_dist
+            # Distance to every beacon
+            beacon_dists = {}
+            for b in beacon_layout.beacons:
+                bxy = np.array(b.pos[:2], dtype=np.float32)
+                beacon_dists[b.identity] = float(np.linalg.norm(cur_xy - bxy))
+            # Target-specific
+            dist_to_target = beacon_dists.get(target_beacon.identity, float("inf")) if target_beacon else float("inf")
+            # Track bounding box of visited area
+            visited_x_min = min(visited_x_min, float(cur_xy[0]))
+            visited_x_max = max(visited_x_max, float(cur_xy[0]))
+            visited_y_min = min(visited_y_min, float(cur_xy[1]))
+            visited_y_max = max(visited_y_max, float(cur_xy[1]))
+            visited_area = (visited_x_max - visited_x_min) * (visited_y_max - visited_y_min)
+
             # Oracle success check (post-hoc metric, NOT used for planning)
+            # Requires line-of-sight — cannot claim beacon through a wall.
             reached = False
-            if target_beacon is not None:
-                target_xy = np.array(target_beacon.pos[:2], dtype=np.float32)
-                dist_to_target = float(np.linalg.norm(obs["pos_np"][:2] - target_xy))
-                if dist_to_target <= args.success_range:
+            if target_beacon is not None and dist_to_target <= args.success_range:
+                los = has_line_of_sight(
+                    cur_xy.astype(np.float32),
+                    np.array(target_beacon.pos[:2], dtype=np.float32),
+                    obstacle_layout,
+                )
+                if los:
                     reached = True
                     terminate_reason = "goal_reached"
-                    print(f"Step {step:03d} | REACHED beacon {target_beacon.identity} at dist={dist_to_target:.3f}m")
+                    print(f"Step {step:03d} | REACHED beacon {target_beacon.identity} "
+                          f"dist={dist_to_target:.3f}m  LOS=yes")
                     break
+                else:
+                    if not logged_los_reject:
+                        print(f"Step {step:03d} | NEAR beacon {target_beacon.identity} "
+                              f"dist={dist_to_target:.3f}m  but LOS=NO (wall between)")
+                        logged_los_reject = True
 
+            # Build per-step beacon distance string
+            bdist_str = "  ".join(f"{k}={v:.2f}" for k, v in sorted(beacon_dists.items()))
+
+            # Comprehensive per-step log (every step)
             print(
-                f"Step {step:03d} | pos=({obs['pos_np'][0]:+.2f}, {obs['pos_np'][1]:+.2f}) "
+                f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) z={cur_z:.3f} "
                 f"yaw={math.degrees(obs['yaw_rad']):+6.1f}deg "
                 f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                f"cost={plan_stats.best_cost:.3f} clr={clearance:.2f}m"
+                f"cost={plan_stats.best_cost:.3f} clr={clearance:.2f}m "
+                f"wd={wall_dist:.2f}m spd={speed:.4f} cd={cumulative_dist:.2f}m "
+                f"area={visited_area:.3f}m² "
+                f"| {bdist_str}"
             )
 
             if fallen:
