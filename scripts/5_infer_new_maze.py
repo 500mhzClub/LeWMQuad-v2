@@ -363,6 +363,53 @@ def grid_cell_for_xy(
     return None
 
 
+def wrap_to_pi(angle_rad: float) -> float:
+    """Wrap an angle to ``[-pi, pi]``."""
+    return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def choose_escape_heading(
+    pos_xy: np.ndarray,
+    yaw_rad: float,
+    obstacle_layout,
+    max_dist: float = 0.90,
+) -> tuple[float, float, float, list[tuple[float, float]]]:
+    """Probe nearby headings and pick the safest direction to pivot toward.
+
+    The returned delta is the wrapped angular offset from the current heading
+    to the selected heading.  A small turn penalty prefers shorter pivots when
+    several directions are similarly clear.
+    """
+    probe_offsets = [
+        0.0,
+        math.radians(35.0),
+        -math.radians(35.0),
+        math.pi / 2.0,
+        -math.pi / 2.0,
+        3.0 * math.pi / 4.0,
+        -3.0 * math.pi / 4.0,
+        -math.pi,
+    ]
+    best_heading = yaw_rad
+    best_clearance = -1.0
+    best_score = -float("inf")
+    scan: list[tuple[float, float]] = []
+    for offset in probe_offsets:
+        heading = yaw_rad + offset
+        clearance = compute_forward_clearance(
+            pos_xy, heading, obstacle_layout, max_dist=max_dist, step_size=0.04, margin=0.14,
+        )
+        turn_penalty = 0.04 * abs(offset) / math.pi
+        score = clearance - turn_penalty
+        scan.append((math.degrees(offset), clearance))
+        if score > best_score or (abs(score - best_score) < 1e-6 and clearance > best_clearance):
+            best_score = score
+            best_clearance = clearance
+            best_heading = heading
+    best_delta = wrap_to_pi(best_heading - yaw_rad)
+    return best_heading, best_clearance, best_delta, scan
+
+
 # ---- Argument parsing ---------------------------------------------------- #
 
 def parse_args() -> argparse.Namespace:
@@ -1194,6 +1241,8 @@ def main() -> None:
         last_nominal_cmd = torch.zeros(3, device=planning_device, dtype=torch.float32)
         consecutive_collisions = 0
         forced_recovery_steps = 0
+        front_blocked_streak = 0
+        recovery_spin_age = 0
 
         # ---- 6. Initial observation ----
         obs = observe(
@@ -1277,9 +1326,14 @@ def main() -> None:
         # Recovery manoeuvre constants (outside loop — fixed for entire run)
         CLEARANCE_FULL = 0.40   # beyond this: full forward weight
         CLEARANCE_ZERO = 0.10   # at/below this: no forward reward
-        RECOVERY_TRIGGER = 6    # consecutive collision steps before recovery
-        RECOVERY_DURATION = 18  # total steps of back-up + turn
-        RECOVERY_HALF = RECOVERY_DURATION // 2
+        TURN_TRIGGER_CLEARANCE = 0.14
+        TURN_RELEASE_CLEARANCE = 0.26
+        TURN_MIN_DELTA_RAD = math.radians(35.0)
+        TURN_REPLAN_ADVANTAGE = 0.10
+        BLOCKED_STREAK_TRIGGER = 3
+        RECOVERY_TRIGGER = 3    # consecutive collision steps before committed pivot
+        RECOVERY_DURATION = 48  # committed spin; exit early once a safe heading opens
+        RECOVERY_MIN_SPIN_STEPS = 8
         recovery_turn_sign = 1.0  # will be set at recovery trigger
 
         # ---- 7. Main loop ----
@@ -1297,18 +1351,71 @@ def main() -> None:
             # Near a wall, suppress yaw jerk penalty so the robot can commit
             # to a clean corner turn without the oscillation cost blocking it.
             planner.yaw_penalty_weight = 0.10 * clearance_frac
+            front_blocked = clearance_plan <= TURN_TRIGGER_CLEARANCE
+            front_blocked_streak = front_blocked_streak + 1 if front_blocked else 0
 
-            # --- Stuck recovery: back up + turn if N consecutive collisions ---
+            escape_heading = obs["yaw_rad"]
+            escape_clearance = clearance_plan
+            escape_delta = 0.0
+            escape_scan: list[tuple[float, float]] = []
+            if front_blocked or forced_recovery_steps > 0 or consecutive_collisions > 0:
+                escape_heading, escape_clearance, escape_delta, escape_scan = choose_escape_heading(
+                    obs["pos_np"][:2], obs["yaw_rad"], obstacle_layout,
+                )
+
+            use_forced_recovery = False
+            proactive_pivot = (
+                front_blocked_streak >= BLOCKED_STREAK_TRIGGER
+                and escape_clearance >= max(TURN_RELEASE_CLEARANCE, clearance_plan + TURN_REPLAN_ADVANTAGE)
+                and abs(escape_delta) >= TURN_MIN_DELTA_RAD
+            )
+            collision_pivot = (
+                consecutive_collisions >= RECOVERY_TRIGGER
+                and escape_clearance >= clearance_plan + 0.04
+                and abs(escape_delta) >= TURN_MIN_DELTA_RAD
+            )
+
+            # --- Committed pivot recovery when the forward corridor is blocked ---
             if forced_recovery_steps > 0:
-                forced_recovery_steps -= 1
-                if forced_recovery_steps >= RECOVERY_HALF:
-                    # First half: reverse
-                    nominal_cmd = torch.tensor([-0.4, 0.0, 0.0],
-                                               dtype=torch.float32, device=planning_device)
+                if recovery_spin_age >= RECOVERY_MIN_SPIN_STEPS and clearance_plan >= TURN_RELEASE_CLEARANCE:
+                    print(f"Step {step:03d} | pivot exit clr={clearance_plan:.2f}m "
+                          f"best={escape_clearance:.2f}m yaw_err={math.degrees(escape_delta):+.1f}deg")
+                    forced_recovery_steps = 0
+                    recovery_spin_age = 0
                 else:
-                    # Second half: spin ~90°
-                    nominal_cmd = torch.tensor([0.0, 0.0, recovery_turn_sign],
-                                               dtype=torch.float32, device=planning_device)
+                    forced_recovery_steps -= 1
+                    recovery_spin_age += 1
+                    use_forced_recovery = True
+            elif proactive_pivot or collision_pivot:
+                forced_recovery_steps = RECOVERY_DURATION - 1
+                recovery_spin_age = 1
+                if abs(escape_delta) >= math.radians(12.0):
+                    recovery_turn_sign = 1.0 if escape_delta > 0.0 else -1.0
+                else:
+                    recovery_turn_sign = 1.0 if (step % 4 < 2) else -1.0
+                use_forced_recovery = True
+                recovery_episode_count += 1
+                planner.reset()
+                last_nominal_cmd.zero_()
+                trigger_reason = (
+                    f"blocked x{front_blocked_streak}"
+                    if proactive_pivot else
+                    f"collisions x{consecutive_collisions}"
+                )
+                scan_str = " ".join(f"{deg:+.0f}:{clr:.2f}" for deg, clr in escape_scan)
+                print(
+                    f"Step {step:03d} | pivot trigger {trigger_reason} "
+                    f"clr={clearance_plan:.2f}m -> best={escape_clearance:.2f}m "
+                    f"delta={math.degrees(escape_delta):+.1f}deg sign={recovery_turn_sign:+.0f} "
+                    f"scan=[{scan_str}]"
+                )
+                front_blocked_streak = 0
+
+            if use_forced_recovery:
+                if abs(escape_delta) >= math.radians(10.0):
+                    recovery_turn_sign = 1.0 if escape_delta > 0.0 else -1.0
+                nominal_cmd = torch.tensor([0.0, 0.0, recovery_turn_sign],
+                                           dtype=torch.float32, device=planning_device)
                 plan_stats = PlanningStats(best_cost=0.0, mean_cost=0.0,
                                            std_cost=0.0, elite_cost=0.0)
             else:
@@ -1470,6 +1577,9 @@ def main() -> None:
                 "frame_substituted": bool(obs["frame_substituted"]),
                 "collided": bool(collided),
                 "fallen": bool(fallen),
+                "planning_front_blocked_streak": int(front_blocked_streak),
+                "planning_escape_clearance_m": float(escape_clearance),
+                "planning_escape_delta_deg": float(math.degrees(escape_delta)),
                 "recovery_steps_remaining": int(forced_recovery_steps),
                 "beacon_center_dist_m": {k: float(v) for k, v in beacon_dists_center.items()},
                 "beacon_claim_dist_m": {k: float(v) for k, v in beacon_dists_claim.items()},
@@ -1501,7 +1611,9 @@ def main() -> None:
                 f"elite={plan_stats.elite_cost:.3f} clr={clearance_now:.2f}/{clearance_plan:.2f}m wd={wall_dist:.2f}m "
                 f"step={step_dist:.3f}m cum={cumulative_dist:.2f}m area={visited_area:.3f}m^2 "
                 f"cells={len(visited_cells)} coll={int(collided)} fall={int(fallen)} "
-                f"frame_sub={int(obs['frame_substituted'])} recovery={forced_recovery_steps} "
+                f"frame_sub={int(obs['frame_substituted'])} blocked={front_blocked_streak} "
+                f"escape={escape_clearance:.2f}@{math.degrees(escape_delta):+.0f}deg "
+                f"recovery={forced_recovery_steps} "
                 f"target=center:{dist_to_target_center:.2f} claim:{dist_to_target_claim:.2f} "
                 f"los:{int(target_los)} front:{target_frontness:+.2f}"
             )
@@ -1525,14 +1637,9 @@ def main() -> None:
                     terminate_reason = "collision"
                     print(f"Step {step:03d} | terminating: collision")
                     break
-                if consecutive_collisions >= RECOVERY_TRIGGER and forced_recovery_steps == 0:
-                    print(f"Step {step:03d} | stuck ({consecutive_collisions} consecutive collisions) → recovery")
-                    forced_recovery_steps = RECOVERY_DURATION
-                    recovery_turn_sign = 1.0 if (step % 4 < 2) else -1.0
-                    recovery_episode_count += 1
-                    consecutive_collisions = 0
-                planner.reset()
-                last_nominal_cmd.zero_()
+                if forced_recovery_steps == 0 and consecutive_collisions == 1:
+                    planner.reset()
+                    last_nominal_cmd.zero_()
             else:
                 consecutive_collisions = 0
 
