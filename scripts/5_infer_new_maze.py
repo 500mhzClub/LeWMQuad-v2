@@ -131,6 +131,7 @@ class CEMPlanner:
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.forward_reward_weight = float(forward_reward_weight)
+        self.yaw_penalty_weight = 0.10  # updated each step from main loop
         self.device = device
         self._warm_start: torch.Tensor | None = None
 
@@ -190,11 +191,12 @@ class CEMPlanner:
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
                 costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
 
-            # Yaw oscillation penalty: discourages indecisive spinning
-            yaw_penalty_weight = 0.15
-            yaw_rates = samples[:, :, 2]  # (N, H)
-            yaw_abs = yaw_rates.abs().sum(dim=-1)
-            costs = costs + yaw_penalty_weight * yaw_abs
+            # Yaw jerk penalty: penalises direction *changes* in yaw (oscillation)
+            # but NOT a sustained turn — allows clean corners, blocks spinning.
+            if self.yaw_penalty_weight > 0.0 and self.horizon > 1:
+                yaw_rates = samples[:, :, 2]          # (N, H)
+                yaw_jerk = (yaw_rates[:, 1:] - yaw_rates[:, :-1]).abs().sum(dim=-1)
+                costs = costs + self.yaw_penalty_weight * yaw_jerk
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -1092,6 +1094,9 @@ def main() -> None:
                 (clearance - CLEARANCE_ZERO) / (CLEARANCE_FULL - CLEARANCE_ZERO)
             ))
             planner.forward_reward_weight = args.forward_reward_weight * clearance_frac
+            # Near a wall, suppress yaw jerk penalty so the robot can commit
+            # to a clean corner turn without the oscillation cost blocking it.
+            planner.yaw_penalty_weight = 0.10 * clearance_frac
 
             # --- Stuck recovery: back up + turn if N consecutive collisions ---
             if forced_recovery_steps > 0:
