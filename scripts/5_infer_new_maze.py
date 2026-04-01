@@ -224,6 +224,36 @@ class CEMPlanner:
         return best_seq, stats
 
 
+# ---- Forward clearance --------------------------------------------------- #
+
+def compute_forward_clearance(
+    pos_xy: np.ndarray,
+    yaw_rad: float,
+    obstacle_layout,
+    max_dist: float = 0.60,
+    step_size: float = 0.04,
+    margin: float = 0.14,
+) -> float:
+    """Ray-march forward from the robot to find the nearest wall ahead.
+
+    Returns the distance (in metres) to the nearest obstacle in the
+    forward direction, capped at *max_dist*.  Uses the same
+    ``detect_collisions`` geometry as the physics collision check.
+    """
+    dx = math.cos(yaw_rad)
+    dy = math.sin(yaw_rad)
+    n_steps = int(max_dist / step_size)
+    for i in range(1, n_steps + 1):
+        test = torch.tensor(
+            [[pos_xy[0] + i * step_size * dx,
+              pos_xy[1] + i * step_size * dy]],
+            dtype=torch.float32,
+        )
+        if detect_collisions(test, obstacle_layout, margin=margin)[0].item():
+            return float((i - 1) * step_size)
+    return float(max_dist)
+
+
 # ---- Argument parsing ---------------------------------------------------- #
 
 def parse_args() -> argparse.Namespace:
@@ -256,7 +286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.25])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    parser.add_argument("--forward_reward_weight", type=float, default=2.0,
+    parser.add_argument("--forward_reward_weight", type=float, default=1.2,
                         help="Safety-gated forward velocity bonus (prevents backing up)")
     # PPO noise
     parser.add_argument("--ppo_obs_noise_std", type=float, default=0.0)
@@ -1020,6 +1050,8 @@ def main() -> None:
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
         last_nominal_cmd = torch.zeros(3, device=planning_device, dtype=torch.float32)
+        consecutive_collisions = 0
+        forced_recovery_steps = 0
 
         # ---- 6. Initial observation ----
         obs = observe(
@@ -1040,15 +1072,49 @@ def main() -> None:
         combined_frames_hwc.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
 
+        # Recovery manoeuvre constants (outside loop — fixed for entire run)
+        CLEARANCE_FULL = 0.40   # beyond this: full forward weight
+        CLEARANCE_ZERO = 0.10   # at/below this: no forward reward
+        RECOVERY_TRIGGER = 6    # consecutive collision steps before recovery
+        RECOVERY_DURATION = 18  # total steps of back-up + turn
+        RECOVERY_HALF = RECOVERY_DURATION // 2
+        recovery_turn_sign = 1.0  # will be set at recovery trigger
+
         # ---- 7. Main loop ----
         for step in range(args.steps):
-            # Plan
-            plan_seq, plan_stats = planner.plan(
-                z_start_raw=obs["z_raw"],
-                z_goal_proj=z_breadcrumb,
-                last_cmd=last_nominal_cmd,
+            # --- Wall-aware forward bias scaling ---
+            # Ray-march forward to find clearance; scale down forward_reward_weight
+            # as the robot approaches a wall, reaching 0 when touching.
+            clearance = compute_forward_clearance(
+                obs["pos_np"][:2], obs["yaw_rad"], obstacle_layout,
             )
-            nominal_cmd = plan_seq[0]
+            clearance_frac = max(0.0, min(1.0,
+                (clearance - CLEARANCE_ZERO) / (CLEARANCE_FULL - CLEARANCE_ZERO)
+            ))
+            planner.forward_reward_weight = args.forward_reward_weight * clearance_frac
+
+            # --- Stuck recovery: back up + turn if N consecutive collisions ---
+            if forced_recovery_steps > 0:
+                forced_recovery_steps -= 1
+                if forced_recovery_steps >= RECOVERY_HALF:
+                    # First half: reverse
+                    nominal_cmd = torch.tensor([-0.4, 0.0, 0.0],
+                                               dtype=torch.float32, device=planning_device)
+                else:
+                    # Second half: spin ~90°
+                    nominal_cmd = torch.tensor([0.0, 0.0, recovery_turn_sign],
+                                               dtype=torch.float32, device=planning_device)
+                plan_stats = PlanningStats(best_cost=0.0, mean_cost=0.0,
+                                           std_cost=0.0, elite_cost=0.0)
+            else:
+                # Plan
+                plan_seq, plan_stats = planner.plan(
+                    z_start_raw=obs["z_raw"],
+                    z_goal_proj=z_breadcrumb,
+                    last_cmd=last_nominal_cmd,
+                )
+                nominal_cmd = plan_seq[0]
+
             last_nominal_cmd = nominal_cmd.detach().clone()
             cmd_vals = [float(v) for v in nominal_cmd.detach().cpu().tolist()]
 
@@ -1115,7 +1181,7 @@ def main() -> None:
                 f"Step {step:03d} | pos=({obs['pos_np'][0]:+.2f}, {obs['pos_np'][1]:+.2f}) "
                 f"yaw={math.degrees(obs['yaw_rad']):+6.1f}deg "
                 f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                f"cost={plan_stats.best_cost:.3f}"
+                f"cost={plan_stats.best_cost:.3f} clr={clearance:.2f}m"
             )
 
             if fallen:
@@ -1124,12 +1190,20 @@ def main() -> None:
                 break
             if collided:
                 collision_count += 1
+                consecutive_collisions += 1
                 if args.terminate_on_collision:
                     terminate_reason = "collision"
                     print(f"Step {step:03d} | terminating: collision")
                     break
+                if consecutive_collisions >= RECOVERY_TRIGGER and forced_recovery_steps == 0:
+                    print(f"Step {step:03d} | stuck ({consecutive_collisions} consecutive collisions) → recovery")
+                    forced_recovery_steps = RECOVERY_DURATION
+                    recovery_turn_sign = 1.0 if (step % 4 < 2) else -1.0
+                    consecutive_collisions = 0
                 planner.reset()
                 last_nominal_cmd.zero_()
+            else:
+                consecutive_collisions = 0
 
     finally:
         try:
