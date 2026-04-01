@@ -301,6 +301,68 @@ def nearest_wall_distance(pos_xy: np.ndarray, obstacle_layout) -> float:
     return best
 
 
+def quat_to_rpy_deg(quat_np: np.ndarray) -> tuple[float, float, float]:
+    """Convert quaternion ``[w, x, y, z]`` to roll/pitch/yaw in degrees."""
+    w, x, y, z = [float(v) for v in quat_np]
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.degrees(math.copysign(math.pi / 2.0, sinp))
+    else:
+        pitch = math.degrees(math.asin(sinp))
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+    return roll, pitch, yaw
+
+
+def extract_body_kinematics(proprio: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """Return body-frame linear and angular velocity from the proprio vector."""
+    prop = proprio[0].detach().cpu().numpy()
+    return np.asarray(prop[5:8], dtype=np.float32), np.asarray(prop[8:11], dtype=np.float32)
+
+
+def beacon_claim_xy(beacon, wall_thickness: float, stand_off: float = 0.03) -> np.ndarray:
+    """A reachable point just in front of the beacon's wall face.
+
+    Beacon centres are stored very close to the host wall centre.  For
+    redemption / LOS checks we instead use a point slightly in front of the
+    visible face so that a valid frontal approach is accepted while a wall on
+    the far side still blocks the claim.
+    """
+    normal = np.array(beacon.normal[:2], dtype=np.float32)
+    wall_center_xy = np.array(beacon.pos[:2], dtype=np.float32) - 0.035 * normal
+    return wall_center_xy + normal * (0.5 * float(wall_thickness) + stand_off)
+
+
+def beacon_frontness(pos_xy: np.ndarray, beacon) -> float:
+    """Signed distance along the beacon normal; positive means in front."""
+    beacon_xy = np.array(beacon.pos[:2], dtype=np.float32)
+    normal = np.array(beacon.normal[:2], dtype=np.float32)
+    return float(np.dot(pos_xy - beacon_xy, normal))
+
+
+def grid_cell_for_xy(
+    pos_xy: np.ndarray,
+    grid_ox: float,
+    grid_oy: float,
+    maze_step: float,
+    grid_rows: int,
+    grid_cols: int,
+) -> tuple[int, int] | None:
+    """Map an XY position to the nearest maze cell centre."""
+    col = int(math.floor((float(pos_xy[0]) - grid_ox) / maze_step + 0.5))
+    row = int(math.floor((float(pos_xy[1]) - grid_oy) / maze_step + 0.5))
+    if 0 <= row < grid_rows and 0 <= col < grid_cols:
+        return row, col
+    return None
+
+
 # ---- Argument parsing ---------------------------------------------------- #
 
 def parse_args() -> argparse.Namespace:
@@ -986,6 +1048,7 @@ def main() -> None:
 
     target_beacon_id = beacon_name_to_id(target_beacon.identity) if target_beacon else None
     breadcrumb_xy = [float(target_beacon.pos[0]), float(target_beacon.pos[1])] if target_beacon else None
+    target_claim_xy = beacon_claim_xy(target_beacon, args.wall_thickness) if target_beacon else None
 
     # ---- Comprehensive maze/beacon layout logging ----
     print("=" * 72)
@@ -1004,6 +1067,16 @@ def main() -> None:
     print(f"  AABB x=[{maze_x_min:+.3f}, {maze_x_max:+.3f}]  "
           f"y=[{maze_y_min:+.3f}, {maze_y_max:+.3f}]  "
           f"total walls={len(obstacle_layout.obstacles)}")
+    for i, obs in enumerate(obstacle_layout.obstacles):
+        x0 = float(obs.pos[0]) - 0.5 * float(obs.size[0])
+        x1 = float(obs.pos[0]) + 0.5 * float(obs.size[0])
+        y0 = float(obs.pos[1]) - 0.5 * float(obs.size[1])
+        y1 = float(obs.pos[1]) + 0.5 * float(obs.size[1])
+        z0 = float(obs.pos[2]) - 0.5 * float(obs.size[2])
+        z1 = float(obs.pos[2]) + 0.5 * float(obs.size[2])
+        print(f"  WALL[{i:02d}] c=({obs.pos[0]:+.3f}, {obs.pos[1]:+.3f}, {obs.pos[2]:+.3f})  "
+              f"size=({obs.size[0]:.3f}, {obs.size[1]:.3f}, {obs.size[2]:.3f})  "
+              f"x=[{x0:+.3f},{x1:+.3f}] y=[{y0:+.3f},{y1:+.3f}] z=[{z0:+.3f},{z1:+.3f}]")
     print(f"SPAWN  cell=({start_cell[0]},{start_cell[1]})  "
           f"pos=({spawn_xy[0]:+.3f}, {spawn_xy[1]:+.3f})  "
           f"yaw={math.degrees(spawn_yaw):+.1f}deg")
@@ -1011,11 +1084,16 @@ def main() -> None:
           f"distractors={len(beacon_layout.distractors)}")
     for i, b in enumerate(beacon_layout.beacons):
         d_from_spawn = float(np.linalg.norm(np.array(b.pos[:2]) - spawn_xy))
-        los = has_line_of_sight(spawn_xy, np.array(b.pos[:2], dtype=np.float32), obstacle_layout)
+        claim_xy = beacon_claim_xy(b, args.wall_thickness)
+        claim_dist = float(np.linalg.norm(claim_xy - spawn_xy))
+        los = has_line_of_sight(spawn_xy, claim_xy, obstacle_layout, step_size=0.02, margin=0.01)
+        frontness = beacon_frontness(spawn_xy, b)
         tag = " ← TARGET" if (target_beacon and b.identity == target_beacon.identity) else ""
         print(f"  [{i}] {b.identity:8s} pos=({b.pos[0]:+.3f}, {b.pos[1]:+.3f}, {b.pos[2]:+.3f})  "
               f"normal=({b.normal[0]:+.2f}, {b.normal[1]:+.2f})  "
-              f"dist_spawn={d_from_spawn:.3f}m  LOS={'yes' if los else 'NO'}{tag}")
+              f"claim=({claim_xy[0]:+.3f}, {claim_xy[1]:+.3f})  "
+              f"dist_spawn={d_from_spawn:.3f}m  claim_dist={claim_dist:.3f}m  "
+              f"frontness={frontness:+.3f}m  LOS={'yes' if los else 'NO'}{tag}")
     print("=" * 72)
 
     # ---- 3. Build Genesis scenes ----
@@ -1136,6 +1214,66 @@ def main() -> None:
         combined_frames_hwc.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
 
+        # Diagnostics tracked across the run.
+        step_metrics: list[dict[str, Any]] = []
+        cumulative_dist = 0.0
+        logged_los_reject = False
+        los_reject_count = 0
+        recovery_episode_count = 0
+        prev_xy_for_metrics = np.asarray(obs["pos_np"][:2], dtype=np.float32).copy()
+        visited_x_min = float(prev_xy_for_metrics[0])
+        visited_x_max = float(prev_xy_for_metrics[0])
+        visited_y_min = float(prev_xy_for_metrics[1])
+        visited_y_max = float(prev_xy_for_metrics[1])
+        visited_area = 0.0
+        visited_cells: set[tuple[int, int]] = set()
+        init_cell = grid_cell_for_xy(
+            prev_xy_for_metrics, grid_ox, grid_oy, maze_step, args.grid_rows, args.grid_cols,
+        )
+        if init_cell is not None:
+            visited_cells.add(init_cell)
+        initial_clearance = compute_forward_clearance(prev_xy_for_metrics, obs["yaw_rad"], obstacle_layout)
+        initial_wall_dist = nearest_wall_distance(prev_xy_for_metrics, obstacle_layout)
+        z_min = z_max = float(obs["pos_np"][2])
+        min_wall_dist = initial_wall_dist
+        min_clearance = max_clearance = initial_clearance
+        max_abs_roll = 0.0
+        max_abs_pitch = 0.0
+        max_body_speed = 0.0
+        max_body_ang_speed = 0.0
+        closest_target_center_dist = float("inf")
+        closest_target_claim_dist = float("inf")
+        roll_deg, pitch_deg, yaw_deg = quat_to_rpy_deg(obs["quat_np"])
+        lin_vel_b, ang_vel_b = extract_body_kinematics(obs["proprio"])
+        init_body_speed = float(np.linalg.norm(lin_vel_b))
+        init_body_ang_speed = float(np.linalg.norm(ang_vel_b))
+        max_abs_roll = max(max_abs_roll, abs(roll_deg))
+        max_abs_pitch = max(max_abs_pitch, abs(pitch_deg))
+        max_body_speed = max(max_body_speed, init_body_speed)
+        max_body_ang_speed = max(max_body_ang_speed, init_body_ang_speed)
+        init_target_center = float("inf")
+        init_target_claim = float("inf")
+        init_target_los = False
+        init_target_frontness = 0.0
+        if target_beacon is not None and target_claim_xy is not None:
+            init_target_center = float(np.linalg.norm(prev_xy_for_metrics - np.array(target_beacon.pos[:2], dtype=np.float32)))
+            init_target_claim = float(np.linalg.norm(prev_xy_for_metrics - target_claim_xy))
+            init_target_frontness = beacon_frontness(prev_xy_for_metrics, target_beacon)
+            init_target_los = has_line_of_sight(
+                prev_xy_for_metrics, target_claim_xy, obstacle_layout, step_size=0.02, margin=0.01,
+            )
+            closest_target_center_dist = init_target_center
+            closest_target_claim_dist = init_target_claim
+        print(
+            f"INIT | cell={init_cell} pos=({prev_xy_for_metrics[0]:+.2f}, {prev_xy_for_metrics[1]:+.2f}) "
+            f"z={float(obs['pos_np'][2]):.3f} rpy=({roll_deg:+5.1f}, {pitch_deg:+5.1f}, {yaw_deg:+6.1f})deg "
+            f"v_b=({lin_vel_b[0]:+.3f}, {lin_vel_b[1]:+.3f}, {lin_vel_b[2]:+.3f}) "
+            f"w_b=({ang_vel_b[0]:+.3f}, {ang_vel_b[1]:+.3f}, {ang_vel_b[2]:+.3f}) "
+            f"clr={initial_clearance:.2f}m wd={initial_wall_dist:.2f}m "
+            f"target_center={init_target_center:.2f}m target_claim={init_target_claim:.2f}m "
+            f"target_los={int(init_target_los)} target_front={init_target_frontness:+.2f}"
+        )
+
         # Recovery manoeuvre constants (outside loop — fixed for entire run)
         CLEARANCE_FULL = 0.40   # beyond this: full forward weight
         CLEARANCE_ZERO = 0.10   # at/below this: no forward reward
@@ -1149,11 +1287,11 @@ def main() -> None:
             # --- Wall-aware forward bias scaling ---
             # Ray-march forward to find clearance; scale down forward_reward_weight
             # as the robot approaches a wall, reaching 0 when touching.
-            clearance = compute_forward_clearance(
+            clearance_plan = compute_forward_clearance(
                 obs["pos_np"][:2], obs["yaw_rad"], obstacle_layout,
             )
             clearance_frac = max(0.0, min(1.0,
-                (clearance - CLEARANCE_ZERO) / (CLEARANCE_FULL - CLEARANCE_ZERO)
+                (clearance_plan - CLEARANCE_ZERO) / (CLEARANCE_FULL - CLEARANCE_ZERO)
             ))
             planner.forward_reward_weight = args.forward_reward_weight * clearance_frac
             # Near a wall, suppress yaw jerk penalty so the robot can commit
@@ -1220,76 +1358,161 @@ def main() -> None:
                 args.chase_dist, args.chase_height, args.side_offset, args.lookahead,
             )
 
-            # Log
-            ego_frames_hwc.append(obs["frame_hwc"])
-            third_person_frames_hwc.append(tp_frame)
-            combined_frames_hwc.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
-            path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
-            nominal_cmds.append(cmd_vals)
-            plan_costs.append(float(plan_stats.best_cost))
-
             # Collision / termination checks
             pos_xy = torch.from_numpy(np.asarray(obs["pos_np"][:2], dtype=np.float32)).unsqueeze(0)
             collided = bool(detect_collisions(pos_xy, obstacle_layout, margin=sim_cfg.collision_margin)[0].item())
             fallen = bool(obs["pos_np"][2] < sim_cfg.min_z)
 
             # Per-step metrics
-            cur_xy = obs["pos_np"][:2]
+            cur_xy = np.asarray(obs["pos_np"][:2], dtype=np.float32)
             cur_z = float(obs["pos_np"][2])
-            prev_xy = np.array(path_xy[-1], dtype=np.float32) if path_xy else cur_xy
-            step_dist = float(np.linalg.norm(cur_xy - prev_xy))
+            roll_deg, pitch_deg, yaw_deg = quat_to_rpy_deg(obs["quat_np"])
+            lin_vel_b, ang_vel_b = extract_body_kinematics(obs["proprio"])
+            step_dist = float(np.linalg.norm(cur_xy - prev_xy_for_metrics))
             cumulative_dist += step_dist
+            prev_xy_for_metrics = cur_xy.copy()
+            clearance_now = compute_forward_clearance(cur_xy, obs["yaw_rad"], obstacle_layout)
             wall_dist = nearest_wall_distance(cur_xy, obstacle_layout)
-            # Instantaneous speed (displacement per step)
-            speed = step_dist
-            # Distance to every beacon
-            beacon_dists = {}
-            for b in beacon_layout.beacons:
-                bxy = np.array(b.pos[:2], dtype=np.float32)
-                beacon_dists[b.identity] = float(np.linalg.norm(cur_xy - bxy))
-            # Target-specific
-            dist_to_target = beacon_dists.get(target_beacon.identity, float("inf")) if target_beacon else float("inf")
-            # Track bounding box of visited area
+            body_speed = float(np.linalg.norm(lin_vel_b))
+            body_ang_speed = float(np.linalg.norm(ang_vel_b))
+            current_cell = grid_cell_for_xy(
+                cur_xy, grid_ox, grid_oy, maze_step, args.grid_rows, args.grid_cols,
+            )
+            if current_cell is not None:
+                visited_cells.add(current_cell)
             visited_x_min = min(visited_x_min, float(cur_xy[0]))
             visited_x_max = max(visited_x_max, float(cur_xy[0]))
             visited_y_min = min(visited_y_min, float(cur_xy[1]))
             visited_y_max = max(visited_y_max, float(cur_xy[1]))
             visited_area = (visited_x_max - visited_x_min) * (visited_y_max - visited_y_min)
+            z_min = min(z_min, cur_z)
+            z_max = max(z_max, cur_z)
+            min_wall_dist = min(min_wall_dist, wall_dist)
+            min_clearance = min(min_clearance, clearance_now)
+            max_clearance = max(max_clearance, clearance_now)
+            max_abs_roll = max(max_abs_roll, abs(roll_deg))
+            max_abs_pitch = max(max_abs_pitch, abs(pitch_deg))
+            max_body_speed = max(max_body_speed, body_speed)
+            max_body_ang_speed = max(max_body_ang_speed, body_ang_speed)
+
+            beacon_diag_terms: list[str] = []
+            beacon_dists_center: dict[str, float] = {}
+            beacon_dists_claim: dict[str, float] = {}
+            beacon_frontnesses: dict[str, float] = {}
+            beacon_los: dict[str, bool] = {}
+            for b in beacon_layout.beacons:
+                bxy = np.array(b.pos[:2], dtype=np.float32)
+                claim_xy = beacon_claim_xy(b, args.wall_thickness)
+                center_dist = float(np.linalg.norm(cur_xy - bxy))
+                claim_dist = float(np.linalg.norm(cur_xy - claim_xy))
+                frontness = beacon_frontness(cur_xy, b)
+                los = has_line_of_sight(cur_xy, claim_xy, obstacle_layout, step_size=0.02, margin=0.01)
+                beacon_dists_center[b.identity] = center_dist
+                beacon_dists_claim[b.identity] = claim_dist
+                beacon_frontnesses[b.identity] = frontness
+                beacon_los[b.identity] = los
+                beacon_diag_terms.append(
+                    f"{b.identity}:c={center_dist:.2f}/f={claim_dist:.2f}/los={int(los)}/front={frontness:+.2f}"
+                )
+
+            dist_to_target_center = (
+                beacon_dists_center.get(target_beacon.identity, float("inf"))
+                if target_beacon else float("inf")
+            )
+            dist_to_target_claim = (
+                beacon_dists_claim.get(target_beacon.identity, float("inf"))
+                if target_beacon else float("inf")
+            )
+            target_frontness = (
+                beacon_frontnesses.get(target_beacon.identity, 0.0)
+                if target_beacon else 0.0
+            )
+            target_los = (
+                beacon_los.get(target_beacon.identity, False)
+                if target_beacon else False
+            )
+            closest_target_center_dist = min(closest_target_center_dist, dist_to_target_center)
+            closest_target_claim_dist = min(closest_target_claim_dist, dist_to_target_claim)
+
+            # Log after metrics so the printed state always matches the recorded trace.
+            ego_frames_hwc.append(obs["frame_hwc"])
+            third_person_frames_hwc.append(tp_frame)
+            combined_frames_hwc.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
+            path_xy.append([float(cur_xy[0]), float(cur_xy[1])])
+            nominal_cmds.append(cmd_vals)
+            plan_costs.append(float(plan_stats.best_cost))
+
+            step_metrics.append({
+                "step": int(step),
+                "cell": list(current_cell) if current_cell is not None else None,
+                "pos": [float(cur_xy[0]), float(cur_xy[1]), cur_z],
+                "rpy_deg": [roll_deg, pitch_deg, yaw_deg],
+                "cmd": cmd_vals,
+                "plan_cost_best": float(plan_stats.best_cost),
+                "plan_cost_mean": float(plan_stats.mean_cost),
+                "plan_cost_std": float(plan_stats.std_cost),
+                "plan_cost_elite": float(plan_stats.elite_cost),
+                "forward_clearance_m": float(clearance_now),
+                "planning_clearance_m": float(clearance_plan),
+                "nearest_wall_m": float(wall_dist),
+                "step_distance_m": float(step_dist),
+                "cumulative_distance_m": float(cumulative_dist),
+                "visited_bbox_area_m2": float(visited_area),
+                "visited_cells": len(visited_cells),
+                "body_linear_vel": [float(v) for v in lin_vel_b],
+                "body_angular_vel": [float(v) for v in ang_vel_b],
+                "body_speed_mps": float(body_speed),
+                "body_ang_speed_rps": float(body_ang_speed),
+                "target_center_dist_m": float(dist_to_target_center),
+                "target_claim_dist_m": float(dist_to_target_claim),
+                "target_los": bool(target_los),
+                "target_frontness_m": float(target_frontness),
+                "frame_substituted": bool(obs["frame_substituted"]),
+                "collided": bool(collided),
+                "fallen": bool(fallen),
+                "recovery_steps_remaining": int(forced_recovery_steps),
+                "beacon_center_dist_m": {k: float(v) for k, v in beacon_dists_center.items()},
+                "beacon_claim_dist_m": {k: float(v) for k, v in beacon_dists_claim.items()},
+                "beacon_los": {k: bool(v) for k, v in beacon_los.items()},
+                "beacon_frontness_m": {k: float(v) for k, v in beacon_frontnesses.items()},
+            })
 
             # Oracle success check (post-hoc metric, NOT used for planning)
-            # Requires line-of-sight — cannot claim beacon through a wall.
             reached = False
-            if target_beacon is not None and dist_to_target <= args.success_range:
-                los = has_line_of_sight(
-                    cur_xy.astype(np.float32),
-                    np.array(target_beacon.pos[:2], dtype=np.float32),
-                    obstacle_layout,
-                )
-                if los:
+            if target_beacon is not None and dist_to_target_claim <= args.success_range:
+                if target_los and target_frontness > 0.0:
                     reached = True
-                    terminate_reason = "goal_reached"
-                    print(f"Step {step:03d} | REACHED beacon {target_beacon.identity} "
-                          f"dist={dist_to_target:.3f}m  LOS=yes")
-                    break
                 else:
+                    los_reject_count += 1
                     if not logged_los_reject:
                         print(f"Step {step:03d} | NEAR beacon {target_beacon.identity} "
-                              f"dist={dist_to_target:.3f}m  but LOS=NO (wall between)")
+                              f"center={dist_to_target_center:.3f}m  claim={dist_to_target_claim:.3f}m  "
+                              f"LOS={int(target_los)}  front={target_frontness:+.3f}m  blocked")
                         logged_los_reject = True
-
-            # Build per-step beacon distance string
-            bdist_str = "  ".join(f"{k}={v:.2f}" for k, v in sorted(beacon_dists.items()))
 
             # Comprehensive per-step log (every step)
             print(
-                f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) z={cur_z:.3f} "
-                f"yaw={math.degrees(obs['yaw_rad']):+6.1f}deg "
+                f"Step {step:03d} | cell={current_cell} pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) z={cur_z:.3f} "
+                f"rpy=({roll_deg:+5.1f}, {pitch_deg:+5.1f}, {yaw_deg:+6.1f})deg "
+                f"v_b=({lin_vel_b[0]:+.3f}, {lin_vel_b[1]:+.3f}, {lin_vel_b[2]:+.3f}) "
+                f"w_b=({ang_vel_b[0]:+.3f}, {ang_vel_b[1]:+.3f}, {ang_vel_b[2]:+.3f}) "
                 f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                f"cost={plan_stats.best_cost:.3f} clr={clearance:.2f}m "
-                f"wd={wall_dist:.2f}m spd={speed:.4f} cd={cumulative_dist:.2f}m "
-                f"area={visited_area:.3f}m² "
-                f"| {bdist_str}"
+                f"cost={plan_stats.best_cost:.3f}/{plan_stats.mean_cost:.3f}±{plan_stats.std_cost:.3f} "
+                f"elite={plan_stats.elite_cost:.3f} clr={clearance_now:.2f}/{clearance_plan:.2f}m wd={wall_dist:.2f}m "
+                f"step={step_dist:.3f}m cum={cumulative_dist:.2f}m area={visited_area:.3f}m^2 "
+                f"cells={len(visited_cells)} coll={int(collided)} fall={int(fallen)} "
+                f"frame_sub={int(obs['frame_substituted'])} recovery={forced_recovery_steps} "
+                f"target=center:{dist_to_target_center:.2f} claim:{dist_to_target_claim:.2f} "
+                f"los:{int(target_los)} front:{target_frontness:+.2f}"
             )
+            if beacon_diag_terms:
+                print(f"           | beacons {'  '.join(beacon_diag_terms)}")
+
+            if reached:
+                terminate_reason = "goal_reached"
+                print(f"Step {step:03d} | REACHED beacon {target_beacon.identity} "
+                      f"claim={dist_to_target_claim:.3f}m  LOS=yes  front={target_frontness:+.3f}m")
+                break
 
             if fallen:
                 terminate_reason = "fallen"
@@ -1306,6 +1529,7 @@ def main() -> None:
                     print(f"Step {step:03d} | stuck ({consecutive_collisions} consecutive collisions) → recovery")
                     forced_recovery_steps = RECOVERY_DURATION
                     recovery_turn_sign = 1.0 if (step % 4 < 2) else -1.0
+                    recovery_episode_count += 1
                     consecutive_collisions = 0
                 planner.reset()
                 last_nominal_cmd.zero_()
@@ -1327,6 +1551,30 @@ def main() -> None:
             pass
 
     elapsed = time.time() - t0
+    visited_bbox = {
+        "x_min": float(visited_x_min),
+        "x_max": float(visited_x_max),
+        "y_min": float(visited_y_min),
+        "y_max": float(visited_y_max),
+    }
+    diagnostics = {
+        "cumulative_distance_m": float(cumulative_dist),
+        "visited_bbox": visited_bbox,
+        "visited_area_m2": float(visited_area),
+        "visited_cell_count": len(visited_cells),
+        "visited_cells": [list(cell) for cell in sorted(visited_cells)],
+        "z_range_m": [float(z_min), float(z_max)],
+        "min_wall_distance_m": float(min_wall_dist),
+        "clearance_range_m": [float(min_clearance), float(max_clearance)],
+        "max_abs_roll_deg": float(max_abs_roll),
+        "max_abs_pitch_deg": float(max_abs_pitch),
+        "max_body_speed_mps": float(max_body_speed),
+        "max_body_ang_speed_rps": float(max_body_ang_speed),
+        "closest_target_center_dist_m": float(closest_target_center_dist),
+        "closest_target_claim_dist_m": float(closest_target_claim_dist),
+        "los_reject_count": int(los_reject_count),
+        "recovery_episode_count": int(recovery_episode_count),
+    }
 
     # ---- 8. Export ----
     summary = {
@@ -1345,13 +1593,20 @@ def main() -> None:
         "spawn_xy": [float(spawn_xy[0]), float(spawn_xy[1])],
         "spawn_yaw_rad": float(spawn_yaw),
         "breadcrumb_xy": breadcrumb_xy,
+        "target_claim_xy": [float(v) for v in target_claim_xy] if target_claim_xy is not None else None,
         "path_xy": path_xy,
         "nominal_cmds": nominal_cmds,
         "plan_costs": plan_costs,
+        "obstacles": [
+            {"pos": [float(v) for v in obs.pos], "size": [float(v) for v in obs.size]}
+            for obs in obstacle_layout.obstacles
+        ],
         "beacons": [
             {"identity": b.identity, "pos": [float(v) for v in b.pos], "normal": [float(v) for v in b.normal]}
             for b in beacon_layout.beacons
         ],
+        "diagnostics": diagnostics,
+        "step_metrics": step_metrics,
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -1372,6 +1627,23 @@ def main() -> None:
             breadcrumb_xy=breadcrumb_xy,
         )
 
+    print("=" * 72)
+    print(
+        f"RUN SUMMARY | {terminate_reason} | steps={len(nominal_cmds)} | collisions={collision_count} "
+        f"| recoveries={recovery_episode_count} | los_rejects={los_reject_count}"
+    )
+    print(
+        f"  distance={cumulative_dist:.2f}m  area={visited_area:.3f}m^2  "
+        f"cells={len(visited_cells)}  z_range=[{z_min:.3f}, {z_max:.3f}]m"
+    )
+    print(
+        f"  wall_min={min_wall_dist:.3f}m  clearance_range=[{min_clearance:.3f}, {max_clearance:.3f}]m  "
+        f"roll_max={max_abs_roll:.1f}deg  pitch_max={max_abs_pitch:.1f}deg"
+    )
+    print(
+        f"  speed_max={max_body_speed:.3f}m/s  ang_speed_max={max_body_ang_speed:.3f}rad/s  "
+        f"target_center_min={closest_target_center_dist:.3f}m  target_claim_min={closest_target_claim_dist:.3f}m"
+    )
     print(f"Finished in {elapsed:.1f}s | {terminate_reason} | collisions={collision_count}")
     print(f"Outputs: {out_dir}")
 
