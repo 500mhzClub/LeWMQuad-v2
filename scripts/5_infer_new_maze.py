@@ -183,11 +183,12 @@ class CEMPlanner:
 
             # Forward reward gated by the world model's safety prediction:
             # full bonus when predicted trajectory is collision-free,
-            # suppressed when the safety head predicts contact/stuck.
+            # hard suppression when the safety head predicts contact/stuck.
+            # sigmoid gate: ~1.0 when safe (mean<0.15), ~0 when risky (mean>0.45)
             if self.forward_reward_weight > 0.0:
                 safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
                 safety_mean = safety_cost / float(max(1, self.horizon))
-                bonus_gate = torch.exp(-0.5 * safety_mean.detach())
+                bonus_gate = torch.sigmoid(5.0 * (0.3 - safety_mean.detach()))
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
                 costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
 
@@ -442,7 +443,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.25])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    parser.add_argument("--forward_reward_weight", type=float, default=1.2,
+    parser.add_argument("--forward_reward_weight", type=float, default=0.8,
                         help="Forward velocity bonus weight")
     parser.add_argument("--exploration_weight", type=float, default=None,
                         help="Override exploration bonus weight from scorer checkpoint.")
