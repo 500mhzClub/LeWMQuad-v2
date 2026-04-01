@@ -292,7 +292,6 @@ class ExplorationBonus(nn.Module):
         """Training loss — average prediction error over the batch."""
         return self.forward(z).mean()
 
-    @torch.no_grad()
     def online_update(
         self,
         z: torch.Tensor,
@@ -318,20 +317,21 @@ class ExplorationBonus(nn.Module):
         if z.ndim == 1:
             z = z.unsqueeze(0)
 
-        # Record bonus before update
-        bonus_before = self.forward(z).mean().item()
+        with torch.no_grad():
+            bonus_before = self.forward(z).mean().item()
 
-        # Temporarily enable gradients for the predictor
+        # Enable gradients for the predictor, run manual SGD
         for p in self.predictor.parameters():
             p.requires_grad_(True)
 
-        for _ in range(n_steps):
-            t = self.target(z)
-            p = self.predictor(z)
-            loss = (p - t).square().mean()
-            grads = torch.autograd.grad(loss, self.predictor.parameters())
-            for param, grad in zip(self.predictor.parameters(), grads):
-                param.data.sub_(lr * grad)
+        with torch.enable_grad():
+            for _ in range(n_steps):
+                t = self.target(z).detach()
+                p = self.predictor(z)
+                loss = (p - t).square().mean()
+                grads = torch.autograd.grad(loss, self.predictor.parameters())
+                for param, grad in zip(self.predictor.parameters(), grads):
+                    param.data.sub_(lr * grad)
 
         for p in self.predictor.parameters():
             p.requires_grad_(False)
