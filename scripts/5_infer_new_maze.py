@@ -98,6 +98,7 @@ class PlanningStats:
     mean_cost: float
     std_cost: float
     elite_cost: float
+    progress_mean: float = 0.0
 
 
 # ---- CEM planner --------------------------------------------------------- #
@@ -117,7 +118,7 @@ class CEMPlanner:
         cmd_high: torch.Tensor,
         init_std: torch.Tensor,
         min_std: torch.Tensor,
-        forward_reward_weight: float,
+        progress_weight: float,
         device: torch.device,
     ):
         self.world_model = world_model
@@ -130,7 +131,7 @@ class CEMPlanner:
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
-        self.forward_reward_weight = float(forward_reward_weight)
+        self.progress_weight = float(progress_weight)
         self.yaw_penalty_weight = 0.10  # updated each step from main loop
         self.device = device
         self._warm_start: torch.Tensor | None = None
@@ -169,24 +170,33 @@ class CEMPlanner:
         if z_goal_proj is not None:
             z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).repeat(self.n_candidates, 1)
 
+        elite_progress_mean = 0.0
         for _ in range(self.cem_iters):
-            samples = mean.unsqueeze(0) + std.unsqueeze(0) * torch.randn(
-                self.n_candidates, self.horizon, 3, device=self.device,
+            # Mix warm-started + diverse candidates to avoid lock-in at junctions
+            n_diverse = self.n_candidates // 6
+            n_warm = self.n_candidates - n_diverse
+            warm = mean.unsqueeze(0) + std.unsqueeze(0) * torch.randn(
+                n_warm, self.horizon, 3, device=self.device,
             )
+            diverse = self.cmd_low.view(1, 1, 3) + (
+                self.cmd_high - self.cmd_low
+            ).view(1, 1, 3) * torch.rand(
+                n_diverse, self.horizon, 3, device=self.device,
+            )
+            samples = torch.cat([warm, diverse], dim=0)
             samples = samples.clamp(self.cmd_low.view(1, 1, 3), self.cmd_high.view(1, 1, 3))
             samples[0] = mean  # always evaluate the current mean
 
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
 
-            # --- Unified safety-budgeted cost ---
-            # Key invariant: the combined forward + exploration bonus is
-            # scaled by ONE safety gate.  This guarantees safety always
-            # retains proportional influence — no combination of bonus
-            # weights can overcome it.
+            # --- Trust-the-model cost ---
+            # No safety gate.  The world model predicts consequences; the
+            # safety head scores them.  Latent progress replaces the old
+            # forward-velocity heuristic — the reward now comes from the
+            # world model's own predictions, not the raw command.
 
-            # 1. Safety cost (always dominates)
+            # 1. Safety cost (consequence-trained head)
             safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
-            safety_mean = safety_cost / float(max(1, self.horizon))
 
             # 2. Goal attraction
             goal_cost = torch.zeros_like(safety_cost)
@@ -195,13 +205,16 @@ class CEMPlanner:
                     z_rollouts, z_goal_batch,
                 )
 
-            # 3. Forward reward (raw, ungated)
-            forward_term = torch.zeros_like(safety_cost)
-            if self.forward_reward_weight > 0.0:
-                forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
-                forward_term = self.forward_reward_weight * forward_bonus
+            # 3. Latent progress — reward predicted state change
+            # Walking into a wall -> world model predicts no change -> no reward.
+            # Turning at a junction -> new visual scene -> high reward.
+            progress_term = torch.zeros_like(safety_cost)
+            if self.progress_weight > 0.0 and self.horizon > 1:
+                z_diffs = z_rollouts[:, 1:, :] - z_rollouts[:, :-1, :]
+                progress_per_step = z_diffs.norm(dim=-1)   # (N, H-1)
+                progress_term = self.progress_weight * progress_per_step.sum(dim=-1)
 
-            # 4. Exploration bonus (raw, ungated)
+            # 4. Exploration bonus (RND novelty)
             explore_term = torch.zeros_like(safety_cost)
             if (self.scorer.exploration is not None
                     and self.scorer.exploration_weight > 0):
@@ -211,19 +224,14 @@ class CEMPlanner:
                 ).reshape(N_cand, H_len).sum(dim=-1)
                 explore_term = self.scorer.exploration_weight * bonus
 
-            # 5. Unified safety gate on ALL bonuses
-            # ~1.0 in safe corridors (mean<0.25), ~0 approaching walls (mean>0.55)
-            bonus_gate = torch.sigmoid(5.0 * (0.4 - safety_mean.detach()))
-            total_bonus = (forward_term + explore_term) * bonus_gate
-
-            # 6. Yaw jerk penalty
+            # 5. Yaw jerk penalty (smoothness only, light)
             yaw_term = torch.zeros_like(safety_cost)
             if self.yaw_penalty_weight > 0.0 and self.horizon > 1:
-                yaw_rates = samples[:, :, 2]          # (N, H)
+                yaw_rates = samples[:, :, 2]
                 yaw_jerk = (yaw_rates[:, 1:] - yaw_rates[:, :-1]).abs().sum(dim=-1)
                 yaw_term = self.yaw_penalty_weight * yaw_jerk
 
-            costs = safety_cost + goal_cost + yaw_term - total_bonus
+            costs = safety_cost + goal_cost + yaw_term - progress_term - explore_term
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -237,6 +245,8 @@ class CEMPlanner:
             mean = elite.mean(dim=0)
             std = elite.std(dim=0, unbiased=False).clamp_min(self.min_std)
             elite_mean_cost = float(elite_costs.mean().item())
+            if self.progress_weight > 0.0:
+                elite_progress_mean = float(progress_term[elite_idx].mean().item())
 
         # Warm-start: shift sequence forward by one step
         shifted = torch.cat([best_seq[1:], best_seq[-1:].clone()], dim=0)
@@ -249,6 +259,7 @@ class CEMPlanner:
             mean_cost=float(best_costs.mean().item()),
             std_cost=float(best_costs.std(unbiased=False).item()),
             elite_cost=float(elite_mean_cost),
+            progress_mean=elite_progress_mean,
         )
         return best_seq, stats
 
@@ -469,8 +480,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     parser.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.25])
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    parser.add_argument("--forward_reward_weight", type=float, default=1.0,
-                        help="Forward velocity bonus weight")
+    parser.add_argument("--progress_weight", type=float, default=0.5,
+                        help="Latent progress reward weight (world-model-predicted state change)")
     parser.add_argument("--exploration_weight", type=float, default=None,
                         help="Override exploration bonus weight from scorer checkpoint.")
     parser.add_argument("--rnd_online_lr", type=float, default=1e-3,
@@ -1210,7 +1221,7 @@ def main() -> None:
         print(
             f"Scorer: goal_weight={scorer.goal_weight:.3f} "
             f"exploration_weight={scorer.exploration_weight:.3f} "
-            f"forward_reward={args.forward_reward_weight:.3f}"
+            f"progress_weight={args.progress_weight:.3f}"
         )
 
         physics_scene, physics_robot, physics_act_dofs, q0, sim_cfg = build_physics_scene(
@@ -1266,7 +1277,7 @@ def main() -> None:
             cmd_high=cmd_high_t,
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
-            forward_reward_weight=args.forward_reward_weight,
+            progress_weight=args.progress_weight,
             device=planning_device,
         )
 
@@ -1373,8 +1384,8 @@ def main() -> None:
             )
             # No clearance-based weight scaling — the consequence-trained
             # energy head handles wall avoidance through the world model.
-            planner.forward_reward_weight = args.forward_reward_weight
-            planner.yaw_penalty_weight = 0.05
+            planner.progress_weight = args.progress_weight
+            planner.yaw_penalty_weight = 0.02
 
             escape_heading = obs["yaw_rad"]
             escape_clearance = clearance_plan
@@ -1628,7 +1639,7 @@ def main() -> None:
                 f"w_b=({ang_vel_b[0]:+.3f}, {ang_vel_b[1]:+.3f}, {ang_vel_b[2]:+.3f}) "
                 f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
                 f"cost={plan_stats.best_cost:.3f}/{plan_stats.mean_cost:.3f}±{plan_stats.std_cost:.3f} "
-                f"elite={plan_stats.elite_cost:.3f} clr={clearance_now:.2f}/{clearance_plan:.2f}m wd={wall_dist:.2f}m "
+                f"elite={plan_stats.elite_cost:.3f} prog={plan_stats.progress_mean:.2f} clr={clearance_now:.2f}/{clearance_plan:.2f}m wd={wall_dist:.2f}m "
                 f"step={step_dist:.3f}m cum={cumulative_dist:.2f}m area={visited_area:.3f}m^2 "
                 f"cells={len(visited_cells)} coll={int(collided)} fall={int(fallen)} "
                 f"frame_sub={int(obs['frame_substituted'])} "
@@ -1716,7 +1727,7 @@ def main() -> None:
         "steps_executed": len(nominal_cmds),
         "collision_count": collision_count,
         "ego_frame_substitutions": ego_frame_substitutions,
-        "forward_reward_weight": args.forward_reward_weight,
+        "progress_weight": args.progress_weight,
         "spawn_xy": [float(spawn_xy[0]), float(spawn_xy[1])],
         "spawn_yaw_rad": float(spawn_yaw),
         "breadcrumb_xy": breadcrumb_xy,
