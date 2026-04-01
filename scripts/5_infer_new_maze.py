@@ -181,12 +181,15 @@ class CEMPlanner:
             # Full TrajectoryScorer: safety + goal + exploration
             costs = self.scorer.score(z_rollouts, z_goal=z_goal_batch if z_goal_batch is not None else None)
 
-            # Forward reward: encourage forward motion.  The world model and
-            # consequence-trained energy head already penalise trajectories
-            # that lead to collisions — no safety gate needed.
+            # Forward reward gated by the world model's safety prediction:
+            # full bonus when predicted trajectory is collision-free,
+            # suppressed when the safety head predicts contact/stuck.
             if self.forward_reward_weight > 0.0:
+                safety_cost = self.scorer.safety_head.score_trajectory(z_rollouts)
+                safety_mean = safety_cost / float(max(1, self.horizon))
+                bonus_gate = torch.exp(-0.5 * safety_mean.detach())
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1)
-                costs = costs - self.forward_reward_weight * forward_bonus
+                costs = costs - self.forward_reward_weight * bonus_gate * forward_bonus
 
             # Yaw jerk penalty: penalises direction *changes* in yaw (oscillation)
             # but NOT a sustained turn — allows clean corners, blocks spinning.
