@@ -132,6 +132,7 @@ class CEMPlanner:
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.forward_reward_weight = float(forward_reward_weight)
+        self.diversity_weight = 0.0  # set from main loop
         self.yaw_penalty_weight = 0.10  # updated each step from main loop
         self.device = device
         self._warm_start: torch.Tensor | None = None
@@ -154,6 +155,7 @@ class CEMPlanner:
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None = None,
         last_cmd: torch.Tensor | None = None,
+        recent_latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, PlanningStats]:
         mean = self._initial_mean(last_cmd)
         std = self.init_std.unsqueeze(0).repeat(self.horizon, 1)
@@ -171,18 +173,9 @@ class CEMPlanner:
             z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).repeat(self.n_candidates, 1)
 
         for _ in range(self.cem_iters):
-            # Mix warm-started + diverse candidates to break lock-in at junctions
-            n_diverse = self.n_candidates // 6
-            n_warm = self.n_candidates - n_diverse
-            warm = mean.unsqueeze(0) + std.unsqueeze(0) * torch.randn(
-                n_warm, self.horizon, 3, device=self.device,
+            samples = mean.unsqueeze(0) + std.unsqueeze(0) * torch.randn(
+                self.n_candidates, self.horizon, 3, device=self.device,
             )
-            diverse = self.cmd_low.view(1, 1, 3) + (
-                self.cmd_high - self.cmd_low
-            ).view(1, 1, 3) * torch.rand(
-                n_diverse, self.horizon, 3, device=self.device,
-            )
-            samples = torch.cat([warm, diverse], dim=0)
             samples = samples.clamp(self.cmd_low.view(1, 1, 3), self.cmd_high.view(1, 1, 3))
             samples[0] = mean  # always evaluate the current mean
 
@@ -215,18 +208,33 @@ class CEMPlanner:
                 ).reshape(N_cand, H_len).sum(dim=-1)
                 explore_term = self.scorer.exploration_weight * bonus
 
-            # 5. Safety gate — suppress bonuses near walls
+            # 5. Safety gate on forward + exploration
             bonus_gate = torch.sigmoid(5.0 * (0.3 - safety_mean.detach()))
             total_bonus = (forward_term + explore_term) * bonus_gate
 
-            # 6. Yaw jerk penalty
+            # 6. Diversity bonus — anti-backtracking in latent space (UNGATED)
+            # Rewards trajectories whose predicted latents are far from
+            # recently visited states.  Provides direction at junctions
+            # and prevents oscillation even when safety gate kills forward.
+            diversity_term = torch.zeros_like(safety_cost)
+            if recent_latents is not None and self.diversity_weight > 0.0 and recent_latents.shape[0] > 0:
+                N_cand, H_len, D_lat = z_rollouts.shape
+                z_flat = z_rollouts.reshape(N_cand * H_len, D_lat)
+                # L2-normalize for scale-invariant distance
+                z_norm = torch.nn.functional.normalize(z_flat, dim=-1)
+                ref_norm = torch.nn.functional.normalize(recent_latents, dim=-1)
+                dists = torch.cdist(z_norm, ref_norm)          # (N*H, K)
+                min_dists = dists.min(dim=-1).values            # (N*H,)
+                diversity_term = self.diversity_weight * min_dists.reshape(N_cand, H_len).sum(dim=-1)
+
+            # 7. Yaw jerk penalty
             yaw_term = torch.zeros_like(safety_cost)
             if self.yaw_penalty_weight > 0.0 and self.horizon > 1:
                 yaw_rates = samples[:, :, 2]
                 yaw_jerk = (yaw_rates[:, 1:] - yaw_rates[:, :-1]).abs().sum(dim=-1)
                 yaw_term = self.yaw_penalty_weight * yaw_jerk
 
-            costs = safety_cost + goal_cost + yaw_term - total_bonus
+            costs = safety_cost + goal_cost + yaw_term - total_bonus - diversity_term
 
             min_cost, min_idx = torch.min(costs, dim=0)
             if float(min_cost.item()) < best_cost:
@@ -474,6 +482,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     parser.add_argument("--forward_reward_weight", type=float, default=0.8,
                         help="Forward velocity bonus weight")
+    parser.add_argument("--diversity_weight", type=float, default=1.0,
+                        help="Latent diversity bonus weight (anti-backtracking, ungated)")
     parser.add_argument("--exploration_weight", type=float, default=None,
                         help="Override exploration bonus weight from scorer checkpoint.")
     parser.add_argument("--rnd_online_lr", type=float, default=1e-3,
@@ -1213,7 +1223,8 @@ def main() -> None:
         print(
             f"Scorer: goal_weight={scorer.goal_weight:.3f} "
             f"exploration_weight={scorer.exploration_weight:.3f} "
-            f"forward_reward={args.forward_reward_weight:.3f}"
+            f"forward_reward={args.forward_reward_weight:.3f} "
+            f"diversity={args.diversity_weight:.3f}"
         )
 
         physics_scene, physics_robot, physics_act_dofs, q0, sim_cfg = build_physics_scene(
@@ -1272,6 +1283,7 @@ def main() -> None:
             forward_reward_weight=args.forward_reward_weight,
             device=planning_device,
         )
+        planner.diversity_weight = args.diversity_weight
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
         last_nominal_cmd = torch.zeros(3, device=planning_device, dtype=torch.float32)
@@ -1297,6 +1309,9 @@ def main() -> None:
         third_person_frames_hwc.append(tp_frame)
         combined_frames_hwc.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+
+        # Latent history for diversity bonus (anti-backtracking)
+        latent_history: list[torch.Tensor] = [obs["z_proj"].squeeze(0).detach()]
 
         # Diagnostics tracked across the run.
         step_metrics: list[dict[str, Any]] = []
@@ -1433,10 +1448,12 @@ def main() -> None:
                                            std_cost=0.0, elite_cost=0.0)
             else:
                 # Plan — world model + consequence energy drives all navigation
+                recent_z = torch.stack(latent_history).to(planning_device) if latent_history else None
                 plan_seq, plan_stats = planner.plan(
                     z_start_raw=obs["z_raw"],
                     z_goal_proj=z_breadcrumb,
                     last_cmd=last_nominal_cmd,
+                    recent_latents=recent_z,
                 )
                 nominal_cmd = plan_seq[0]
 
@@ -1470,6 +1487,10 @@ def main() -> None:
                 ego_frame_substitutions += 1
             else:
                 last_clean_ego_frame = obs["frame_hwc"].copy()
+
+            # Update latent history for diversity bonus
+            if not obs["frame_substituted"]:
+                latent_history.append(obs["z_proj"].squeeze(0).detach())
 
             # Online RND adaptation — teach predictor about this observation
             # so revisited states progressively lose their novelty bonus.
@@ -1720,6 +1741,7 @@ def main() -> None:
         "collision_count": collision_count,
         "ego_frame_substitutions": ego_frame_substitutions,
         "forward_reward_weight": args.forward_reward_weight,
+        "diversity_weight": args.diversity_weight,
         "spawn_xy": [float(spawn_xy[0]), float(spawn_xy[1])],
         "spawn_yaw_rad": float(spawn_yaw),
         "breadcrumb_xy": breadcrumb_xy,
