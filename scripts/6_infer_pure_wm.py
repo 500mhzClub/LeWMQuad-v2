@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Novelty-seeking MPC for maze exploration using the LeWM world model.
+"""Displacement-based MPC for maze exploration using the LeWM world model.
 
-The world model gives us two things for free:
-  1. Safe rollouts -- wall trajectories produce poor predictions, CEM avoids them.
-  2. Meaningful latent geometry -- nearby latent states = similar physical states.
+The world model predicts future latent states from candidate action sequences.
+Planning uses two terms (plus optional goal):
 
-The planning cost has two terms and one tunable weight:
+    cost = -displacement(z_H, z_0) - recency_weight * recency(z_rollout, z_recent)
+         + goal_lambda * ||z_H - z_g||^2
 
-    cost = -novelty(z_rollout, visited_memory) + lambda * ||z_H - z_g||^2
-
-  - novelty: predicted latents that are far from everywhere we have already been
-    score low (= good).  This drives systematic corridor exploration.
-  - terminal goal: gentle pull toward the beacon.  Weak at distance (latent
-    distance does not respect topology), strong when close (same corridor).
-  - lambda: balances exploration vs exploitation.  Low = explore more.
+  - displacement: ||z_H - z_0||^2 -- "go somewhere different from where you are
+    now."  Wall collisions keep the robot in place physically, so the model
+    should predict small displacement for collision trajectories.  This is
+    the implicit safety signal.
+  - recency: min L2 distance from predicted rollout to a short FIFO buffer of
+    recent z_raw observations (~last 50 steps).  Prevents the robot from
+    immediately backtracking into where it just was.  The buffer naturally
+    forgets, so old areas become explorable again after dead ends.
+  - goal: terminal L2^2 to the beacon breadcrumb latent.
 
 No safety heads, no forward bonus, no gates, no oracle ray-marching,
-no stuck detector, no forced recovery.  The world model handles wall
-avoidance through dynamics predictions alone.
+no stuck detector, no forced recovery.
 
 Usage:
     python scripts/6_infer_pure_wm.py \\
@@ -35,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -100,27 +102,26 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Novelty-seeking CEM planner ----------------------------------------- #
+# ---- Displacement + recency CEM planner ---------------------------------- #
 
-class NoveltyCEMPlanner:
-    """CEM planner that explores by seeking novel latent states.
+class DisplacementCEMPlanner:
+    """CEM planner that maximises predicted latent displacement.
 
     Cost for each candidate trajectory:
 
-        cost = -novelty(z_rollout, visited) + goal_lambda * ||z_H - z_g||^2
+        cost = -||z_H - z_0||^2
+               - recency_weight * mean(min_dist(z_rollout, z_recent))
+               + goal_lambda * ||z_H - z_g||^2
 
-    novelty: for each predicted latent in the rollout, compute the minimum
-    L2 distance to any previously visited latent.  Average over the horizon.
-    High novelty = the trajectory reaches places we haven't been = low cost.
+    displacement: trajectories that move the robot to a new physical location
+    produce large latent displacement.  Wall collisions keep the robot in
+    place, so the model predicts small displacement -- implicit wall avoidance.
 
-    goal: terminal L2^2 to the breadcrumb latent (paper Eq. 4).  Provides
-    a gradient toward the beacon when nearby.  At distance through walls,
-    this term is nearly constant across candidates (all equally far in
-    latent space) so novelty dominates -- exactly what we want.
+    recency: short FIFO of recent z_raw (~50 steps) prevents immediate
+    backtracking.  The buffer forgets naturally so old areas become
+    explorable again after dead ends.
 
-    The world model's dynamics predictions handle wall avoidance: rollouts
-    that walk into walls produce degenerate/collapsed predictions that score
-    poorly on both terms.
+    goal: terminal pull toward beacon breadcrumb.
     """
 
     def __init__(
@@ -131,6 +132,7 @@ class NoveltyCEMPlanner:
         cem_iters: int,
         elite_frac: float,
         goal_lambda: float,
+        recency_weight: float,
         cmd_low: torch.Tensor,
         cmd_high: torch.Tensor,
         init_std: torch.Tensor,
@@ -143,6 +145,7 @@ class NoveltyCEMPlanner:
         self.cem_iters = int(cem_iters)
         self.n_elite = max(1, int(round(self.n_candidates * elite_frac)))
         self.goal_lambda = float(goal_lambda)
+        self.recency_weight = float(recency_weight)
         self.cmd_low = cmd_low.to(device=device, dtype=torch.float32)
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
@@ -158,21 +161,21 @@ class NoveltyCEMPlanner:
         self,
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None,
-        visited: torch.Tensor | None,
+        z_recent: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Plan an action sequence balancing exploration and goal-seeking.
+        """Plan an action sequence via displacement + recency + goal.
 
         Args:
             z_start_raw: (1, D) raw encoder embedding of current observation.
             z_goal_proj: (D,) or (1, D) projected goal embedding, or None.
-            visited:     (K, D) raw latents of visited landmarks, or None.
+            z_recent:    (K, D) FIFO of recent z_raw observations, or None.
 
         Returns:
             best_seq: (H, 3) best action sequence.
             info: dict with cost breakdown for logging.
         """
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
-        z0_batch = z0.expand(self.n_candidates, -1)
+        z0_batch = z0.expand(self.n_candidates, -1)  # (N, D)
 
         z_goal_batch = None
         if z_goal_proj is not None:
@@ -182,9 +185,9 @@ class NoveltyCEMPlanner:
                 self.n_candidates, -1,
             )
 
-        visited_dev = None
-        if visited is not None and visited.shape[0] > 0:
-            visited_dev = visited.to(self.device, dtype=torch.float32)
+        recent_dev = None
+        if z_recent is not None and z_recent.shape[0] > 0:
+            recent_dev = z_recent.to(self.device, dtype=torch.float32)
 
         # Initialise CEM distribution
         if self._warm_start is not None:
@@ -214,27 +217,31 @@ class NoveltyCEMPlanner:
             # z_rollouts: (N, H, D)
             N, H, D = z_rollouts.shape
 
-            # --- Novelty term ---
-            # For each predicted latent, find min L2 distance to visited set.
-            # Raw L2 (no normalization) preserves spatial structure the encoder learned.
-            novelty_score = torch.zeros(N, device=self.device)
-            if visited_dev is not None:
+            # --- Displacement term ---
+            # How far does the terminal prediction move from the start?
+            z_terminal = z_rollouts[:, -1, :]  # (N, D)
+            displacement = (z_terminal - z0_batch).square().sum(dim=-1)  # (N,)
+
+            # --- Recency term ---
+            # Avoid backtracking into recent observations
+            recency_score = torch.zeros(N, device=self.device)
+            if recent_dev is not None:
                 z_flat = z_rollouts.reshape(N * H, D)
-                # (N*H, K) pairwise L2 distances
-                dists = torch.cdist(z_flat, visited_dev)
-                # Min distance to any visited state, averaged over horizon
-                min_dists = dists.min(dim=-1).values  # (N*H,)
-                novelty_score = min_dists.reshape(N, H).mean(dim=-1)  # (N,)
+                dists = torch.cdist(z_flat, recent_dev)  # (N*H, K)
+                min_dists = dists.min(dim=-1).values      # (N*H,)
+                recency_score = min_dists.reshape(N, H).mean(dim=-1)  # (N,)
 
             # --- Goal term ---
             goal_cost = torch.zeros(N, device=self.device)
             if z_goal_batch is not None:
-                z_terminal = z_rollouts[:, -1, :]
                 goal_cost = (z_terminal - z_goal_batch).square().sum(dim=-1)
 
             # Combined cost: lower is better
-            # Negate novelty (we want to maximise it)
-            costs = -novelty_score + self.goal_lambda * goal_cost
+            costs = (
+                -displacement
+                - self.recency_weight * recency_score
+                + self.goal_lambda * goal_cost
+            )
 
             # Track best
             min_cost, min_idx = costs.min(dim=0)
@@ -243,7 +250,8 @@ class NoveltyCEMPlanner:
                 best_seq = samples[min_idx.item()].detach().clone()
                 best_info = {
                     "cost": min_cost.item(),
-                    "novelty": novelty_score[min_idx].item(),
+                    "displacement": displacement[min_idx].item(),
+                    "recency": recency_score[min_idx].item(),
                     "goal_cost": goal_cost[min_idx].item(),
                 }
 
@@ -301,14 +309,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     p.add_argument("--goal_lambda", type=float, default=0.01,
-                    help="Weight on terminal goal cost vs novelty. "
+                    help="Weight on terminal goal cost vs displacement. "
                          "Low = explore more, high = beeline to beacon.")
-    p.add_argument("--visited_subsample", type=int, default=200,
-                    help="Max visited landmarks to use for novelty computation. "
-                         "Uniformly subsampled if exceeded, for speed.")
-    p.add_argument("--landmark_threshold", type=float, default=1.0,
-                    help="Min L2 distance in z_raw space to add a new landmark. "
-                         "Prevents memory filling with near-identical snapshots.")
+    p.add_argument("--recency_weight", type=float, default=0.5,
+                    help="Weight on recency anti-backtracking term.")
+    p.add_argument("--recency_buffer", type=int, default=50,
+                    help="FIFO size for recent z_raw observations. "
+                         "Prevents immediate backtracking; forgets old areas.")
     # Success / termination
     p.add_argument("--success_range", type=float, default=0.4)
     # Output
@@ -893,13 +900,14 @@ def main():
         # ---- 5. Spawn robot + create planner ----
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
-        planner = NoveltyCEMPlanner(
+        planner = DisplacementCEMPlanner(
             world_model=world_model,
             horizon=args.plan_horizon,
             n_candidates=args.n_candidates,
             cem_iters=args.cem_iters,
             elite_frac=args.elite_frac,
             goal_lambda=args.goal_lambda,
+            recency_weight=args.recency_weight,
             cmd_low=torch.tensor(args.cmd_low, dtype=torch.float32),
             cmd_high=torch.tensor(args.cmd_high, dtype=torch.float32),
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
@@ -913,12 +921,9 @@ def main():
         plan_step_idx = 0  # which action in current plan to execute next
         plan_info: dict[str, float] = {}
 
-        # Visited latent memory for novelty computation (landmark-based).
-        # Only store a new z_raw if it is sufficiently far from all existing
-        # landmarks, so the memory captures distinct locations, not repeated
-        # views of the same corridor.
-        visited_latents: list[torch.Tensor] = []
-        landmark_thresh = args.landmark_threshold
+        # FIFO recency buffer: last N z_raw observations.
+        # Prevents immediate backtracking; naturally forgets old areas.
+        recency_buf: deque[torch.Tensor] = deque(maxlen=args.recency_buffer)
 
         # ---- 6. Initial observation ----
         obs = observe(
@@ -930,7 +935,7 @@ def main():
         )
         last_clean_frame = obs["frame_hwc"].copy()
         ego_frames_hwc.append(obs["frame_hwc"])
-        visited_latents.append(obs["z_raw"].squeeze(0).detach())
+        recency_buf.append(obs["z_raw"].squeeze(0).detach())
         tp_frame = render_third_person_frame(
             physics_robot, physics_act_dofs,
             tp_robot, tp_act_dofs, tp_cam,
@@ -949,19 +954,13 @@ def main():
             )
 
             if need_replan:
-                # Build visited tensor (subsample for speed)
-                visited_t = None
-                if visited_latents:
-                    all_v = torch.stack(visited_latents)
-                    if all_v.shape[0] > args.visited_subsample:
-                        idx = torch.linspace(
-                            0, all_v.shape[0] - 1, args.visited_subsample,
-                        ).long()
-                        all_v = all_v[idx]
-                    visited_t = all_v
+                # Stack recency buffer into tensor for planner
+                z_recent = None
+                if len(recency_buf) > 0:
+                    z_recent = torch.stack(list(recency_buf))
 
                 plan_seq, plan_info = planner.plan(
-                    obs["z_raw"], z_breadcrumb, visited_t,
+                    obs["z_raw"], z_breadcrumb, z_recent,
                 )
                 plan_step_idx = 0
                 costs_log.append(plan_info.get("cost", 0.0))
@@ -990,18 +989,7 @@ def main():
             )
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                # Landmark-gated visited memory: only add if far enough
-                # from all existing landmarks to represent a new location
-                z_new = obs["z_raw"].squeeze(0).detach()
-                if len(visited_latents) == 0:
-                    visited_latents.append(z_new)
-                else:
-                    existing = torch.stack(visited_latents)
-                    min_dist = torch.cdist(
-                        z_new.unsqueeze(0), existing,
-                    ).min().item()
-                    if min_dist >= landmark_thresh:
-                        visited_latents.append(z_new)
+                recency_buf.append(obs["z_raw"].squeeze(0).detach())
 
             # Render third-person
             tp_frame = render_third_person_frame(
@@ -1056,12 +1044,13 @@ def main():
                     reached = True
 
                 if step % 20 == 0 or reached:
-                    nov_str = f"nov={plan_info.get('novelty', 0):.3f}" if plan_info else ""
+                    disp_str = f"disp={plan_info.get('displacement', 0):.1f}" if plan_info else ""
+                    rec_str = f"rec={plan_info.get('recency', 0):.1f}" if plan_info else ""
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                        f"d_goal={dist_claim:.2f}m {nov_str} "
-                        f"landmarks={len(visited_latents)} coll={collision_count}"
+                        f"d_goal={dist_claim:.2f}m {disp_str} {rec_str} "
+                        f"coll={collision_count}"
                     )
 
             if reached:
@@ -1084,7 +1073,7 @@ def main():
 
     # ---- 8. Export ----
     summary = {
-        "approach": "novelty_seeking_mpc",
+        "approach": "displacement_mpc",
         "seed": args.seed,
         "grid": f"{args.grid_rows}x{args.grid_cols}",
         "target": target_beacon.identity if target_beacon else None,
@@ -1099,8 +1088,8 @@ def main():
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
             "goal_lambda": args.goal_lambda,
-            "visited_subsample": args.visited_subsample,
-            "landmark_threshold": args.landmark_threshold,
+            "recency_weight": args.recency_weight,
+            "recency_buffer": args.recency_buffer,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
