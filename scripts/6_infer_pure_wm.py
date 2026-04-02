@@ -12,6 +12,12 @@ No safety heads, no forward reward, no exploration bonus, no diversity,
 no yaw penalty, no oracle ray-marching, no collision backstop.
 The world model's latent space already encodes wall proximity and dynamics
 (verified by probing results in Table 1 of the paper).
+
+ python scripts/6_infer_pure_wm.py \
+    --ppo_ckpt models/ppo/ckpt_20000.pt \
+    --wm_ckpt lewm_checkpoints/epoch_20.pt \
+    --seed 42
+
 """
 from __future__ import annotations
 
@@ -232,7 +238,7 @@ def parse_args() -> argparse.Namespace:
     # CEM planner (paper defaults: 300 candidates, 30 iters, top 30 elites)
     p.add_argument("--plan_horizon", type=int, default=5,
                     help="Planning horizon H (paper default: 5)")
-    p.add_argument("--n_candidates", type=int, default=300,
+    p.add_argument("--n_candidates", type=int, default=100,
                     help="CEM candidate count (paper: 300)")
     p.add_argument("--cem_iters", type=int, default=30,
                     help="CEM optimisation iterations (paper: 30)")
