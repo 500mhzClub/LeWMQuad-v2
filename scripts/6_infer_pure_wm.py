@@ -238,7 +238,7 @@ def parse_args() -> argparse.Namespace:
     # CEM planner (paper defaults: 300 candidates, 30 iters, top 30 elites)
     p.add_argument("--plan_horizon", type=int, default=5,
                     help="Planning horizon H (paper default: 5)")
-    p.add_argument("--n_candidates", type=int, default=100,
+    p.add_argument("--n_candidates", type=int, default=300,
                     help="CEM candidate count (paper: 300)")
     p.add_argument("--cem_iters", type=int, default=30,
                     help="CEM optimisation iterations (paper: 30)")
