@@ -482,8 +482,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     parser.add_argument("--forward_reward_weight", type=float, default=0.8,
                         help="Forward velocity bonus weight")
-    parser.add_argument("--diversity_weight", type=float, default=1.0,
-                        help="Latent diversity bonus weight (anti-backtracking, ungated)")
+    parser.add_argument("--diversity_weight", type=float, default=0.0,
+                        help="Latent diversity bonus weight (0 to disable)")
     parser.add_argument("--exploration_weight", type=float, default=None,
                         help="Override exploration bonus weight from scorer checkpoint.")
     parser.add_argument("--rnd_online_lr", type=float, default=1e-3,
@@ -1374,14 +1374,16 @@ def main() -> None:
         )
 
         # Recovery manoeuvre constants (outside loop — fixed for entire run)
-        # Collision backstop only — no proactive pivot.  The planner
-        # handles turning via the consequence-trained energy head.
         RECOVERY_TRIGGER = 3    # consecutive collision steps before backstop spin
-        RECOVERY_DURATION = 12  # short backstop spin (was 48)
+        RECOVERY_DURATION = 12  # short backstop spin
         RECOVERY_MIN_SPIN_STEPS = 4
         TURN_RELEASE_CLEARANCE = 0.20
         TURN_MIN_DELTA_RAD = math.radians(25.0)
         recovery_turn_sign = 1.0  # will be set at recovery trigger
+
+        # Stuck detector — force a turn when no spatial progress
+        STUCK_PATIENCE = 150     # check displacement over this many steps
+        STUCK_THRESHOLD = 0.10   # metres — must displace at least this much
 
         # ---- 7. Main loop ----
         for step in range(args.steps):
@@ -1409,7 +1411,19 @@ def main() -> None:
                 and abs(escape_delta) >= TURN_MIN_DELTA_RAD
             )
 
-            # --- Collision backstop: short spin only on repeated collisions ---
+            # --- Stuck detector: force turn when no spatial progress ---
+            progress_stuck = False
+            if step >= STUCK_PATIENCE and forced_recovery_steps == 0:
+                old_xy = np.array(path_xy[step - STUCK_PATIENCE], dtype=np.float32)
+                cur_xy_check = np.asarray(obs["pos_np"][:2], dtype=np.float32)
+                displacement = float(np.linalg.norm(cur_xy_check - old_xy))
+                if displacement < STUCK_THRESHOLD:
+                    progress_stuck = True
+                    escape_heading, escape_clearance, escape_delta, escape_scan = choose_escape_heading(
+                        obs["pos_np"][:2], obs["yaw_rad"], obstacle_layout,
+                    )
+
+            # --- Collision backstop / stuck recovery ---
             if forced_recovery_steps > 0:
                 if recovery_spin_age >= RECOVERY_MIN_SPIN_STEPS and clearance_plan >= TURN_RELEASE_CLEARANCE:
                     print(f"Step {step:03d} | backstop exit clr={clearance_plan:.2f}m "
@@ -1420,7 +1434,7 @@ def main() -> None:
                     forced_recovery_steps -= 1
                     recovery_spin_age += 1
                     use_forced_recovery = True
-            elif collision_pivot:
+            elif collision_pivot or progress_stuck:
                 forced_recovery_steps = RECOVERY_DURATION - 1
                 recovery_spin_age = 1
                 if abs(escape_delta) >= math.radians(12.0):
@@ -1432,8 +1446,9 @@ def main() -> None:
                 planner.reset()
                 last_nominal_cmd.zero_()
                 scan_str = " ".join(f"{deg:+.0f}:{clr:.2f}" for deg, clr in escape_scan)
+                trigger_reason = "stuck" if progress_stuck else f"collisions x{consecutive_collisions}"
                 print(
-                    f"Step {step:03d} | backstop trigger collisions x{consecutive_collisions} "
+                    f"Step {step:03d} | backstop trigger {trigger_reason} "
                     f"clr={clearance_plan:.2f}m -> best={escape_clearance:.2f}m "
                     f"delta={math.degrees(escape_delta):+.1f}deg sign={recovery_turn_sign:+.0f} "
                     f"scan=[{scan_str}]"
