@@ -165,7 +165,7 @@ class NoveltyCEMPlanner:
         Args:
             z_start_raw: (1, D) raw encoder embedding of current observation.
             z_goal_proj: (D,) or (1, D) projected goal embedding, or None.
-            visited:     (K, D) projected latents of all visited states, or None.
+            visited:     (K, D) raw latents of visited landmarks, or None.
 
         Returns:
             best_seq: (H, 3) best action sequence.
@@ -182,11 +182,9 @@ class NoveltyCEMPlanner:
                 self.n_candidates, -1,
             )
 
-        visited_normed = None
+        visited_dev = None
         if visited is not None and visited.shape[0] > 0:
-            visited_normed = torch.nn.functional.normalize(
-                visited.to(self.device, dtype=torch.float32), dim=-1,
-            )
+            visited_dev = visited.to(self.device, dtype=torch.float32)
 
         # Initialise CEM distribution
         if self._warm_start is not None:
@@ -217,14 +215,13 @@ class NoveltyCEMPlanner:
             N, H, D = z_rollouts.shape
 
             # --- Novelty term ---
-            # For each predicted latent, find min distance to visited set.
-            # Use L2-normalised embeddings for scale-invariance.
+            # For each predicted latent, find min L2 distance to visited set.
+            # Raw L2 (no normalization) preserves spatial structure the encoder learned.
             novelty_score = torch.zeros(N, device=self.device)
-            if visited_normed is not None:
+            if visited_dev is not None:
                 z_flat = z_rollouts.reshape(N * H, D)
-                z_flat_normed = torch.nn.functional.normalize(z_flat, dim=-1)
-                # (N*H, K) pairwise distances
-                dists = torch.cdist(z_flat_normed, visited_normed)
+                # (N*H, K) pairwise L2 distances
+                dists = torch.cdist(z_flat, visited_dev)
                 # Min distance to any visited state, averaged over horizon
                 min_dists = dists.min(dim=-1).values  # (N*H,)
                 novelty_score = min_dists.reshape(N, H).mean(dim=-1)  # (N,)
@@ -307,8 +304,11 @@ def parse_args() -> argparse.Namespace:
                     help="Weight on terminal goal cost vs novelty. "
                          "Low = explore more, high = beeline to beacon.")
     p.add_argument("--visited_subsample", type=int, default=200,
-                    help="Max visited latents to keep for novelty computation. "
+                    help="Max visited landmarks to use for novelty computation. "
                          "Uniformly subsampled if exceeded, for speed.")
+    p.add_argument("--landmark_threshold", type=float, default=1.0,
+                    help="Min L2 distance in z_raw space to add a new landmark. "
+                         "Prevents memory filling with near-identical snapshots.")
     # Success / termination
     p.add_argument("--success_range", type=float, default=0.4)
     # Output
@@ -913,8 +913,12 @@ def main():
         plan_step_idx = 0  # which action in current plan to execute next
         plan_info: dict[str, float] = {}
 
-        # Visited latent memory for novelty computation
+        # Visited latent memory for novelty computation (landmark-based).
+        # Only store a new z_raw if it is sufficiently far from all existing
+        # landmarks, so the memory captures distinct locations, not repeated
+        # views of the same corridor.
         visited_latents: list[torch.Tensor] = []
+        landmark_thresh = args.landmark_threshold
 
         # ---- 6. Initial observation ----
         obs = observe(
@@ -926,7 +930,7 @@ def main():
         )
         last_clean_frame = obs["frame_hwc"].copy()
         ego_frames_hwc.append(obs["frame_hwc"])
-        visited_latents.append(obs["z_proj"].squeeze(0).detach())
+        visited_latents.append(obs["z_raw"].squeeze(0).detach())
         tp_frame = render_third_person_frame(
             physics_robot, physics_act_dofs,
             tp_robot, tp_act_dofs, tp_cam,
@@ -986,8 +990,18 @@ def main():
             )
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                # Add to visited memory (only clean frames)
-                visited_latents.append(obs["z_proj"].squeeze(0).detach())
+                # Landmark-gated visited memory: only add if far enough
+                # from all existing landmarks to represent a new location
+                z_new = obs["z_raw"].squeeze(0).detach()
+                if len(visited_latents) == 0:
+                    visited_latents.append(z_new)
+                else:
+                    existing = torch.stack(visited_latents)
+                    min_dist = torch.cdist(
+                        z_new.unsqueeze(0), existing,
+                    ).min().item()
+                    if min_dist >= landmark_thresh:
+                        visited_latents.append(z_new)
 
             # Render third-person
             tp_frame = render_third_person_frame(
@@ -1047,7 +1061,7 @@ def main():
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
                         f"d_goal={dist_claim:.2f}m {nov_str} "
-                        f"visited={len(visited_latents)} coll={collision_count}"
+                        f"landmarks={len(visited_latents)} coll={collision_count}"
                     )
 
             if reached:
@@ -1086,6 +1100,7 @@ def main():
             "mpc_execute_k": args.mpc_execute,
             "goal_lambda": args.goal_lambda,
             "visited_subsample": args.visited_subsample,
+            "landmark_threshold": args.landmark_threshold,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
