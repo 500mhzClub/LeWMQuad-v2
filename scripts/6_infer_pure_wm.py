@@ -104,8 +104,8 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
-        novelty_weight: float = 1.0,
-        action_penalty_weight: float = 0.05,
+        novelty_weight: float = 10.0,
+        action_penalty_weight: float = 0.001,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -191,7 +191,7 @@ class PureCEMPlanner:
                     costs -= self.novelty_weight * seq_novelty_dist
 
             # 3. Action Smoothness Penalty (L2)
-            # Encourages smooth movement and penalizes bang-bang rotation exploits
+            # Scaled down drastically to prevent it acting like a parking brake
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -245,8 +245,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
-    p.add_argument("--novelty_weight", type=float, default=1.0)
-    p.add_argument("--action_penalty_weight", type=float, default=0.05)
+    # Dramatically changed novelty to action-penalty ratio to force movement
+    p.add_argument("--novelty_weight", type=float, default=10.0)
+    p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--history_len", type=int, default=100)
     p.add_argument("--success_range", type=float, default=0.4)
     
@@ -846,7 +847,6 @@ def main():
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         
-        # FIX: Appending raw latents to match rollout space
         latent_history.append(obs["z_raw"].squeeze(0).detach())
 
         for step in range(args.steps):
@@ -887,7 +887,6 @@ def main():
             
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                # FIX: Appending raw latents to match rollout space
                 latent_history.append(obs["z_raw"].squeeze(0).detach())
                 if len(latent_history) > args.history_len:
                     latent_history.pop(0)
