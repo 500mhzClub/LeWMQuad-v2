@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Safety + novelty MPC for maze exploration using the LeWM world model.
+"""Displacement + novelty MPC for maze exploration using the LeWM world model.
 
 The world model predicts future latent states from candidate action sequences.
-A learned safety head scores trajectories for wall avoidance, while a latent
-novelty signal drives exploration.
+Planning uses displacement for immediate movement drive and novelty for
+long-term exploration, both in projected latent space.
 
-    cost = safety_energy(z_rollout)
+    cost = -displacement(z_H, z_0)
          - novelty_weight * novelty(z_rollout, visited)
          + goal_lambda * ||z_H - z_g||^2
 
-  - safety: LatentEnergyHead trained on clearance/traversability data.
-    Provides reliable wall avoidance without heuristics.
+  - displacement: ||z_H - z_0||^2 in projected space.  Provides immediate
+    gradient for movement.  Wall collisions keep the robot in place
+    physically, so the model predicts small displacement for collision
+    trajectories — implicit wall avoidance.
   - novelty: min L2 distance from predicted rollout to the full set of
     previously visited projected latents.  The visited set never forgets,
     driving systematic exploration of new corridors.
   - goal: terminal L2^2 to the beacon breadcrumb latent.
 
-No forward bonus, no gates, no oracle ray-marching,
+All comparisons are in projected space (enc_projector / pred_projector),
+the space the world model was trained to predict in.
+
+No safety heads, no forward bonus, no gates, no oracle ray-marching,
 no stuck detector, no forced recovery.
 
 Usage:
@@ -101,35 +106,33 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Safety + novelty CEM planner ---------------------------------------- #
+# ---- Displacement + novelty CEM planner ---------------------------------- #
 
-class NoveltyCEMPlanner:
-    """CEM planner: learned safety + latent novelty + goal.
+class DisplacementCEMPlanner:
+    """CEM planner: displacement + latent novelty + goal.
 
     Cost for each candidate trajectory:
 
-        cost = safety_energy(z_rollout)
+        cost = -||z_H - z_0||^2
              - novelty_weight * mean(min_dist(z_rollout, visited))
              + goal_lambda * ||z_H - z_g||^2
 
-    safety: the LatentEnergyHead scores each predicted latent for wall
-    proximity and traversability.  Trained on real clearance data, so it
-    provides reliable wall avoidance without heuristics.
+    displacement: immediate movement drive in projected space.  The only
+    signal with reliable variance across candidates.  Implicit wall
+    avoidance: the world model predicts small displacement for trajectories
+    that hit walls (the robot stays in place physically).
 
-    novelty: min L2 distance from predicted rollout to the full set of
-    previously visited projected latents.  The visited set never forgets,
-    driving systematic exploration.
+    novelty: persistent visited-latent memory (never forgets).  Drives
+    long-term corridor exploration once enough landmarks accumulate.
 
     goal: terminal pull toward beacon breadcrumb.
 
-    All novelty/goal comparisons happen in projected space (the space the
-    world model was trained to predict in).
+    All comparisons in projected space (enc_projector / pred_projector).
     """
 
     def __init__(
         self,
         world_model: LeWorldModel,
-        safety_head: LatentEnergyHead,
         horizon: int,
         n_candidates: int,
         cem_iters: int,
@@ -144,7 +147,6 @@ class NoveltyCEMPlanner:
         device: torch.device,
     ):
         self.world_model = world_model
-        self.safety_head = safety_head
         self.horizon = int(horizon)
         self.n_candidates = int(n_candidates)
         self.cem_iters = int(cem_iters)
@@ -169,7 +171,7 @@ class NoveltyCEMPlanner:
         z_goal_proj: torch.Tensor | None,
         visited_proj: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Plan an action sequence via safety + novelty + goal.
+        """Plan an action sequence via displacement + novelty + goal.
 
         Args:
             z_start_raw:  (1, D) raw encoder embedding (predictor input).
@@ -182,6 +184,8 @@ class NoveltyCEMPlanner:
         """
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)  # (N, D)
+        # Project z0 into the same space as plan_rollout output
+        z0_proj = self.world_model.enc_projector(z0_batch)  # (N, D)
 
         z_goal_batch = None
         if z_goal_proj is not None:
@@ -229,10 +233,11 @@ class NoveltyCEMPlanner:
             # z_rollouts: (N, H, D) in projected space
             N, H, D = z_rollouts.shape
 
-            # --- Safety term (learned energy head, per-step mean) ---
-            safety_cost = self.safety_head.score_trajectory(z_rollouts) / float(H)  # (N,)
+            # --- Displacement term (projected space) ---
+            z_terminal = z_rollouts[:, -1, :]  # (N, D)
+            displacement = (z_terminal - z0_proj).square().sum(dim=-1)  # (N,)
 
-            # --- Novelty term (projected space, per-step mean) ---
+            # --- Novelty term (projected space) ---
             novelty_score = torch.zeros(N, device=self.device)
             if visited_dev is not None:
                 z_flat = z_rollouts.reshape(N * H, D)
@@ -243,12 +248,11 @@ class NoveltyCEMPlanner:
             # --- Goal term ---
             goal_cost = torch.zeros(N, device=self.device)
             if z_goal_batch is not None:
-                z_terminal = z_rollouts[:, -1, :]  # (N, D)
                 goal_cost = (z_terminal - z_goal_batch).square().sum(dim=-1)
 
             # Combined cost: lower is better
             costs = (
-                safety_cost
+                -displacement
                 - self.novelty_weight * novelty_score
                 + self.goal_lambda * goal_cost
             )
@@ -260,11 +264,9 @@ class NoveltyCEMPlanner:
                 best_seq = samples[min_idx.item()].detach().clone()
                 best_info = {
                     "cost": min_cost.item(),
-                    "safety": safety_cost[min_idx].item(),
+                    "displacement": displacement[min_idx].item(),
                     "novelty": novelty_score[min_idx].item(),
                     "goal_cost": goal_cost[min_idx].item(),
-                    "safety_std": safety_cost.std().item(),
-                    "novelty_std": novelty_score.std().item(),
                 }
 
             # Update CEM distribution from elites
