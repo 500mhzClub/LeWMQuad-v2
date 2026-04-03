@@ -1,34 +1,17 @@
 #!/usr/bin/env python3
-"""Displacement + novelty MPC for maze exploration using the LeWM world model.
+"""Pure world-model maze inference — no heuristics, no oracle.
 
-The world model predicts future latent states from candidate action sequences.
-Planning uses displacement for immediate movement drive and novelty for
-long-term exploration, both in projected latent space.
+Implements the planning approach from Section 3.2 of the LeWM paper exactly:
+  1. Encode current observation: z_1 = enc(o_1)
+  2. Encode goal observation:   z_g = enc(o_g)
+  3. CEM optimises action sequence to minimise terminal cost:
+       C(z_H) = ||z_H - z_g||²
+  4. MPC: execute first K actions, then replan from fresh observation.
 
-    cost = -displacement(z_H, z_0)
-         - novelty_weight * novelty(z_rollout, visited)
-         + goal_lambda * ||z_H - z_g||^2
-
-  - displacement: ||z_H - z_0||^2 in projected space.  Provides immediate
-    gradient for movement.  Wall collisions keep the robot in place
-    physically, so the model predicts small displacement for collision
-    trajectories — implicit wall avoidance.
-  - novelty: min L2 distance from predicted rollout to the full set of
-    previously visited projected latents.  The visited set never forgets,
-    driving systematic exploration of new corridors.
-  - goal: terminal L2^2 to the beacon breadcrumb latent.
-
-All comparisons are in projected space (enc_projector / pred_projector),
-the space the world model was trained to predict in.
-
-No safety heads, no forward bonus, no gates, no oracle ray-marching,
-no stuck detector, no forced recovery.
-
-Usage:
-    python scripts/6_infer_pure_wm.py \\
-        --ppo_ckpt models/ppo/ckpt_20000.pt \\
-        --wm_ckpt lewm_checkpoints/epoch_20.pt \\
-        --seed 42 --steps 4000
+No safety heads, no forward reward, no exploration bonus, no diversity,
+no yaw penalty, no oracle ray-marching, no collision backstop.
+The world model's latent space already encodes wall proximity and dynamics
+(verified by probing results in Table 1 of the paper).
 """
 from __future__ import annotations
 
@@ -67,7 +50,6 @@ from lewm.genesis_utils import init_genesis_once, to_numpy
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import generate_enclosed_maze
 from lewm.models import ActorCritic, LeWorldModel
-from lewm.models.energy_head import LatentEnergyHead
 from lewm.obstacle_utils import add_obstacles_to_scene, detect_collisions
 
 torch.backends.cudnn.benchmark = True
@@ -106,28 +88,18 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Displacement + novelty CEM planner ---------------------------------- #
+# ---- Pure CEM planner (paper Section 3.2) -------------------------------- #
 
-class DisplacementCEMPlanner:
-    """CEM planner: displacement + latent novelty + goal.
+class PureCEMPlanner:
+    """CEM planner with terminal goal-matching cost only.
 
-    Cost for each candidate trajectory:
+    Implements Equations (4)-(5) from the LeWM paper:
+        C(z_H) = ||z_H - z_g||²
+        a*_{1:H} = argmin_{a_{1:H}} C(z_H)
 
-        cost = -||z_H - z_0||^2
-             - novelty_weight * mean(min_dist(z_rollout, visited))
-             + goal_lambda * ||z_H - z_g||^2
-
-    displacement: immediate movement drive in projected space.  The only
-    signal with reliable variance across candidates.  Implicit wall
-    avoidance: the world model predicts small displacement for trajectories
-    that hit walls (the robot stays in place physically).
-
-    novelty: persistent visited-latent memory (never forgets).  Drives
-    long-term corridor exploration once enough landmarks accumulate.
-
-    goal: terminal pull toward beacon breadcrumb.
-
-    All comparisons in projected space (enc_projector / pred_projector).
+    No safety heads, no exploration bonuses, no hand-tuned gates.
+    The world model's dynamics predictions naturally avoid walls
+    because wall-approach trajectories lead to poor goal matching.
     """
 
     def __init__(
@@ -137,9 +109,6 @@ class DisplacementCEMPlanner:
         n_candidates: int,
         cem_iters: int,
         elite_frac: float,
-        goal_lambda: float,
-        novelty_weight: float,
-        visited_subsample: int,
         cmd_low: torch.Tensor,
         cmd_high: torch.Tensor,
         init_std: torch.Tensor,
@@ -151,9 +120,6 @@ class DisplacementCEMPlanner:
         self.n_candidates = int(n_candidates)
         self.cem_iters = int(cem_iters)
         self.n_elite = max(1, int(round(self.n_candidates * elite_frac)))
-        self.goal_lambda = float(goal_lambda)
-        self.novelty_weight = float(novelty_weight)
-        self.visited_subsample = int(visited_subsample)
         self.cmd_low = cmd_low.to(device=device, dtype=torch.float32)
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
@@ -168,42 +134,26 @@ class DisplacementCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_proj: torch.Tensor | None,
-        visited_proj: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Plan an action sequence via displacement + novelty + goal.
+        z_goal_proj: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
+        """Plan an action sequence to reach the goal.
 
         Args:
-            z_start_raw:  (1, D) raw encoder embedding (predictor input).
-            z_goal_proj:  (D,) or (1, D) projected goal embedding, or None.
-            visited_proj: (K, D) projected latents of all visited states.
+            z_start_raw: (1, D) raw encoder embedding of current observation.
+            z_goal_proj: (D,) or (1, D) projected embedding of goal observation.
 
         Returns:
-            best_seq: (H, 3) best action sequence.
-            info: dict with cost breakdown for logging.
+            best_seq: (H, 3) best action sequence found.
+            best_cost: scalar cost of best sequence.
         """
+        if z_goal_proj.ndim == 1:
+            z_goal_proj = z_goal_proj.unsqueeze(0)
+
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
-        z0_batch = z0.expand(self.n_candidates, -1)  # (N, D)
-        # Project z0 into the same space as plan_rollout output
-        z0_proj = self.world_model.enc_projector(z0_batch)  # (N, D)
-
-        z_goal_batch = None
-        if z_goal_proj is not None:
-            if z_goal_proj.ndim == 1:
-                z_goal_proj = z_goal_proj.unsqueeze(0)
-            z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
-                self.n_candidates, -1,
-            )
-
-        visited_dev = None
-        if visited_proj is not None and visited_proj.shape[0] > 0:
-            v = visited_proj.to(self.device, dtype=torch.float32)
-            if v.shape[0] > self.visited_subsample:
-                idx = torch.linspace(
-                    0, v.shape[0] - 1, self.visited_subsample,
-                ).long()
-                v = v[idx]
-            visited_dev = v
+        z0_batch = z0.expand(self.n_candidates, -1)
+        z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
+            self.n_candidates, -1,
+        )
 
         # Initialise CEM distribution
         if self._warm_start is not None:
@@ -215,72 +165,44 @@ class DisplacementCEMPlanner:
 
         best_seq = mean.clone()
         best_cost = float("inf")
-        best_info: dict[str, float] = {}
 
         for _ in range(self.cem_iters):
-            # Sample
+            # Sample candidate action sequences
             noise = torch.randn(
                 self.n_candidates, self.horizon, 3, device=self.device,
             )
             samples = mean.unsqueeze(0) + std.unsqueeze(0) * noise
             samples = samples.clamp(
-                self.cmd_low.view(1, 1, 3), self.cmd_high.view(1, 1, 3),
+                self.cmd_low.view(1, 1, 3),
+                self.cmd_high.view(1, 1, 3),
             )
-            samples[0] = mean
+            samples[0] = mean  # always evaluate current mean
 
-            # Rollout world model (returns projected latents)
+            # Rollout world model: z_{t+1} = pred(z_t, a_t)
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
-            # z_rollouts: (N, H, D) in projected space
-            N, H, D = z_rollouts.shape
 
-            # --- Displacement term (projected space) ---
-            z_terminal = z_rollouts[:, -1, :]  # (N, D)
-            displacement = (z_terminal - z0_proj).square().sum(dim=-1)  # (N,)
+            # Terminal cost: C(z_H) = ||z_H - z_g||²  (Eq. 4)
+            z_terminal = z_rollouts[:, -1, :]  # (B, D)
+            costs = (z_terminal - z_goal_batch).square().sum(dim=-1)  # (B,)
 
-            # --- Novelty term (projected space) ---
-            novelty_score = torch.zeros(N, device=self.device)
-            if visited_dev is not None:
-                z_flat = z_rollouts.reshape(N * H, D)
-                dists = torch.cdist(z_flat, visited_dev)  # (N*H, K)
-                min_dists = dists.min(dim=-1).values       # (N*H,)
-                novelty_score = min_dists.reshape(N, H).mean(dim=-1)  # (N,)
-
-            # --- Goal term ---
-            goal_cost = torch.zeros(N, device=self.device)
-            if z_goal_batch is not None:
-                goal_cost = (z_terminal - z_goal_batch).square().sum(dim=-1)
-
-            # Combined cost: lower is better
-            costs = (
-                -displacement
-                - self.novelty_weight * novelty_score
-                + self.goal_lambda * goal_cost
-            )
-
-            # Track best
+            # Track global best
             min_cost, min_idx = costs.min(dim=0)
             if min_cost.item() < best_cost:
                 best_cost = min_cost.item()
                 best_seq = samples[min_idx.item()].detach().clone()
-                best_info = {
-                    "cost": min_cost.item(),
-                    "displacement": displacement[min_idx].item(),
-                    "novelty": novelty_score[min_idx].item(),
-                    "goal_cost": goal_cost[min_idx].item(),
-                }
 
-            # Update CEM distribution from elites
+            # Select elites, update distribution
             elite_idx = torch.topk(costs, k=self.n_elite, largest=False).indices
             elite = samples[elite_idx]
             mean = elite.mean(dim=0)
             std = elite.std(dim=0, unbiased=False).clamp_min(self.min_std)
 
-        # Warm-start: shift forward
+        # Warm-start next planning step: shift forward by one
         self._warm_start = torch.cat(
             [best_seq[1:], best_seq[-1:].clone()], dim=0,
         ).detach()
 
-        return best_seq, best_info
+        return best_seq, best_cost
 
 
 # ---- Argument parsing ---------------------------------------------------- #
@@ -292,8 +214,6 @@ def parse_args() -> argparse.Namespace:
     # Checkpoints
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
-    p.add_argument("--scorer_ckpt", type=str, required=True,
-                    help="Energy head checkpoint (contains safety_head state dict).")
     # Maze generation
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grid_rows", type=int, default=4)
@@ -324,18 +244,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    p.add_argument("--goal_lambda", type=float, default=0.01,
-                    help="Weight on terminal goal cost. "
-                         "Low = explore more, high = beeline to beacon.")
-    p.add_argument("--novelty_weight", type=float, default=0.5,
-                    help="Weight on novelty (distance from visited states).")
-    p.add_argument("--visited_subsample", type=int, default=200,
-                    help="Max visited landmarks for novelty computation. "
-                         "Uniformly subsampled if exceeded, for speed.")
-    p.add_argument("--landmark_threshold", type=float, default=1.0,
-                    help="Min L2 distance in projected space to add a new "
-                         "landmark. Prevents memory bloat from near-identical "
-                         "snapshots.")
     # Success / termination
     p.add_argument("--success_range", type=float, default=0.4)
     # Output
@@ -395,23 +303,6 @@ def load_world_model(ckpt_path: str, device: torch.device):
         "latent_dim": latent_dim, "image_size": image_size,
         "patch_size": patch_size, "use_proprio": use_proprio,
     }
-
-
-def load_safety_head(ckpt_path: str, device: torch.device) -> LatentEnergyHead:
-    ckpt = torch.load(ckpt_path, map_location=device)
-    latent_dim = int(ckpt.get("latent_dim", 192))
-    hidden_dim = int(ckpt.get("hidden_dim", 512))
-    dropout = float(ckpt.get("dropout", 0.0))
-    head = LatentEnergyHead(
-        latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout,
-    ).to(device)
-    # Per-epoch checkpoints use "head_state_dict"; combined scorer uses "safety_head"
-    if "head_state_dict" in ckpt:
-        clean_load_state(head, ckpt["head_state_dict"])
-    else:
-        clean_load_state(head, ckpt["safety_head"])
-    head.eval()
-    return head
 
 
 def load_frozen_policy(ckpt_path: str, gs) -> ActorCritic:
@@ -822,14 +713,12 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # ---- 1. Load world model + safety head ----
+    # ---- 1. Load world model ----
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
-    safety_head = load_safety_head(args.scorer_ckpt, planning_device)
     camera_cfg = ego_camera_config_from_args(args)
 
     print(f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
           f"image_size={wm_meta['image_size']}")
-    print(f"Loaded safety head from {args.scorer_ckpt}")
 
     # ---- 2. Generate enclosed maze ----
     obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
@@ -892,8 +781,7 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
-          f"iters={args.cem_iters}, K={args.mpc_execute}, "
-          f"goal_lambda={args.goal_lambda}, novelty_weight={args.novelty_weight}")
+          f"iters={args.cem_iters}, K={args.mpc_execute}")
 
     # ---- 3. Build Genesis scenes ----
     t0 = time.time()
@@ -939,16 +827,12 @@ def main():
         # ---- 5. Spawn robot + create planner ----
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
-        planner = NoveltyCEMPlanner(
+        planner = PureCEMPlanner(
             world_model=world_model,
-            safety_head=safety_head,
             horizon=args.plan_horizon,
             n_candidates=args.n_candidates,
             cem_iters=args.cem_iters,
             elite_frac=args.elite_frac,
-            goal_lambda=args.goal_lambda,
-            novelty_weight=args.novelty_weight,
-            visited_subsample=args.visited_subsample,
             cmd_low=torch.tensor(args.cmd_low, dtype=torch.float32),
             cmd_high=torch.tensor(args.cmd_high, dtype=torch.float32),
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
@@ -960,13 +844,6 @@ def main():
         last_clean_frame: np.ndarray | None = None
         plan_seq: torch.Tensor | None = None
         plan_step_idx = 0  # which action in current plan to execute next
-        plan_info: dict[str, float] = {}
-
-        # Persistent visited-latent memory (projected space).
-        # Landmark-gated: only store a new z_proj if it is sufficiently far
-        # from all existing landmarks to represent a genuinely new location.
-        visited_latents: list[torch.Tensor] = []
-        landmark_thresh = args.landmark_threshold
 
         # ---- 6. Initial observation ----
         obs = observe(
@@ -978,7 +855,6 @@ def main():
         )
         last_clean_frame = obs["frame_hwc"].copy()
         ego_frames_hwc.append(obs["frame_hwc"])
-        visited_latents.append(obs["z_proj"].squeeze(0).detach())
         tp_frame = render_third_person_frame(
             physics_robot, physics_act_dofs,
             tp_robot, tp_act_dofs, tp_cam,
@@ -996,17 +872,18 @@ def main():
                 or plan_step_idx >= args.mpc_execute
             )
 
-            if need_replan:
-                # Build visited tensor for novelty computation
-                visited_t = None
-                if visited_latents:
-                    visited_t = torch.stack(visited_latents)
-
-                plan_seq, plan_info = planner.plan(
-                    obs["z_raw"], z_breadcrumb, visited_t,
+            if need_replan and z_breadcrumb is not None:
+                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb)
+                plan_step_idx = 0
+                costs_log.append(cost)
+            elif z_breadcrumb is None:
+                # No goal — just walk forward
+                plan_seq = torch.tensor(
+                    [[0.4, 0.0, 0.0]] * args.plan_horizon,
+                    dtype=torch.float32, device=planning_device,
                 )
                 plan_step_idx = 0
-                costs_log.append(plan_info.get("cost", 0.0))
+                costs_log.append(0.0)
 
             # Extract current action from plan
             nominal_cmd = plan_seq[plan_step_idx]
@@ -1032,18 +909,6 @@ def main():
             )
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                # Landmark-gated: only add if far enough from existing
-                # landmarks in projected space to represent a new location
-                z_new = obs["z_proj"].squeeze(0).detach()
-                if len(visited_latents) == 0:
-                    visited_latents.append(z_new)
-                else:
-                    existing = torch.stack(visited_latents)
-                    min_dist = torch.cdist(
-                        z_new.unsqueeze(0), existing,
-                    ).min().item()
-                    if min_dist >= landmark_thresh:
-                        visited_latents.append(z_new)
 
             # Render third-person
             tp_frame = render_third_person_frame(
@@ -1098,13 +963,11 @@ def main():
                     reached = True
 
                 if step % 20 == 0 or reached:
-                    safe_str = f"safe={plan_info.get('safety', 0):.2f}(σ{plan_info.get('safety_std', 0):.3f})" if plan_info else ""
-                    nov_str = f"nov={plan_info.get('novelty', 0):.2f}(σ{plan_info.get('novelty_std', 0):.3f})" if plan_info else ""
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                        f"d_goal={dist_claim:.2f}m {safe_str} {nov_str} "
-                        f"landmarks={len(visited_latents)} coll={collision_count}"
+                        f"cost={costs_log[-1]:.1f} d_goal={dist_claim:.2f}m "
+                        f"coll={collision_count}"
                     )
 
             if reached:
@@ -1127,7 +990,8 @@ def main():
 
     # ---- 8. Export ----
     summary = {
-        "approach": "safety_novelty_mpc",
+        "approach": "pure_world_model_terminal_cost",
+        "paper_section": "3.2",
         "seed": args.seed,
         "grid": f"{args.grid_rows}x{args.grid_cols}",
         "target": target_beacon.identity if target_beacon else None,
@@ -1141,10 +1005,6 @@ def main():
             "cem_iters": args.cem_iters,
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
-            "goal_lambda": args.goal_lambda,
-            "novelty_weight": args.novelty_weight,
-            "visited_subsample": args.visited_subsample,
-            "landmark_threshold": args.landmark_threshold,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
