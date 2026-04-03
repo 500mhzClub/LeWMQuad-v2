@@ -1,16 +1,9 @@
-"""Pure world-model maze inference — sequence-based novelty exploration.
+#!/usr/bin/env python3
+"""Pure world-model maze inference — sequence novelty with Cosine Distance.
 
 Implements the planning approach from Section 3.2 of the LeWM paper, enhanced
-with Sequence-Based Trajectory Novelty to overcome perceptual aliasing in 
-featureless (grey-wall) environments.
-
-Pipeline:
-  1. Encode current observation: z_1 = enc(o_1)
-  2. Encode goal observation (if known): z_g = enc(o_g)
-  3. CEM optimises action sequence to minimise terminal cost + maximize novelty:
-       C(z_{1:H}) = ||z_H - z_g||² - w * min_j ||z_{1:H} - w_j||²
-       where w_j are historical latent sequences of length H.
-  4. MPC: execute first K actions, then replan from fresh observation.
+with Sequence-Based Trajectory Novelty using normalized Cosine Similarity to 
+prevent dimensional scaling issues, and a soft forward prior to break symmetry.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -37,6 +30,7 @@ if REPO_ROOT not in sys.path:
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from lewm.beacon_utils import BEACON_FAMILIES, BeaconLayout
@@ -92,14 +86,10 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Pure CEM planner (paper Section 3.2 + Sequence Novelty) ------------ #
+# ---- Pure CEM planner (Cosine Distance + Symmetry Breaking) -------------- #
 
 class PureCEMPlanner:
-    """CEM planner with terminal goal-matching cost and sequence novelty.
-
-    Implements Equations (4)-(5) from the LeWM paper, plus a memory-based
-    trajectory novelty term to overcome perceptual aliasing.
-    """
+    """CEM planner with Cosine Distance goal matching and novelty tracking."""
 
     def __init__(
         self,
@@ -113,7 +103,8 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
-        novelty_weight: float = 2.0,
+        novelty_weight: float = 1.0,
+        forward_bias: float = 0.1,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -126,6 +117,7 @@ class PureCEMPlanner:
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
         self.novelty_weight = novelty_weight
+        self.forward_bias = forward_bias
         self._warm_start: torch.Tensor | None = None
 
     def reset(self) -> None:
@@ -138,17 +130,6 @@ class PureCEMPlanner:
         z_goal_proj: torch.Tensor | None = None,
         history_windows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
-        """Plan an action sequence to reach the goal / explore safely.
-
-        Args:
-            z_start_raw: (1, D) raw encoder embedding of current observation.
-            z_goal_proj: (D,) or (1, D) projected embedding of goal observation.
-            history_windows: (M, H, D) recent latent sequence memory bank.
-
-        Returns:
-            best_seq: (H, 3) best action sequence found.
-            best_cost: scalar cost of best sequence.
-        """
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
         
@@ -160,7 +141,6 @@ class PureCEMPlanner:
                 self.n_candidates, -1,
             )
 
-        # Initialise CEM distribution
         if self._warm_start is not None:
             mean = self._warm_start.clone()
         else:
@@ -172,7 +152,6 @@ class PureCEMPlanner:
         best_cost = float("inf")
 
         for _ in range(self.cem_iters):
-            # Sample candidate action sequences
             noise = torch.randn(
                 self.n_candidates, self.horizon, 3, device=self.device,
             )
@@ -181,19 +160,18 @@ class PureCEMPlanner:
                 self.cmd_low.view(1, 1, 3),
                 self.cmd_high.view(1, 1, 3),
             )
-            samples[0] = mean  # always evaluate current mean
+            samples[0] = mean
 
-            # Rollout world model: z_{t+1} = pred(z_t, a_t)
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
-
             costs = torch.zeros(self.n_candidates, device=self.device)
 
-            # 1. Terminal cost: C(z_H) = ||z_H - z_g||²
+            # 1. Terminal Cost (Cosine Distance: 0 to 2)
             if z_goal_batch is not None:
-                z_terminal = z_rollouts[:, -1, :]  # (B, D)
-                costs += (z_terminal - z_goal_batch).square().sum(dim=-1)  # (B,)
+                z_terminal = z_rollouts[:, -1, :]  
+                cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
+                costs += (1.0 - cos_sim)
 
-            # 2. Sequence Novelty Bonus (to escape perceptual aliasing)
+            # 2. Sequence Novelty (Cosine Distance: 0 to 2)
             if history_windows is not None and self.novelty_weight > 0.0:
                 B, H, D = z_rollouts.shape
                 M = history_windows.shape[0]
@@ -201,26 +179,30 @@ class PureCEMPlanner:
                     z_flat = z_rollouts.reshape(B, H * D)
                     h_flat = history_windows.reshape(M, H * D)
                     
-                    # Compute L2 distance between candidate sequences and all history sequences
-                    dists = torch.cdist(z_flat, h_flat) # (B, M)
-                    seq_novelty = dists.min(dim=-1).values # (B,)
+                    z_norm = F.normalize(z_flat, p=2, dim=-1)
+                    h_norm = F.normalize(h_flat, p=2, dim=-1)
                     
-                    # Reward novelty (subtract from cost)
-                    costs -= self.novelty_weight * seq_novelty
+                    sim_matrix = torch.mm(z_norm, h_norm.transpose(0, 1))
+                    max_sim = sim_matrix.max(dim=-1).values
+                    
+                    seq_novelty_dist = 1.0 - max_sim 
+                    costs -= self.novelty_weight * seq_novelty_dist
 
-            # Track global best
+            # 3. Soft Forward Prior (Break symmetry in featureless corridors)
+            if self.forward_bias > 0.0:
+                vx_cmds = samples[:, :, 0] # (B, H)
+                costs -= vx_cmds.sum(dim=-1) * self.forward_bias
+
             min_cost, min_idx = costs.min(dim=0)
             if min_cost.item() < best_cost:
                 best_cost = min_cost.item()
                 best_seq = samples[min_idx.item()].detach().clone()
 
-            # Select elites, update distribution
             elite_idx = torch.topk(costs, k=self.n_elite, largest=False).indices
             elite = samples[elite_idx]
             mean = elite.mean(dim=0)
             std = elite.std(dim=0, unbiased=False).clamp_min(self.min_std)
 
-        # Warm-start next planning step: shift forward by one
         self._warm_start = torch.cat(
             [best_seq[1:], best_seq[-1:].clone()], dim=0,
         ).detach()
@@ -234,10 +216,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Pure world-model maze inference (paper Section 3.2).",
     )
-    # Checkpoints
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
-    # Maze generation
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grid_rows", type=int, default=4)
     p.add_argument("--grid_cols", type=int, default=4)
@@ -245,51 +225,40 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wall_thickness", type=float, default=0.20)
     p.add_argument("--n_beacons", type=int, default=2)
     p.add_argument("--n_distractors", type=int, default=0)
-    p.add_argument("--target_beacon", type=str, default=None,
-                    help="Beacon colour to seek (default: furthest from start)")
-    # Simulation
+    p.add_argument("--target_beacon", type=str, default=None)
+    
     p.add_argument("--steps", type=int, default=480)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--sim_backend", type=str, default="auto")
     p.add_argument("--show_viewer", action="store_true")
-    # CEM planner (paper defaults: 300 candidates, 30 iters, top 30 elites)
-    p.add_argument("--plan_horizon", type=int, default=5,
-                    help="Planning horizon H (paper default: 5)")
-    p.add_argument("--n_candidates", type=int, default=300,
-                    help="CEM candidate count (paper: 300)")
-    p.add_argument("--cem_iters", type=int, default=30,
-                    help="CEM optimisation iterations (paper: 30)")
-    p.add_argument("--elite_frac", type=float, default=0.10,
-                    help="Fraction of candidates as elites (paper: 30/300=0.10)")
-    p.add_argument("--mpc_execute", type=int, default=1,
-                    help="Actions to execute before replanning (paper: K)")
+    
+    p.add_argument("--plan_horizon", type=int, default=5)
+    p.add_argument("--n_candidates", type=int, default=300)
+    p.add_argument("--cem_iters", type=int, default=30)
+    p.add_argument("--elite_frac", type=float, default=0.10)
+    p.add_argument("--mpc_execute", type=int, default=1)
     p.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    # Sequence novelty exploration
-    p.add_argument("--novelty_weight", type=float, default=1.0,
-                    help="Weight for sequence trajectory novelty.")
-    p.add_argument("--history_len", type=int, default=100,
-                    help="Number of past steps to remember for novelty distance.")
-    # Success / termination
+    
+    p.add_argument("--novelty_weight", type=float, default=1.0)
+    p.add_argument("--forward_bias", type=float, default=0.1)
+    p.add_argument("--history_len", type=int, default=100)
     p.add_argument("--success_range", type=float, default=0.4)
-    # Output
+    
     p.add_argument("--out_dir", type=str, default=None)
-    p.add_argument("--video_format", type=str, default="auto",
-                    choices=["auto", "mp4", "gif", "both"])
+    p.add_argument("--video_format", type=str, default="auto", choices=["auto", "mp4", "gif", "both"])
     p.add_argument("--video_fps", type=int, default=20)
     p.add_argument("--gif_stride", type=int, default=2)
-    # Camera
+    
     add_egocentric_camera_args(p)
-    # Third-person camera
     p.add_argument("--third_person_res", type=int, default=480)
     p.add_argument("--third_person_fov", type=float, default=60.0)
     p.add_argument("--chase_dist", type=float, default=0.6)
     p.add_argument("--chase_height", type=float, default=0.45)
     p.add_argument("--side_offset", type=float, default=0.15)
     p.add_argument("--lookahead", type=float, default=0.3)
-    # Breadcrumb view
     p.add_argument("--breadcrumb_view_dist", type=float, default=0.5)
 
     return p.parse_args()
@@ -302,11 +271,9 @@ def clean_load_state(module: torch.nn.Module, sd: dict, *, strict: bool = True):
     if missing or unexpected:
         raise RuntimeError(f"State-dict mismatch: {missing=}, {unexpected=}")
 
-
 def load_world_model(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
     state = clean_state_dict(ckpt["model_state_dict"])
-    # Infer architecture from checkpoint
     pos_embed = state["encoder.vis_enc.pos_embed"]
     patch_w = state["encoder.vis_enc.patch_embed.weight"]
     pred_pos = state["predictor.pos_embed"]
@@ -331,7 +298,6 @@ def load_world_model(ckpt_path: str, device: torch.device):
         "latent_dim": latent_dim, "image_size": image_size,
         "patch_size": patch_size, "use_proprio": use_proprio,
     }
-
 
 def load_frozen_policy(ckpt_path: str, gs) -> ActorCritic:
     model = ActorCritic(obs_dim=50, act_dim=12).to(gs.device)
@@ -370,7 +336,6 @@ def build_physics_scene(gs, torch_mod, args, obstacle_layout, beacon_layout):
 
     return scene, robot, act_dofs, q0, cfg
 
-
 def build_render_scene(gs, torch_mod, urdf_path, obstacle_layout, beacon_layout,
                        img_res, fov, near):
     scene = gs.Scene(show_viewer=False)
@@ -408,7 +373,6 @@ def reset_robot(robot, act_dofs, q0, spawn_xy, yaw_rad, gs, torch_mod):
     robot.set_dofs_position(q0.unsqueeze(0), act_dofs)
     robot.set_dofs_velocity(torch_mod.zeros((1, 12), device=gs.device), act_dofs)
 
-
 def collect_proprio(robot, act_dofs, q0, prev_action):
     pos = robot.get_pos()
     quat = robot.get_quat()
@@ -419,7 +383,6 @@ def collect_proprio(robot, act_dofs, q0, prev_action):
     q_rel = q - q0.unsqueeze(0)
     proprio = torch.cat([pos[:, 2:3], quat, vel_b, ang_b, q_rel, dq, prev_action], dim=1)
     return proprio, to_numpy(pos[0]), to_numpy(quat[0])
-
 
 def sync_render_robot(src_robot, src_act_dofs, dst_robot, dst_act_dofs):
     pos = src_robot.get_pos()
@@ -439,7 +402,6 @@ def render_egocentric_frame(
     obstacle_layout, camera_cfg: EgoCameraConfig,
     fallback_frame_hwc: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Render an egocentric frame with camera safety retraction."""
     pos_np, quat_np = sync_render_robot(
         physics_robot, physics_act_dofs, ego_robot, ego_act_dofs,
     )
@@ -467,7 +429,6 @@ def render_egocentric_frame(
     if hasattr(rgb, "cpu"):
         rgb = rgb.cpu().numpy()
     return np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)), pos_np, quat_np, False
-
 
 def render_third_person_frame(
     physics_robot, physics_act_dofs,
@@ -543,7 +504,6 @@ def encode_breadcrumb(
     world_model, render_scene, render_robot, render_act_dofs, cam,
     beacon, view_dist, planning_device, q0, gs, torch_mod,
 ) -> torch.Tensor:
-    """Render one front-face view of target beacon, encode as goal latent."""
     render_robot.set_pos(
         torch_mod.tensor([[999.0, 999.0, -10.0]], device=gs.device, dtype=torch_mod.float32),
         zero_velocity=True,
@@ -620,7 +580,6 @@ def build_side_by_side_frame(fp_hwc, tp_hwc):
     divider = np.full((target_h, 8, 3), 12, dtype=np.uint8)
     return np.concatenate([fp_hwc, divider, tp_hwc], axis=1)
 
-
 def encode_mp4(out_path, frames_hwc, fps):
     if not frames_hwc:
         return
@@ -636,7 +595,6 @@ def encode_mp4(out_path, frames_hwc, fps):
     proc.stdin.close()
     proc.wait()
 
-
 def export_video(stem, frames, stride, fps):
     if not frames:
         return
@@ -651,7 +609,6 @@ def export_video(stem, frames, stride, fps):
             f"{stem}.gif", save_all=True,
             append_images=pil_frames[1:], duration=duration, loop=0,
         )
-
 
 def draw_topdown_trajectory(out_path, obstacle_layout, beacon_layout, path_xy, breadcrumb_xy):
     size = 900
@@ -702,14 +659,10 @@ def draw_topdown_trajectory(out_path, obstacle_layout, beacon_layout, path_xy, b
 
     img.save(out_path)
 
-
-# ---- Helpers ------------------------------------------------------------- #
-
 def beacon_claim_xy(beacon, wall_thickness, stand_off=0.03):
     normal = np.array(beacon.normal[:2], dtype=np.float32)
     wall_center_xy = np.array(beacon.pos[:2], dtype=np.float32) - 0.035 * normal
     return wall_center_xy + normal * (0.5 * float(wall_thickness) + stand_off)
-
 
 def has_line_of_sight(a_xy, b_xy, obstacle_layout, step_size=0.03, margin=0.05):
     diff = b_xy - a_xy
@@ -741,14 +694,12 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # ---- 1. Load world model ----
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
     camera_cfg = ego_camera_config_from_args(args)
 
     print(f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
           f"image_size={wm_meta['image_size']}")
 
-    # ---- 2. Generate enclosed maze ----
     obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
         seed=args.seed,
         grid_rows=args.grid_rows,
@@ -766,7 +717,6 @@ def main():
         grid_oy + start_cell[0] * maze_step,
     ], dtype=np.float32)
 
-    # Select target beacon (furthest from spawn)
     target_beacon = None
     if args.target_beacon is not None:
         for b in beacon_layout.beacons:
@@ -781,7 +731,6 @@ def main():
                 best_dist = d
                 target_beacon = b
 
-    # Spawn facing into first open corridor
     spawn_yaw = 0.0
     best_score = -float("inf")
     for probe_yaw in [0.0, math.pi / 2, math.pi, -math.pi / 2]:
@@ -809,9 +758,9 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
-          f"iters={args.cem_iters}, K={args.mpc_execute}, Novelty={args.novelty_weight}")
+          f"iters={args.cem_iters}, K={args.mpc_execute}, "
+          f"Novelty={args.novelty_weight}, FwdBias={args.forward_bias}")
 
-    # ---- 3. Build Genesis scenes ----
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
 
@@ -843,7 +792,6 @@ def main():
             args.third_person_res, args.third_person_fov, 0.01,
         )
 
-        # ---- 4. Encode breadcrumb (goal observation) ----
         z_breadcrumb = None
         if target_beacon is not None:
             z_breadcrumb = encode_breadcrumb(
@@ -853,7 +801,6 @@ def main():
             )
             print(f"Goal latent encoded: ||z_g||={float(z_breadcrumb.norm()):.3f}")
 
-        # ---- 5. Spawn robot + create planner ----
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
         planner = PureCEMPlanner(
@@ -868,14 +815,14 @@ def main():
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
             novelty_weight=args.novelty_weight,
+            forward_bias=args.forward_bias,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
         last_clean_frame: np.ndarray | None = None
         plan_seq: torch.Tensor | None = None
-        plan_step_idx = 0  # which action in current plan to execute next
+        plan_step_idx = 0 
 
-        # ---- 6. Initial observation ----
         obs = observe(
             physics_robot, physics_act_dofs,
             ego_robot, ego_act_dofs, ego_cam,
@@ -895,16 +842,10 @@ def main():
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         latent_history.append(obs["z_proj"].squeeze(0).detach())
 
-        # ---- 7. Main loop ----
         for step in range(args.steps):
-            # MPC: replan when we've exhausted the current plan's K actions
-            need_replan = (
-                plan_seq is None
-                or plan_step_idx >= args.mpc_execute
-            )
+            need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
 
             if need_replan:
-                # Build historical sequence windows for sequence novelty
                 history_windows = None
                 if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
                     H = args.plan_horizon
@@ -917,13 +858,11 @@ def main():
                 plan_step_idx = 0
                 costs_log.append(cost)
 
-            # Extract current action from plan
             nominal_cmd = plan_seq[plan_step_idx]
             plan_step_idx += 1
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
             cmds_log.append(cmd_vals)
 
-            # Execute through PPO low-level controller
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
                 physics_act_dofs, q0, prev_action,
@@ -931,7 +870,6 @@ def main():
             )
             prev_action = actions.detach().clone()
 
-            # Observe new state
             obs = observe(
                 physics_robot, physics_act_dofs,
                 ego_robot, ego_act_dofs, ego_cam,
@@ -943,46 +881,38 @@ def main():
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
                 latent_history.append(obs["z_proj"].squeeze(0).detach())
-                
-                # Keep history bounded
                 if len(latent_history) > args.history_len:
                     latent_history.pop(0)
 
-            # Render third-person
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
                 tp_robot, tp_act_dofs, tp_cam,
                 args.chase_dist, args.chase_height, args.side_offset, args.lookahead,
             )
 
-            # Record
             ego_frames_hwc.append(obs["frame_hwc"])
             tp_frames_hwc.append(tp_frame)
             combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
             cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
             path_xy.append(cur_xy)
 
-            # Collision check (metric only — no recovery action)
             pos_xy_t = torch.from_numpy(
                 np.asarray(obs["pos_np"][:2], dtype=np.float32),
             ).unsqueeze(0)
             collided = bool(detect_collisions(
                 pos_xy_t, obstacle_layout, margin=sim_cfg.collision_margin,
             )[0].item())
+            
             if collided:
                 collision_count += 1
-                # Reset planner warm-start on collision so it doesn't persist
-                # a trajectory that drove into a wall
                 planner.reset()
                 plan_seq = None
 
-            # Fall check
             if obs["pos_np"][2] < sim_cfg.min_z:
                 terminate_reason = "fallen"
                 print(f"Step {step:03d} | fallen")
                 break
 
-            # Success check (oracle for metrics only)
             reached = False
             if target_beacon is not None and target_claim_xy is not None:
                 dist_claim = float(np.linalg.norm(
@@ -1004,7 +934,7 @@ def main():
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                        f"cost={costs_log[-1]:.1f} d_goal={dist_claim:.2f}m "
+                        f"cost={costs_log[-1]:.3f} d_goal={dist_claim:.2f}m "
                         f"coll={collision_count}"
                     )
 
@@ -1026,7 +956,6 @@ def main():
 
     elapsed = time.time() - t0
 
-    # ---- 8. Export ----
     summary = {
         "approach": "pure_world_model_terminal_cost",
         "paper_section": "3.2",
@@ -1044,6 +973,7 @@ def main():
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
             "novelty_weight": args.novelty_weight,
+            "forward_bias": args.forward_bias,
             "history_len": args.history_len,
         },
         "path_xy": path_xy,
