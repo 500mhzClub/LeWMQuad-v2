@@ -401,7 +401,11 @@ def load_safety_head(ckpt_path: str, device: torch.device) -> LatentEnergyHead:
     head = LatentEnergyHead(
         latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout,
     ).to(device)
-    clean_load_state(head, ckpt["safety_head"])
+    # Per-epoch checkpoints use "head_state_dict"; combined scorer uses "safety_head"
+    if "head_state_dict" in ckpt:
+        clean_load_state(head, ckpt["head_state_dict"])
+    else:
+        clean_load_state(head, ckpt["safety_head"])
     head.eval()
     return head
 
