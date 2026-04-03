@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — Aligned Latents and Smoothness Prior.
+"""Pure world-model maze inference — Adaptive Curiosity & Episodic Memory.
 
-Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
-strictly aligned z_raw latents for planning, memory, and goal tracking. 
-Exploration is driven by Sequence Novelty, balanced by an L2 Action Penalty 
-to encourage smooth, deliberate quadrupedal movement without safety heuristics.
+Implements the planning approach from Section 3.2 of the LeWM paper.
+Exploration is driven by Sequence Novelty, but features:
+  1. Episodic Memory: A long, strided history buffer to prevent local pacing.
+  2. Adaptive Curiosity: The novelty weight decays as the goal latent is 
+     approached, preventing the agent from being distracted by novel 
+     backgrounds when the target is in sight.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -87,11 +89,9 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
+# ---- Pure CEM planner (Adaptive Curiosity + L2 Action Prior) ------------- #
 
 class PureCEMPlanner:
-    """CEM planner operating strictly in z_raw space with an L2 action prior."""
-
     def __init__(
         self,
         world_model: LeWorldModel,
@@ -104,8 +104,8 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
-        novelty_weight: float = 10.0,
-        action_penalty_weight: float = 0.001,
+        novelty_weight: float = 3.0,
+        action_penalty_weight: float = 0.005,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -163,17 +163,18 @@ class PureCEMPlanner:
             )
             samples[0] = mean
 
-            # z_rollouts are raw latents predicted by the world model
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
 
             # 1. Terminal Goal Cost (Aligned z_raw space)
+            goal_distances = torch.zeros(self.n_candidates, device=self.device)
             if z_goal_batch is not None:
                 z_terminal = z_rollouts[:, -1, :]  
                 cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
-                costs += (1.0 - cos_sim)
+                goal_distances = (1.0 - cos_sim) # [0.0 to 2.0]
+                costs += goal_distances
 
-            # 2. Sequence Novelty (Aligned z_raw space)
+            # 2. Sequence Novelty (Adaptive Curiosity)
             if history_windows is not None and self.novelty_weight > 0.0:
                 B, H, D = z_rollouts.shape
                 M = history_windows.shape[0]
@@ -188,10 +189,14 @@ class PureCEMPlanner:
                     max_sim = sim_matrix.max(dim=-1).values
                     
                     seq_novelty_dist = 1.0 - max_sim 
-                    costs -= self.novelty_weight * seq_novelty_dist
+                    
+                    # ADAPTIVE CURIOSITY: Scale novelty by how far we are from the goal.
+                    # If goal_dist is small (close to goal), novelty decays so it doesn't distract.
+                    # Clamp to ensure scaling doesn't blow up or invert.
+                    adaptive_scale = torch.clamp(goal_distances, 0.0, 1.0)
+                    costs -= (self.novelty_weight * adaptive_scale) * seq_novelty_dist
 
             # 3. Action Smoothness Penalty (L2)
-            # Scaled down drastically to prevent it acting like a parking brake
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -245,10 +250,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
-    # Dramatically changed novelty to action-penalty ratio to force movement
-    p.add_argument("--novelty_weight", type=float, default=10.0)
-    p.add_argument("--action_penalty_weight", type=float, default=0.001)
-    p.add_argument("--history_len", type=int, default=100)
+    # Updated Hyperparameters for Episodic Memory and Adaptive Curiosity
+    p.add_argument("--novelty_weight", type=float, default=3.0)
+    p.add_argument("--action_penalty_weight", type=float, default=0.005)
+    p.add_argument("--history_len", type=int, default=1000)
+    p.add_argument("--history_stride", type=int, default=3, help="Subsample history to expand temporal memory")
     p.add_argument("--success_range", type=float, default=0.4)
     
     p.add_argument("--out_dir", type=str, default=None)
@@ -508,7 +514,6 @@ def encode_breadcrumb(
     world_model, render_scene, render_robot, render_act_dofs, cam,
     beacon, view_dist, planning_device, q0, gs, torch_mod,
 ) -> torch.Tensor:
-    """Return the RAW latent z_raw of the goal view for accurate planning."""
     render_robot.set_pos(
         torch_mod.tensor([[999.0, 999.0, -10.0]], device=gs.device, dtype=torch_mod.float32),
         zero_velocity=True,
@@ -765,7 +770,8 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, "
-          f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}")
+          f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
+          f"HistLen={args.history_len}, HistStride={args.history_stride}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -857,6 +863,7 @@ def main():
                 if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
                     H = args.plan_horizon
                     windows = []
+                    # Create sequence windows for novelty evaluation
                     for i in range(len(latent_history) - H + 1):
                         windows.append(torch.stack(latent_history[i : i + H]))
                     history_windows = torch.stack(windows).to(planning_device)
@@ -887,9 +894,11 @@ def main():
             
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                latent_history.append(obs["z_raw"].squeeze(0).detach())
-                if len(latent_history) > args.history_len:
-                    latent_history.pop(0)
+                # Subsample memory to prevent getting stuck in tight loops
+                if step % args.history_stride == 0:
+                    latent_history.append(obs["z_raw"].squeeze(0).detach())
+                    if len(latent_history) > args.history_len:
+                        latent_history.pop(0)
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
@@ -982,6 +991,7 @@ def main():
             "novelty_weight": args.novelty_weight,
             "action_penalty_weight": args.action_penalty_weight,
             "history_len": args.history_len,
+            "history_stride": args.history_stride,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
