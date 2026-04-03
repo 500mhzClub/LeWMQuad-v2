@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — Unbounded Exploration & Episodic Memory.
+"""Pure world-model maze inference — Episodic Memory & Latent Lock-on.
 
-Implements the planning approach from Section 3.2 of the LeWM paper.
-Exploration is driven by Sequence Novelty with a strided history buffer to 
-prevent local pacing. Novelty is constant to ensure the robot can explore 
-around physical corners where the goal is occluded.
+Implements the highly successful exploration mechanics (high novelty, low action 
+penalty, H=4) with an expanded, strided episodic memory to force global maze 
+traversal, and a visual latent override to lock onto the goal once sighted.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -87,7 +86,7 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Pure CEM planner ---------------------------------------------------- #
+# ---- Pure CEM planner (Exploration + Visual Lock) ------------------------ #
 
 class PureCEMPlanner:
     def __init__(
@@ -102,8 +101,8 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
-        novelty_weight: float = 2.0,
-        action_penalty_weight: float = 0.001,
+        novelty_weight: float = 10.0,
+        action_penalty_weight: float = 0.01,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -171,11 +170,19 @@ class PureCEMPlanner:
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
 
+            is_visual_match = torch.zeros(self.n_candidates, dtype=torch.bool, device=self.device)
+
+            # 1. Terminal Goal Cost & Visual Lock-on
             if z_goal_batch is not None:
                 z_terminal = z_rollouts[:, -1, :]  
-                cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
-                costs += (1.0 - cos_sim) 
+                cos_sim_goal = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
+                costs += (1.0 - cos_sim_goal) 
+                
+                # Latent Override: If we visually see the target, drop everything and lock on
+                is_visual_match = cos_sim_goal > 0.85
+                costs -= is_visual_match.float() * 1000.0
 
+            # 2. Sequence Novelty (Only if not locked onto goal)
             if history_windows is not None and self.novelty_weight > 0.0:
                 B, H, D = z_rollouts.shape
                 M = history_windows.shape[0]
@@ -190,9 +197,10 @@ class PureCEMPlanner:
                     max_sim = sim_matrix.max(dim=-1).values
                     
                     seq_novelty_dist = 1.0 - max_sim 
-                    # Raw, unscaled novelty to force exploration out of dead ends
-                    costs -= self.novelty_weight * seq_novelty_dist
+                    # Only reward novelty if we haven't found the beacon
+                    costs -= self.novelty_weight * seq_novelty_dist * (~is_visual_match).float()
 
+            # 3. Action Smoothness Penalty (L2)
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -218,7 +226,7 @@ class PureCEMPlanner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pure world-model maze inference (Unbounded Exploration).",
+        description="Pure world-model maze inference (Exploration + Lock-on).",
     )
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
@@ -236,6 +244,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim_backend", type=str, default="auto")
     p.add_argument("--show_viewer", action="store_true")
     
+    # Bounded to trained sequence length
     p.add_argument("--plan_horizon", type=int, default=4)
     p.add_argument("--n_candidates", type=int, default=300)
     p.add_argument("--cem_iters", type=int, default=30)
@@ -247,12 +256,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
-    p.add_argument("--novelty_weight", type=float, default=2.0)
-    p.add_argument("--action_penalty_weight", type=float, default=0.001)
+    # Restored the high-novelty, low-penalty math from the successful exploratory run
+    p.add_argument("--novelty_weight", type=float, default=10.0)
+    p.add_argument("--action_penalty_weight", type=float, default=0.01)
+    
+    # Expanded Episodic Memory
     p.add_argument("--history_len", type=int, default=1000)
     p.add_argument("--history_stride", type=int, default=4)
-    p.add_argument("--success_range", type=float, default=0.4)
     
+    p.add_argument("--success_range", type=float, default=0.4)
     p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--video_format", type=str, default="auto", choices=["auto", "mp4", "gif", "both"])
     p.add_argument("--video_fps", type=int, default=20)
@@ -265,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chase_height", type=float, default=0.45)
     p.add_argument("--side_offset", type=float, default=0.15)
     p.add_argument("--lookahead", type=float, default=0.3)
-    p.add_argument("--breadcrumb_view_dist", type=float, default=0.5)
+    p.add_argument("--breadcrumb_view_dist", type=float, default=0.3)
 
     return p.parse_args()
 
