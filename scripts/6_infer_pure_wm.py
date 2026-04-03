@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — Episodic Memory & Latent Lock-on.
+"""Pure world-model maze inference — Latent Displacement Exploration.
 
-Implements the highly successful exploration mechanics (high novelty, low action 
-penalty, H=4) with an expanded, strided episodic memory to force global maze 
-traversal, and a visual latent override to lock onto the goal once sighted.
+Implements the planning approach from Section 3.2 of the LeWM paper.
+Exploration is driven entirely by Latent Displacement: rewarding action 
+sequences that maximally alter the predicted visual latent compared to the 
+current starting latent. This provides a memory-free reflex to turn away 
+from static dead-ends and keep the visual field flowing.
+
+Bounded to H=4 to match the training constraints of the LeWorldModel.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -86,7 +90,7 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Pure CEM planner (Exploration + Visual Lock) ------------------------ #
+# ---- Pure CEM planner (Latent Displacement) ------------------------------ #
 
 class PureCEMPlanner:
     def __init__(
@@ -101,8 +105,9 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
-        novelty_weight: float = 10.0,
-        action_penalty_weight: float = 0.01,
+        explore_weight: float = 0.5,
+        penalty_v: float = 0.01,
+        penalty_w: float = 0.05,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -114,8 +119,9 @@ class PureCEMPlanner:
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
-        self.novelty_weight = novelty_weight
-        self.action_penalty_weight = action_penalty_weight
+        self.explore_weight = explore_weight
+        self.penalty_v = penalty_v
+        self.penalty_w = penalty_w
         self._warm_start: torch.Tensor | None = None
 
     def reset(self) -> None:
@@ -126,7 +132,6 @@ class PureCEMPlanner:
         self,
         z_start_raw: torch.Tensor,
         z_goal_raw: torch.Tensor | None = None,
-        history_windows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
@@ -168,42 +173,29 @@ class PureCEMPlanner:
             samples[0] = mean
 
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
+            z_terminal = z_rollouts[:, -1, :]  
+            
             costs = torch.zeros(self.n_candidates, device=self.device)
 
-            is_visual_match = torch.zeros(self.n_candidates, dtype=torch.bool, device=self.device)
-
-            # 1. Terminal Goal Cost & Visual Lock-on
+            # 1. Terminal Goal Cost (Cosine distance 0.0 to 2.0)
             if z_goal_batch is not None:
-                z_terminal = z_rollouts[:, -1, :]  
                 cos_sim_goal = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
                 costs += (1.0 - cos_sim_goal) 
-                
-                # Latent Override: If we visually see the target, drop everything and lock on
-                is_visual_match = cos_sim_goal > 0.85
-                costs -= is_visual_match.float() * 1000.0
 
-            # 2. Sequence Novelty (Only if not locked onto goal)
-            if history_windows is not None and self.novelty_weight > 0.0:
-                B, H, D = z_rollouts.shape
-                M = history_windows.shape[0]
-                if M > 0:
-                    z_flat = z_rollouts.reshape(B, H * D)
-                    h_flat = history_windows.reshape(M, H * D)
-                    
-                    z_norm = F.normalize(z_flat, p=2, dim=-1)
-                    h_norm = F.normalize(h_flat, p=2, dim=-1)
-                    
-                    sim_matrix = torch.mm(z_norm, h_norm.transpose(0, 1))
-                    max_sim = sim_matrix.max(dim=-1).values
-                    
-                    seq_novelty_dist = 1.0 - max_sim 
-                    # Only reward novelty if we haven't found the beacon
-                    costs -= self.novelty_weight * seq_novelty_dist * (~is_visual_match).float()
+            # 2. Latent Displacement Reward (Drive to change the visual field)
+            # Memory-free: simply asks "does my view change 4 steps from now?"
+            if self.explore_weight > 0.0:
+                cos_sim_start = F.cosine_similarity(z_terminal, z0_batch, dim=-1)
+                displacement = (1.0 - cos_sim_start)
+                costs -= self.explore_weight * displacement
 
-            # 3. Action Smoothness Penalty (L2)
-            if self.action_penalty_weight > 0.0:
-                act_penalty = samples.square().sum(dim=(1, 2))
-                costs += self.action_penalty_weight * act_penalty
+            # 3. Biomechanical Action Penalties
+            # Penalty W is higher than Penalty V to prevent the robot from
+            # just spinning in place to generate visual displacement.
+            if self.penalty_v > 0.0 or self.penalty_w > 0.0:
+                act_penalty_v = samples[..., :2].square().sum(dim=(1, 2))
+                act_penalty_w = samples[..., 2].square().sum(dim=1)
+                costs += (self.penalty_v * act_penalty_v) + (self.penalty_w * act_penalty_w)
 
             min_cost, min_idx = costs.min(dim=0)
             if min_cost.item() < best_cost:
@@ -226,7 +218,7 @@ class PureCEMPlanner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pure world-model maze inference (Exploration + Lock-on).",
+        description="Pure world-model maze inference (Latent Displacement).",
     )
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
@@ -244,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim_backend", type=str, default="auto")
     p.add_argument("--show_viewer", action="store_true")
     
-    # Bounded to trained sequence length
+    # Bounded to H=4 to respect JEPA model limitations
     p.add_argument("--plan_horizon", type=int, default=4)
     p.add_argument("--n_candidates", type=int, default=300)
     p.add_argument("--cem_iters", type=int, default=30)
@@ -256,13 +248,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
-    # Restored the high-novelty, low-penalty math from the successful exploratory run
-    p.add_argument("--novelty_weight", type=float, default=10.0)
-    p.add_argument("--action_penalty_weight", type=float, default=0.01)
-    
-    # Expanded Episodic Memory
-    p.add_argument("--history_len", type=int, default=1000)
-    p.add_argument("--history_stride", type=int, default=4)
+    # Latent Displacement Weights
+    p.add_argument("--explore_weight", type=float, default=0.5)
+    p.add_argument("--penalty_v", type=float, default=0.01)
+    p.add_argument("--penalty_w", type=float, default=0.05)
     
     p.add_argument("--success_range", type=float, default=0.4)
     p.add_argument("--out_dir", type=str, default=None)
@@ -777,9 +766,7 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
-          f"iters={args.cem_iters}, K={args.mpc_execute}, "
-          f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
-          f"HistLen={args.history_len}, HistStride={args.history_stride}")
+          f"iters={args.cem_iters}, K={args.mpc_execute}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -790,7 +777,6 @@ def main():
     path_xy: List[List[float]] = []
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
-    latent_history: List[torch.Tensor] = []
     terminate_reason = "max_steps"
     collision_count = 0
 
@@ -834,8 +820,9 @@ def main():
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
-            novelty_weight=args.novelty_weight,
-            action_penalty_weight=args.action_penalty_weight,
+            explore_weight=args.explore_weight,
+            penalty_v=args.penalty_v,
+            penalty_w=args.penalty_w,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
@@ -860,22 +847,12 @@ def main():
         tp_frames_hwc.append(tp_frame)
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
-        
-        latent_history.append(obs["z_raw"].squeeze(0).detach())
 
         for step in range(args.steps):
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
 
             if need_replan:
-                history_windows = None
-                if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
-                    H = args.plan_horizon
-                    windows = []
-                    for i in range(len(latent_history) - H + 1):
-                        windows.append(torch.stack(latent_history[i : i + H]))
-                    history_windows = torch.stack(windows).to(planning_device)
-
-                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb, history_windows)
+                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb)
                 plan_step_idx = 0
                 costs_log.append(cost)
 
@@ -901,10 +878,6 @@ def main():
             
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                if step % args.history_stride == 0:
-                    latent_history.append(obs["z_raw"].squeeze(0).detach())
-                    if len(latent_history) > args.history_len:
-                        latent_history.pop(0)
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
@@ -994,10 +967,9 @@ def main():
             "cem_iters": args.cem_iters,
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
-            "novelty_weight": args.novelty_weight,
-            "action_penalty_weight": args.action_penalty_weight,
-            "history_len": args.history_len,
-            "history_stride": args.history_stride,
+            "explore_weight": args.explore_weight,
+            "penalty_v": args.penalty_v,
+            "penalty_w": args.penalty_w,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
