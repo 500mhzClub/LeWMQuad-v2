@@ -106,6 +106,7 @@ class PureCEMPlanner:
         min_std: torch.Tensor,
         device: torch.device,
         novelty_weight: float = 10.0,
+        bad_state_weight: float = 0.5,
         action_penalty_weight: float = 0.001,
     ):
         self.world_model = world_model
@@ -119,6 +120,7 @@ class PureCEMPlanner:
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
         self.novelty_weight = novelty_weight
+        self.bad_state_weight = bad_state_weight
         self.action_penalty_weight = action_penalty_weight
         self._warm_start: torch.Tensor | None = None
 
@@ -131,6 +133,7 @@ class PureCEMPlanner:
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None = None,
         history_latents_proj: torch.Tensor | None = None,
+        bad_latents_proj: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
@@ -167,6 +170,7 @@ class PureCEMPlanner:
             # plan_rollout returns predicted latents in z_proj space.
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
+            z_norm = None
 
             # 1. Terminal Goal Cost (z_proj space)
             if z_goal_batch is not None:
@@ -188,7 +192,19 @@ class PureCEMPlanner:
                     traj_novelty = step_novelty.mean(dim=-1)
                     costs -= self.novelty_weight * traj_novelty
 
-            # 3. Action Smoothness Penalty (L2)
+            # 3. Online repulsion from collision states.
+            if bad_latents_proj is not None and self.bad_state_weight > 0.0:
+                bad_memory = bad_latents_proj.to(self.device, dtype=torch.float32)
+                if bad_memory.shape[0] > 0:
+                    if z_norm is None:
+                        z_norm = F.normalize(z_rollouts, p=2, dim=-1)
+                    bad_norm = F.normalize(bad_memory, p=2, dim=-1)
+                    bad_sim = torch.einsum("bhd,md->bhm", z_norm, bad_norm)
+                    bad_match = bad_sim.max(dim=-1).values.clamp_min(0.0)
+                    bad_penalty = bad_match.mean(dim=-1)
+                    costs += self.bad_state_weight * bad_penalty
+
+            # 4. Action Smoothness Penalty (L2)
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -243,8 +259,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
     p.add_argument("--novelty_weight", type=float, default=10.0)
+    p.add_argument("--bad_state_weight", type=float, default=0.5)
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--history_len", type=int, default=100)
+    p.add_argument("--bad_state_len", type=int, default=256)
     p.add_argument("--success_range", type=float, default=0.4)
     
     p.add_argument("--out_dir", type=str, default=None)
@@ -778,8 +796,8 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, "
-          f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
-          f"HistLen={args.history_len}")
+          f"Novelty={args.novelty_weight}, BadState={args.bad_state_weight}, "
+          f"ActionPen={args.action_penalty_weight}, HistLen={args.history_len}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -791,6 +809,7 @@ def main():
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
     latent_history: List[torch.Tensor] = []
+    bad_state_bank: List[torch.Tensor] = []
     terminate_reason = "max_steps"
     collision_count = 0
     ego_frame_substitutions = 0
@@ -836,6 +855,7 @@ def main():
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
             novelty_weight=args.novelty_weight,
+            bad_state_weight=args.bad_state_weight,
             action_penalty_weight=args.action_penalty_weight,
         )
 
@@ -869,11 +889,14 @@ def main():
 
             if need_replan:
                 history_latents_proj = None
+                bad_latents_proj = None
                 if args.novelty_weight > 0.0 and latent_history:
                     history_latents_proj = torch.stack(latent_history).to(planning_device)
+                if args.bad_state_weight > 0.0 and bad_state_bank:
+                    bad_latents_proj = torch.stack(bad_state_bank).to(planning_device)
 
                 plan_seq, cost = planner.plan(
-                    obs["z_raw"], z_breadcrumb, history_latents_proj,
+                    obs["z_raw"], z_breadcrumb, history_latents_proj, bad_latents_proj,
                 )
                 plan_step_idx = 0
                 costs_log.append(cost)
@@ -933,6 +956,9 @@ def main():
             
             if collided:
                 collision_count += 1
+                bad_state_bank.append(obs["z_proj"].squeeze(0).detach())
+                if len(bad_state_bank) > args.bad_state_len:
+                    bad_state_bank.pop(0)
                 planner.reset()
                 plan_seq = None
 
@@ -1002,8 +1028,10 @@ def main():
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
             "novelty_weight": args.novelty_weight,
+            "bad_state_weight": args.bad_state_weight,
             "action_penalty_weight": args.action_penalty_weight,
             "history_len": args.history_len,
+            "bad_state_len": args.bad_state_len,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
