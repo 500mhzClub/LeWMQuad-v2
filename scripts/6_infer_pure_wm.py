@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""Displacement + novelty MPC for maze exploration using the LeWM world model.
+"""Safety + novelty MPC for maze exploration using the LeWM world model.
 
 The world model predicts future latent states from candidate action sequences.
-Planning uses two terms (plus optional goal):
+A learned safety head scores trajectories for wall avoidance, while a latent
+novelty signal drives exploration.
 
-    cost = -displacement(z_H, z_0) - novelty_weight * novelty(z_rollout, visited)
+    cost = safety_energy(z_rollout)
+         - novelty_weight * novelty(z_rollout, visited)
          + goal_lambda * ||z_H - z_g||^2
 
-  - displacement: ||z_H - z_0||^2 in projected space -- "go somewhere
-    different from where you are now."  Wall collisions keep the robot in
-    place physically, so the model should predict small displacement for
-    collision trajectories.  This is the implicit safety signal.
+  - safety: LatentEnergyHead trained on clearance/traversability data.
+    Provides reliable wall avoidance without heuristics.
   - novelty: min L2 distance from predicted rollout to the full set of
-    previously visited projected latents.  Unlike a short FIFO, the visited
-    set never forgets, driving systematic exploration of new corridors.
+    previously visited projected latents.  The visited set never forgets,
+    driving systematic exploration of new corridors.
   - goal: terminal L2^2 to the beacon breadcrumb latent.
 
-All comparisons are in projected space (enc_projector / pred_projector)
-since that is the space the world model was trained to predict in.
-
-No safety heads, no forward bonus, no gates, no oracle ray-marching,
+No forward bonus, no gates, no oracle ray-marching,
 no stuck detector, no forced recovery.
 
 Usage:
@@ -65,6 +62,7 @@ from lewm.genesis_utils import init_genesis_once, to_numpy
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import generate_enclosed_maze
 from lewm.models import ActorCritic, LeWorldModel
+from lewm.models.energy_head import LatentEnergyHead
 from lewm.obstacle_utils import add_obstacles_to_scene, detect_collisions
 
 torch.backends.cudnn.benchmark = True
@@ -103,34 +101,35 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Displacement + novelty CEM planner ---------------------------------- #
+# ---- Safety + novelty CEM planner ---------------------------------------- #
 
-class DisplacementCEMPlanner:
-    """CEM planner that maximises predicted latent displacement + novelty.
+class NoveltyCEMPlanner:
+    """CEM planner: learned safety + latent novelty + goal.
 
     Cost for each candidate trajectory:
 
-        cost = -||z_H - z_0||^2
-               - novelty_weight * mean(min_dist(z_rollout, visited))
-               + goal_lambda * ||z_H - z_g||^2
+        cost = safety_energy(z_rollout)
+             - novelty_weight * mean(min_dist(z_rollout, visited))
+             + goal_lambda * ||z_H - z_g||^2
 
-    displacement: trajectories that move the robot to a new physical location
-    produce large latent displacement.  Wall collisions keep the robot in
-    place, so the model predicts small displacement -- implicit wall avoidance.
+    safety: the LatentEnergyHead scores each predicted latent for wall
+    proximity and traversability.  Trained on real clearance data, so it
+    provides reliable wall avoidance without heuristics.
 
     novelty: min L2 distance from predicted rollout to the full set of
-    previously visited projected latents.  Unlike a short FIFO, the visited
-    set never forgets, driving the robot to systematically explore new areas.
+    previously visited projected latents.  The visited set never forgets,
+    driving systematic exploration.
 
     goal: terminal pull toward beacon breadcrumb.
 
-    All comparisons happen in projected space (enc_projector / pred_projector)
-    since that is the space the world model was trained to predict in.
+    All novelty/goal comparisons happen in projected space (the space the
+    world model was trained to predict in).
     """
 
     def __init__(
         self,
         world_model: LeWorldModel,
+        safety_head: LatentEnergyHead,
         horizon: int,
         n_candidates: int,
         cem_iters: int,
@@ -145,6 +144,7 @@ class DisplacementCEMPlanner:
         device: torch.device,
     ):
         self.world_model = world_model
+        self.safety_head = safety_head
         self.horizon = int(horizon)
         self.n_candidates = int(n_candidates)
         self.cem_iters = int(cem_iters)
@@ -169,7 +169,7 @@ class DisplacementCEMPlanner:
         z_goal_proj: torch.Tensor | None,
         visited_proj: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Plan an action sequence via displacement + novelty + goal.
+        """Plan an action sequence via safety + novelty + goal.
 
         Args:
             z_start_raw:  (1, D) raw encoder embedding (predictor input).
@@ -182,8 +182,6 @@ class DisplacementCEMPlanner:
         """
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)  # (N, D)
-        # Project z0 into the same space as plan_rollout output
-        z0_proj = self.world_model.enc_projector(z0_batch)  # (N, D)
 
         z_goal_batch = None
         if z_goal_proj is not None:
@@ -231,9 +229,8 @@ class DisplacementCEMPlanner:
             # z_rollouts: (N, H, D) in projected space
             N, H, D = z_rollouts.shape
 
-            # --- Displacement term (projected space) ---
-            z_terminal = z_rollouts[:, -1, :]  # (N, D)
-            displacement = (z_terminal - z0_proj).square().sum(dim=-1)  # (N,)
+            # --- Safety term (learned energy head) ---
+            safety_cost = self.safety_head.score_trajectory(z_rollouts)  # (N,)
 
             # --- Novelty term (projected space) ---
             novelty_score = torch.zeros(N, device=self.device)
@@ -246,11 +243,12 @@ class DisplacementCEMPlanner:
             # --- Goal term ---
             goal_cost = torch.zeros(N, device=self.device)
             if z_goal_batch is not None:
+                z_terminal = z_rollouts[:, -1, :]  # (N, D)
                 goal_cost = (z_terminal - z_goal_batch).square().sum(dim=-1)
 
             # Combined cost: lower is better
             costs = (
-                -displacement
+                safety_cost
                 - self.novelty_weight * novelty_score
                 + self.goal_lambda * goal_cost
             )
@@ -262,7 +260,7 @@ class DisplacementCEMPlanner:
                 best_seq = samples[min_idx.item()].detach().clone()
                 best_info = {
                     "cost": min_cost.item(),
-                    "displacement": displacement[min_idx].item(),
+                    "safety": safety_cost[min_idx].item(),
                     "novelty": novelty_score[min_idx].item(),
                     "goal_cost": goal_cost[min_idx].item(),
                 }
@@ -290,6 +288,8 @@ def parse_args() -> argparse.Namespace:
     # Checkpoints
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
+    p.add_argument("--scorer_ckpt", type=str, required=True,
+                    help="Energy head checkpoint (contains safety_head state dict).")
     # Maze generation
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grid_rows", type=int, default=4)
@@ -321,7 +321,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     p.add_argument("--goal_lambda", type=float, default=0.01,
-                    help="Weight on terminal goal cost vs displacement. "
+                    help="Weight on terminal goal cost. "
                          "Low = explore more, high = beeline to beacon.")
     p.add_argument("--novelty_weight", type=float, default=0.5,
                     help="Weight on novelty (distance from visited states).")
@@ -391,6 +391,19 @@ def load_world_model(ckpt_path: str, device: torch.device):
         "latent_dim": latent_dim, "image_size": image_size,
         "patch_size": patch_size, "use_proprio": use_proprio,
     }
+
+
+def load_safety_head(ckpt_path: str, device: torch.device) -> LatentEnergyHead:
+    ckpt = torch.load(ckpt_path, map_location=device)
+    latent_dim = int(ckpt.get("latent_dim", 192))
+    hidden_dim = int(ckpt.get("hidden_dim", 512))
+    dropout = float(ckpt.get("dropout", 0.0))
+    head = LatentEnergyHead(
+        latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout,
+    ).to(device)
+    clean_load_state(head, ckpt["safety_head"])
+    head.eval()
+    return head
 
 
 def load_frozen_policy(ckpt_path: str, gs) -> ActorCritic:
@@ -801,12 +814,14 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # ---- 1. Load world model ----
+    # ---- 1. Load world model + safety head ----
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
+    safety_head = load_safety_head(args.scorer_ckpt, planning_device)
     camera_cfg = ego_camera_config_from_args(args)
 
     print(f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
           f"image_size={wm_meta['image_size']}")
+    print(f"Loaded safety head from {args.scorer_ckpt}")
 
     # ---- 2. Generate enclosed maze ----
     obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
@@ -916,8 +931,9 @@ def main():
         # ---- 5. Spawn robot + create planner ----
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
-        planner = DisplacementCEMPlanner(
+        planner = NoveltyCEMPlanner(
             world_model=world_model,
+            safety_head=safety_head,
             horizon=args.plan_horizon,
             n_candidates=args.n_candidates,
             cem_iters=args.cem_iters,
@@ -1074,12 +1090,12 @@ def main():
                     reached = True
 
                 if step % 20 == 0 or reached:
-                    disp_str = f"disp={plan_info.get('displacement', 0):.1f}" if plan_info else ""
+                    safe_str = f"safe={plan_info.get('safety', 0):.2f}" if plan_info else ""
                     nov_str = f"nov={plan_info.get('novelty', 0):.3f}" if plan_info else ""
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                        f"d_goal={dist_claim:.2f}m {disp_str} {nov_str} "
+                        f"d_goal={dist_claim:.2f}m {safe_str} {nov_str} "
                         f"landmarks={len(visited_latents)} coll={collision_count}"
                     )
 
@@ -1103,7 +1119,7 @@ def main():
 
     # ---- 8. Export ----
     summary = {
-        "approach": "displacement_novelty_mpc",
+        "approach": "safety_novelty_mpc",
         "seed": args.seed,
         "grid": f"{args.grid_rows}x{args.grid_cols}",
         "target": target_beacon.identity if target_beacon else None,
