@@ -497,6 +497,23 @@ def observe(
     }
 
 
+@torch.no_grad()
+def infer_substituted_latent(
+    world_model: LeWorldModel,
+    z_prev_raw: torch.Tensor,
+    cmd_executed: torch.Tensor,
+    planning_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Advance the latent one step when perception falls back to a stale frame."""
+    z_prev_raw = z_prev_raw.to(planning_device, dtype=torch.float32)
+    if z_prev_raw.ndim == 1:
+        z_prev_raw = z_prev_raw.unsqueeze(0)
+    cmd_step = cmd_executed.to(planning_device, dtype=torch.float32).view(1, 1, -1)
+    z_next_raw = world_model.predictor.rollout(z_prev_raw, cmd_step)[:, -1, :]
+    z_next_proj = world_model.pred_projector(z_next_raw)
+    return z_next_raw.detach(), z_next_proj.detach()
+
+
 # ---- Breadcrumb encoding ------------------------------------------------- #
 
 @torch.no_grad()
@@ -776,6 +793,7 @@ def main():
     latent_history: List[torch.Tensor] = []
     terminate_reason = "max_steps"
     collision_count = 0
+    ego_frame_substitutions = 0
 
     try:
         import genesis as gs
@@ -871,6 +889,7 @@ def main():
                 nominal_cmd.to(gs.device), sim_cfg, gs, torch,
             )
             prev_action = actions.detach().clone()
+            prev_z_raw = obs["z_raw"].detach()
 
             obs = observe(
                 physics_robot, physics_act_dofs,
@@ -879,6 +898,13 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
+            if obs["frame_substituted"]:
+                ego_frame_substitutions += 1
+                z_raw_pred, z_proj_pred = infer_substituted_latent(
+                    world_model, prev_z_raw, nominal_cmd, planning_device,
+                )
+                obs["z_raw"] = z_raw_pred
+                obs["z_proj"] = z_proj_pred
             
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
@@ -968,6 +994,7 @@ def main():
         "steps": len(cmds_log),
         "collisions": collision_count,
         "elapsed_sec": elapsed,
+        "ego_frame_substitutions": ego_frame_substitutions,
         "planner": {
             "horizon": args.plan_horizon,
             "candidates": args.n_candidates,
