@@ -229,10 +229,10 @@ class NoveltyCEMPlanner:
             # z_rollouts: (N, H, D) in projected space
             N, H, D = z_rollouts.shape
 
-            # --- Safety term (learned energy head) ---
-            safety_cost = self.safety_head.score_trajectory(z_rollouts)  # (N,)
+            # --- Safety term (learned energy head, per-step mean) ---
+            safety_cost = self.safety_head.score_trajectory(z_rollouts) / float(H)  # (N,)
 
-            # --- Novelty term (projected space) ---
+            # --- Novelty term (projected space, per-step mean) ---
             novelty_score = torch.zeros(N, device=self.device)
             if visited_dev is not None:
                 z_flat = z_rollouts.reshape(N * H, D)
@@ -263,6 +263,8 @@ class NoveltyCEMPlanner:
                     "safety": safety_cost[min_idx].item(),
                     "novelty": novelty_score[min_idx].item(),
                     "goal_cost": goal_cost[min_idx].item(),
+                    "safety_std": safety_cost.std().item(),
+                    "novelty_std": novelty_score.std().item(),
                 }
 
             # Update CEM distribution from elites
@@ -1094,8 +1096,8 @@ def main():
                     reached = True
 
                 if step % 20 == 0 or reached:
-                    safe_str = f"safe={plan_info.get('safety', 0):.2f}" if plan_info else ""
-                    nov_str = f"nov={plan_info.get('novelty', 0):.3f}" if plan_info else ""
+                    safe_str = f"safe={plan_info.get('safety', 0):.2f}(σ{plan_info.get('safety_std', 0):.3f})" if plan_info else ""
+                    nov_str = f"nov={plan_info.get('novelty', 0):.2f}(σ{plan_info.get('novelty_std', 0):.3f})" if plan_info else ""
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
