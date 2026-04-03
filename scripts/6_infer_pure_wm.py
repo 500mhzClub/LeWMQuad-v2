@@ -1,17 +1,21 @@
-#!/usr/bin/env python3
-"""Pure world-model maze inference — no heuristics, no oracle.
+"""Pure world-model maze inference — sequence-based novelty exploration.
 
-Implements the planning approach from Section 3.2 of the LeWM paper exactly:
+Implements the planning approach from Section 3.2 of the LeWM paper, enhanced
+with Sequence-Based Trajectory Novelty to overcome perceptual aliasing in 
+featureless (grey-wall) environments.
+
+Pipeline:
   1. Encode current observation: z_1 = enc(o_1)
-  2. Encode goal observation:   z_g = enc(o_g)
-  3. CEM optimises action sequence to minimise terminal cost:
-       C(z_H) = ||z_H - z_g||²
+  2. Encode goal observation (if known): z_g = enc(o_g)
+  3. CEM optimises action sequence to minimise terminal cost + maximize novelty:
+       C(z_{1:H}) = ||z_H - z_g||² - w * min_j ||z_{1:H} - w_j||²
+       where w_j are historical latent sequences of length H.
   4. MPC: execute first K actions, then replan from fresh observation.
 
-No safety heads, no forward reward, no exploration bonus, no diversity,
-no yaw penalty, no oracle ray-marching, no collision backstop.
-The world model's latent space already encodes wall proximity and dynamics
-(verified by probing results in Table 1 of the paper).
+python3 scripts/6_infer_pure_wm.py \
+    --ppo_ckpt models/ppo/ckpt_20000.pt \
+    --wm_ckpt lewm_checkpoints/epoch_20.pt \
+    --seed 42 --steps 4000 
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
@@ -88,18 +92,13 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Pure CEM planner (paper Section 3.2) -------------------------------- #
+# ---- Pure CEM planner (paper Section 3.2 + Sequence Novelty) ------------ #
 
 class PureCEMPlanner:
-    """CEM planner with terminal goal-matching cost only.
+    """CEM planner with terminal goal-matching cost and sequence novelty.
 
-    Implements Equations (4)-(5) from the LeWM paper:
-        C(z_H) = ||z_H - z_g||²
-        a*_{1:H} = argmin_{a_{1:H}} C(z_H)
-
-    No safety heads, no exploration bonuses, no hand-tuned gates.
-    The world model's dynamics predictions naturally avoid walls
-    because wall-approach trajectories lead to poor goal matching.
+    Implements Equations (4)-(5) from the LeWM paper, plus a memory-based
+    trajectory novelty term to overcome perceptual aliasing.
     """
 
     def __init__(
@@ -114,6 +113,7 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
+        novelty_weight: float = 2.0,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -125,6 +125,7 @@ class PureCEMPlanner:
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
+        self.novelty_weight = novelty_weight
         self._warm_start: torch.Tensor | None = None
 
     def reset(self) -> None:
@@ -134,26 +135,30 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_proj: torch.Tensor,
+        z_goal_proj: torch.Tensor | None = None,
+        history_windows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
-        """Plan an action sequence to reach the goal.
+        """Plan an action sequence to reach the goal / explore safely.
 
         Args:
             z_start_raw: (1, D) raw encoder embedding of current observation.
             z_goal_proj: (D,) or (1, D) projected embedding of goal observation.
+            history_windows: (M, H, D) recent latent sequence memory bank.
 
         Returns:
             best_seq: (H, 3) best action sequence found.
             best_cost: scalar cost of best sequence.
         """
-        if z_goal_proj.ndim == 1:
-            z_goal_proj = z_goal_proj.unsqueeze(0)
-
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
-        z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
-            self.n_candidates, -1,
-        )
+        
+        z_goal_batch = None
+        if z_goal_proj is not None:
+            if z_goal_proj.ndim == 1:
+                z_goal_proj = z_goal_proj.unsqueeze(0)
+            z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
+                self.n_candidates, -1,
+            )
 
         # Initialise CEM distribution
         if self._warm_start is not None:
@@ -181,9 +186,27 @@ class PureCEMPlanner:
             # Rollout world model: z_{t+1} = pred(z_t, a_t)
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
 
-            # Terminal cost: C(z_H) = ||z_H - z_g||²  (Eq. 4)
-            z_terminal = z_rollouts[:, -1, :]  # (B, D)
-            costs = (z_terminal - z_goal_batch).square().sum(dim=-1)  # (B,)
+            costs = torch.zeros(self.n_candidates, device=self.device)
+
+            # 1. Terminal cost: C(z_H) = ||z_H - z_g||²
+            if z_goal_batch is not None:
+                z_terminal = z_rollouts[:, -1, :]  # (B, D)
+                costs += (z_terminal - z_goal_batch).square().sum(dim=-1)  # (B,)
+
+            # 2. Sequence Novelty Bonus (to escape perceptual aliasing)
+            if history_windows is not None and self.novelty_weight > 0.0:
+                B, H, D = z_rollouts.shape
+                M = history_windows.shape[0]
+                if M > 0:
+                    z_flat = z_rollouts.reshape(B, H * D)
+                    h_flat = history_windows.reshape(M, H * D)
+                    
+                    # Compute L2 distance between candidate sequences and all history sequences
+                    dists = torch.cdist(z_flat, h_flat) # (B, M)
+                    seq_novelty = dists.min(dim=-1).values # (B,)
+                    
+                    # Reward novelty (subtract from cost)
+                    costs -= self.novelty_weight * seq_novelty
 
             # Track global best
             min_cost, min_idx = costs.min(dim=0)
@@ -244,6 +267,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
+    # Sequence novelty exploration
+    p.add_argument("--novelty_weight", type=float, default=1.0,
+                    help="Weight for sequence trajectory novelty.")
+    p.add_argument("--history_len", type=int, default=100,
+                    help="Number of past steps to remember for novelty distance.")
     # Success / termination
     p.add_argument("--success_range", type=float, default=0.4)
     # Output
@@ -781,18 +809,19 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
-          f"iters={args.cem_iters}, K={args.mpc_execute}")
+          f"iters={args.cem_iters}, K={args.mpc_execute}, Novelty={args.novelty_weight}")
 
     # ---- 3. Build Genesis scenes ----
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
 
-    ego_frames_hwc: list[np.ndarray] = []
-    tp_frames_hwc: list[np.ndarray] = []
-    combined_frames: list[np.ndarray] = []
-    path_xy: list[list[float]] = []
-    costs_log: list[float] = []
-    cmds_log: list[list[float]] = []
+    ego_frames_hwc: List[np.ndarray] = []
+    tp_frames_hwc: List[np.ndarray] = []
+    combined_frames: List[np.ndarray] = []
+    path_xy: List[List[float]] = []
+    costs_log: List[float] = []
+    cmds_log: List[List[float]] = []
+    latent_history: List[torch.Tensor] = []
     terminate_reason = "max_steps"
     collision_count = 0
 
@@ -838,6 +867,7 @@ def main():
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
+            novelty_weight=args.novelty_weight,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
@@ -863,6 +893,7 @@ def main():
         tp_frames_hwc.append(tp_frame)
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+        latent_history.append(obs["z_proj"].squeeze(0).detach())
 
         # ---- 7. Main loop ----
         for step in range(args.steps):
@@ -872,18 +903,19 @@ def main():
                 or plan_step_idx >= args.mpc_execute
             )
 
-            if need_replan and z_breadcrumb is not None:
-                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb)
+            if need_replan:
+                # Build historical sequence windows for sequence novelty
+                history_windows = None
+                if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
+                    H = args.plan_horizon
+                    windows = []
+                    for i in range(len(latent_history) - H + 1):
+                        windows.append(torch.stack(latent_history[i : i + H]))
+                    history_windows = torch.stack(windows).to(planning_device)
+
+                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb, history_windows)
                 plan_step_idx = 0
                 costs_log.append(cost)
-            elif z_breadcrumb is None:
-                # No goal — just walk forward
-                plan_seq = torch.tensor(
-                    [[0.4, 0.0, 0.0]] * args.plan_horizon,
-                    dtype=torch.float32, device=planning_device,
-                )
-                plan_step_idx = 0
-                costs_log.append(0.0)
 
             # Extract current action from plan
             nominal_cmd = plan_seq[plan_step_idx]
@@ -907,8 +939,14 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
+            
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
+                latent_history.append(obs["z_proj"].squeeze(0).detach())
+                
+                # Keep history bounded
+                if len(latent_history) > args.history_len:
+                    latent_history.pop(0)
 
             # Render third-person
             tp_frame = render_third_person_frame(
@@ -1005,6 +1043,8 @@ def main():
             "cem_iters": args.cem_iters,
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
+            "novelty_weight": args.novelty_weight,
+            "history_len": args.history_len,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
