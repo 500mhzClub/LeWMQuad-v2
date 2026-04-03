@@ -8,6 +8,8 @@ Exploration is driven by Sequence Novelty, but features:
      approached, preventing the agent from being distracted by novel 
      backgrounds when the target is in sight.
 
+Bounded to H=4 to match the training constraints of the LeWorldModel.
+
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
     --wm_ckpt lewm_checkpoints/epoch_20.pt \
@@ -143,7 +145,14 @@ class PureCEMPlanner:
             )
 
         if self._warm_start is not None:
-            mean = self._warm_start.clone()
+            H_prev = self._warm_start.shape[0]
+            if H_prev >= self.horizon:
+                mean = self._warm_start[:self.horizon].clone()
+            else:
+                mean = torch.cat([
+                    self._warm_start,
+                    self._warm_start[-1:].expand(self.horizon - H_prev, -1)
+                ], dim=0).clone()
         else:
             mean = 0.5 * (self.cmd_low + self.cmd_high)
             mean = mean.unsqueeze(0).expand(self.horizon, -1).clone()
@@ -166,15 +175,13 @@ class PureCEMPlanner:
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
 
-            # 1. Terminal Goal Cost (Aligned z_raw space)
             goal_distances = torch.zeros(self.n_candidates, device=self.device)
             if z_goal_batch is not None:
                 z_terminal = z_rollouts[:, -1, :]  
                 cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
-                goal_distances = (1.0 - cos_sim) # [0.0 to 2.0]
+                goal_distances = (1.0 - cos_sim) 
                 costs += goal_distances
 
-            # 2. Sequence Novelty (Adaptive Curiosity)
             if history_windows is not None and self.novelty_weight > 0.0:
                 B, H, D = z_rollouts.shape
                 M = history_windows.shape[0]
@@ -189,14 +196,9 @@ class PureCEMPlanner:
                     max_sim = sim_matrix.max(dim=-1).values
                     
                     seq_novelty_dist = 1.0 - max_sim 
-                    
-                    # ADAPTIVE CURIOSITY: Scale novelty by how far we are from the goal.
-                    # If goal_dist is small (close to goal), novelty decays so it doesn't distract.
-                    # Clamp to ensure scaling doesn't blow up or invert.
                     adaptive_scale = torch.clamp(goal_distances, 0.0, 1.0)
                     costs -= (self.novelty_weight * adaptive_scale) * seq_novelty_dist
 
-            # 3. Action Smoothness Penalty (L2)
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -222,7 +224,7 @@ class PureCEMPlanner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pure world-model maze inference (Aligned z_raw latents).",
+        description="Pure world-model maze inference (Bounded to trained seq_len).",
     )
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
@@ -240,21 +242,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim_backend", type=str, default="auto")
     p.add_argument("--show_viewer", action="store_true")
     
-    p.add_argument("--plan_horizon", type=int, default=5)
+    # REVERTED to H=4 to match `3_train_lewm.py` sequence limit
+    p.add_argument("--plan_horizon", type=int, default=4)
     p.add_argument("--n_candidates", type=int, default=300)
     p.add_argument("--cem_iters", type=int, default=30)
     p.add_argument("--elite_frac", type=float, default=0.10)
     p.add_argument("--mpc_execute", type=int, default=1)
+    
     p.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
-    # Updated Hyperparameters for Episodic Memory and Adaptive Curiosity
     p.add_argument("--novelty_weight", type=float, default=3.0)
     p.add_argument("--action_penalty_weight", type=float, default=0.005)
     p.add_argument("--history_len", type=int, default=1000)
-    p.add_argument("--history_stride", type=int, default=3, help="Subsample history to expand temporal memory")
+    p.add_argument("--history_stride", type=int, default=3)
     p.add_argument("--success_range", type=float, default=0.4)
     
     p.add_argument("--out_dir", type=str, default=None)
@@ -863,7 +866,6 @@ def main():
                 if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
                     H = args.plan_horizon
                     windows = []
-                    # Create sequence windows for novelty evaluation
                     for i in range(len(latent_history) - H + 1):
                         windows.append(torch.stack(latent_history[i : i + H]))
                     history_windows = torch.stack(windows).to(planning_device)
@@ -894,7 +896,6 @@ def main():
             
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                # Subsample memory to prevent getting stuck in tight loops
                 if step % args.history_stride == 0:
                     latent_history.append(obs["z_raw"].squeeze(0).detach())
                     if len(latent_history) > args.history_len:
