@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — Aligned Latents and Smoothness Prior.
+"""Pure world-model maze inference — projected-space scoring + smoothness prior.
 
-Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
-strictly aligned z_raw latents for planning, memory, and goal tracking. 
-Exploration is driven by Sequence Novelty, balanced by an L2 Action Penalty 
-to encourage smooth, deliberate quadrupedal movement without safety heuristics.
+Implements the planning approach from Section 3.2 of the LeWM paper. The
+predictor rolls out from the current observation's ``z_raw`` state, while goal
+matching and novelty are scored in ``z_proj`` space where the JEPA loss is
+defined. Exploration is driven by stepwise memory novelty, balanced by an L2
+action penalty to encourage smooth, deliberate quadrupedal movement.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -87,10 +88,10 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
+# ---- Pure CEM planner (z_raw rollout + z_proj scoring) ------------------- #
 
 class PureCEMPlanner:
-    """CEM planner operating strictly in z_raw space with an L2 action prior."""
+    """CEM planner with raw-state rollout and projected-space scoring."""
 
     def __init__(
         self,
@@ -128,17 +129,17 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_raw: torch.Tensor | None = None,
-        history_windows: torch.Tensor | None = None,
+        z_goal_proj: torch.Tensor | None = None,
+        history_latents_proj: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
         
         z_goal_batch = None
-        if z_goal_raw is not None:
-            if z_goal_raw.ndim == 1:
-                z_goal_raw = z_goal_raw.unsqueeze(0)
-            z_goal_batch = z_goal_raw.to(self.device, dtype=torch.float32).expand(
+        if z_goal_proj is not None:
+            if z_goal_proj.ndim == 1:
+                z_goal_proj = z_goal_proj.unsqueeze(0)
+            z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
                 self.n_candidates, -1,
             )
 
@@ -163,32 +164,29 @@ class PureCEMPlanner:
             )
             samples[0] = mean
 
-            # z_rollouts are raw latents predicted by the world model
+            # plan_rollout returns predicted latents in z_proj space.
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
 
-            # 1. Terminal Goal Cost (Aligned z_raw space)
+            # 1. Terminal Goal Cost (z_proj space)
             if z_goal_batch is not None:
-                z_terminal = z_rollouts[:, -1, :]  
+                z_terminal = z_rollouts[:, -1, :]
                 cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
                 costs += (1.0 - cos_sim)
 
-            # 2. Sequence Novelty (Aligned z_raw space)
-            if history_windows is not None and self.novelty_weight > 0.0:
+            # 2. Stepwise memory novelty against visited projected states.
+            if history_latents_proj is not None and self.novelty_weight > 0.0:
                 B, H, D = z_rollouts.shape
-                M = history_windows.shape[0]
+                memory = history_latents_proj.to(self.device, dtype=torch.float32)
+                M = memory.shape[0]
                 if M > 0:
-                    z_flat = z_rollouts.reshape(B, H * D)
-                    h_flat = history_windows.reshape(M, H * D)
-                    
-                    z_norm = F.normalize(z_flat, p=2, dim=-1)
-                    h_norm = F.normalize(h_flat, p=2, dim=-1)
-                    
-                    sim_matrix = torch.mm(z_norm, h_norm.transpose(0, 1))
+                    z_norm = F.normalize(z_rollouts, p=2, dim=-1)
+                    h_norm = F.normalize(memory, p=2, dim=-1)
+                    sim_matrix = torch.einsum("bhd,md->bhm", z_norm, h_norm)
                     max_sim = sim_matrix.max(dim=-1).values
-                    
-                    seq_novelty_dist = 1.0 - max_sim 
-                    costs -= self.novelty_weight * seq_novelty_dist
+                    step_novelty = 1.0 - max_sim
+                    traj_novelty = step_novelty.mean(dim=-1)
+                    costs -= self.novelty_weight * traj_novelty
 
             # 3. Action Smoothness Penalty (L2)
             if self.action_penalty_weight > 0.0:
@@ -506,7 +504,7 @@ def encode_breadcrumb(
     world_model, render_scene, render_robot, render_act_dofs, cam,
     beacon, view_dist, planning_device, q0, gs, torch_mod,
 ) -> torch.Tensor:
-    """Return the RAW latent z_raw of the goal view for accurate planning."""
+    """Return the projected latent z_proj of the goal view for scoring."""
     render_robot.set_pos(
         torch_mod.tensor([[999.0, 999.0, -10.0]], device=gs.device, dtype=torch_mod.float32),
         zero_velocity=True,
@@ -542,8 +540,8 @@ def encode_breadcrumb(
     rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
     vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
     
-    z_raw, _ = world_model.encode(vis_t, None)
-    return z_raw.squeeze(0).detach()
+    _, z_proj = world_model.encode(vis_t, None)
+    return z_proj.squeeze(0).detach()
 
 
 # ---- PPO execution ------------------------------------------------------- #
@@ -804,7 +802,7 @@ def main():
                 target_beacon, args.breadcrumb_view_dist,
                 planning_device, q0, gs, torch,
             )
-            print(f"Goal latent encoded (z_raw): ||z_g||={float(z_breadcrumb.norm()):.3f}")
+            print(f"Goal latent encoded (z_proj): ||z_g||={float(z_breadcrumb.norm()):.3f}")
 
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
@@ -846,21 +844,19 @@ def main():
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         
-        latent_history.append(obs["z_raw"].squeeze(0).detach())
+        latent_history.append(obs["z_proj"].squeeze(0).detach())
 
         for step in range(args.steps):
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
 
             if need_replan:
-                history_windows = None
-                if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
-                    H = args.plan_horizon
-                    windows = []
-                    for i in range(len(latent_history) - H + 1):
-                        windows.append(torch.stack(latent_history[i : i + H]))
-                    history_windows = torch.stack(windows).to(planning_device)
+                history_latents_proj = None
+                if args.novelty_weight > 0.0 and latent_history:
+                    history_latents_proj = torch.stack(latent_history).to(planning_device)
 
-                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb, history_windows)
+                plan_seq, cost = planner.plan(
+                    obs["z_raw"], z_breadcrumb, history_latents_proj,
+                )
                 plan_step_idx = 0
                 costs_log.append(cost)
 
@@ -886,7 +882,7 @@ def main():
             
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                latent_history.append(obs["z_raw"].squeeze(0).detach())
+                latent_history.append(obs["z_proj"].squeeze(0).detach())
                 if len(latent_history) > args.history_len:
                     latent_history.pop(0)
 
