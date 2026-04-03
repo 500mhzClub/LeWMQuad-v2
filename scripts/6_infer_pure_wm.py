@@ -219,8 +219,12 @@ class DisplacementCEMPlanner:
 
             # --- Displacement term ---
             # How far does the terminal prediction move from the start?
+            # z_rollouts are in projected space (plan_rollout applies
+            # pred_projector), so we must also project z0 for a valid
+            # same-space comparison.
+            z0_proj = self.world_model.enc_projector(z0_batch)
             z_terminal = z_rollouts[:, -1, :]  # (N, D)
-            displacement = (z_terminal - z0_batch).square().sum(dim=-1)  # (N,)
+            displacement = (z_terminal - z0_proj).square().sum(dim=-1)  # (N,)
 
             # --- Recency term ---
             # Avoid backtracking into recent observations
@@ -935,7 +939,7 @@ def main():
         )
         last_clean_frame = obs["frame_hwc"].copy()
         ego_frames_hwc.append(obs["frame_hwc"])
-        recency_buf.append(obs["z_raw"].squeeze(0).detach())
+        recency_buf.append(obs["z_proj"].squeeze(0).detach())
         tp_frame = render_third_person_frame(
             physics_robot, physics_act_dofs,
             tp_robot, tp_act_dofs, tp_cam,
@@ -989,7 +993,7 @@ def main():
             )
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                recency_buf.append(obs["z_raw"].squeeze(0).detach())
+                recency_buf.append(obs["z_proj"].squeeze(0).detach())
 
             # Render third-person
             tp_frame = render_third_person_frame(
