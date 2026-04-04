@@ -530,19 +530,21 @@ def update_reservoir_bank(
     n_seen: int,
     max_size: int,
     rng: np.random.Generator,
-) -> int:
+) -> tuple[int, bool]:
     """Reservoir-sample visited latents so novelty memory spans the full run."""
     latent = latent.detach().cpu()
     n_seen += 1
     if max_size <= 0:
-        return n_seen
+        return n_seen, False
+    filled_before = len(bank) >= max_size
     if len(bank) < max_size:
         bank.append(latent)
-        return n_seen
+        filled_after = len(bank) >= max_size
+        return n_seen, (not filled_before and filled_after)
     replace_idx = int(rng.integers(0, n_seen))
     if replace_idx < max_size:
         bank[replace_idx] = latent
-    return n_seen
+    return n_seen, False
 
 
 # ---- Breadcrumb encoding ------------------------------------------------- #
@@ -1015,6 +1017,7 @@ def main():
     collision_count = 0
     frame_substitution_count = 0
     first_collision_step: int | None = None
+    visited_bank_fill_step: int | None = None
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
@@ -1094,13 +1097,16 @@ def main():
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
         
-        visited_seen = update_reservoir_bank(
+        visited_seen, bank_filled_now = update_reservoir_bank(
             visited_bank,
             select_score_latent(obs["z_raw"], obs["z_proj"], args.score_space).squeeze(0),
             visited_seen,
             args.visited_bank_size,
             novelty_rng,
         )
+        if bank_filled_now:
+            visited_bank_fill_step = 0
+            print("Visited bank full at initial observation; switching to reservoir replacement")
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1145,7 +1151,7 @@ def main():
                 frame_substitution_count += 1
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                visited_seen = update_reservoir_bank(
+                visited_seen, bank_filled_now = update_reservoir_bank(
                     visited_bank,
                     select_score_latent(
                         obs["z_raw"], obs["z_proj"], args.score_space,
@@ -1154,6 +1160,12 @@ def main():
                     args.visited_bank_size,
                     novelty_rng,
                 )
+                if bank_filled_now and visited_bank_fill_step is None:
+                    visited_bank_fill_step = step
+                    print(
+                        f"Visited bank full at step {step:03d}; "
+                        "switching to reservoir replacement"
+                    )
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
@@ -1210,12 +1222,16 @@ def main():
                     cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
                     cov_delta = cov_area - last_logged_coverage_area_m2
                     last_logged_coverage_area_m2 = cov_area
+                    if args.visited_bank_size > 0:
+                        bank_status = f"{len(visited_bank)}/{args.visited_bank_size}"
+                    else:
+                        bank_status = "off"
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
                         f"cost={costs_log[-1]:.3f} d_goal={dist_claim:.2f}m "
                         f"coll={collision_count} cov={cov_area:.2f}m^2 "
-                        f"cov+={cov_delta:+.2f}"
+                        f"cov+={cov_delta:+.2f} bank={bank_status}"
                     )
 
             if reached:
@@ -1280,6 +1296,7 @@ def main():
             "action_penalty_weight": args.action_penalty_weight,
             "visited_bank_size": args.visited_bank_size,
             "visited_samples_seen": visited_seen,
+            "visited_bank_fill_step": visited_bank_fill_step,
         },
         "coverage": coverage_metrics,
         "path_xy": path_xy,
