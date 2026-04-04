@@ -197,9 +197,17 @@ class LeWorldModel(nn.Module):
         Returns:
             z_pred_proj: (B, H, D) — projected predicted latents at each step.
         """
-        z_pred_raw = self.predictor.rollout(z_start_raw, action_seq)
+        z_pred_raw = self.plan_rollout_raw(z_start_raw, action_seq)
         z_pred_proj = self.pred_projector.forward_seq(z_pred_raw)
         return z_pred_proj
+
+    def plan_rollout_raw(
+        self,
+        z_start_raw: torch.Tensor,
+        action_seq: torch.Tensor,
+    ) -> torch.Tensor:
+        """Rollout predictor and return raw predicted latents."""
+        return self.predictor.rollout(z_start_raw, action_seq)
 
     def plan_cost(
         self,

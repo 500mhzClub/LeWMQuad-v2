@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — Aligned Latents and Smoothness Prior.
+"""Pure world-model maze inference — score-space ablation + smoothness prior.
 
 Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
-strictly aligned z_raw latents for planning, memory, and goal tracking.
-Exploration is driven by Sequence Novelty, balanced by an L2 Action Penalty
-to encourage smooth, deliberate quadrupedal movement without safety heuristics.
+the world model directly without hand-cranked safety heuristics. The planner can
+score trajectories in three spaces:
+  - ``mixed``: current baseline, raw observation/goal history vs projected rollout
+  - ``raw``: raw observation/goal history vs raw rollout
+  - ``proj``: projected observation/goal history vs projected rollout
+Exploration is driven by Sequence Novelty, balanced by an L2 Action Penalty.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -90,7 +93,7 @@ class RobotSimConfig:
 # ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
 
 class PureCEMPlanner:
-    """CEM planner operating strictly in z_raw space with an L2 action prior."""
+    """CEM planner with configurable rollout / scoring representation."""
 
     def __init__(
         self,
@@ -104,6 +107,7 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
+        score_space: str = "mixed",
         novelty_weight: float = 10.0,
         action_penalty_weight: float = 0.001,
     ):
@@ -117,6 +121,7 @@ class PureCEMPlanner:
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
+        self.score_space = score_space
         self.novelty_weight = novelty_weight
         self.action_penalty_weight = action_penalty_weight
         self._warm_start: torch.Tensor | None = None
@@ -128,17 +133,17 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_raw: torch.Tensor | None = None,
+        z_goal_score: torch.Tensor | None = None,
         history_windows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
         
         z_goal_batch = None
-        if z_goal_raw is not None:
-            if z_goal_raw.ndim == 1:
-                z_goal_raw = z_goal_raw.unsqueeze(0)
-            z_goal_batch = z_goal_raw.to(self.device, dtype=torch.float32).expand(
+        if z_goal_score is not None:
+            if z_goal_score.ndim == 1:
+                z_goal_score = z_goal_score.unsqueeze(0)
+            z_goal_batch = z_goal_score.to(self.device, dtype=torch.float32).expand(
                 self.n_candidates, -1,
             )
 
@@ -163,17 +168,19 @@ class PureCEMPlanner:
             )
             samples[0] = mean
 
-            # z_rollouts are raw latents predicted by the world model
-            z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
+            if self.score_space == "raw":
+                z_rollouts = self.world_model.plan_rollout_raw(z0_batch, samples)
+            else:
+                z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
 
-            # 1. Terminal Goal Cost (Aligned z_raw space)
+            # 1. Terminal goal cost in the configured score space.
             if z_goal_batch is not None:
                 z_terminal = z_rollouts[:, -1, :]
                 cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
                 costs += (1.0 - cos_sim)
 
-            # 2. Sequence Novelty (Aligned z_raw space)
+            # 2. Sequence novelty in the configured score space.
             if history_windows is not None and self.novelty_weight > 0.0:
                 B, H, D = z_rollouts.shape
                 M = history_windows.shape[0]
@@ -239,6 +246,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_iters", type=int, default=30)
     p.add_argument("--elite_frac", type=float, default=0.10)
     p.add_argument("--mpc_execute", type=int, default=1)
+    p.add_argument("--score_space", type=str, default="mixed",
+                   choices=["mixed", "raw", "proj"])
     p.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
@@ -499,14 +508,25 @@ def observe(
     }
 
 
+def select_score_latent(
+    z_raw: torch.Tensor,
+    z_proj: torch.Tensor,
+    score_space: str,
+) -> torch.Tensor:
+    """Select the latent representation used for scoring / memory."""
+    if score_space == "proj":
+        return z_proj
+    return z_raw
+
+
 # ---- Breadcrumb encoding ------------------------------------------------- #
 
 @torch.no_grad()
 def encode_breadcrumb(
     world_model, render_scene, render_robot, render_act_dofs, cam,
     beacon, view_dist, planning_device, q0, gs, torch_mod,
-) -> torch.Tensor:
-    """Return the RAW latent z_raw of the goal view for accurate planning."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return raw and projected latents of the goal view."""
     render_robot.set_pos(
         torch_mod.tensor([[999.0, 999.0, -10.0]], device=gs.device, dtype=torch_mod.float32),
         zero_velocity=True,
@@ -542,8 +562,8 @@ def encode_breadcrumb(
     rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
     vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
     
-    z_raw, _ = world_model.encode(vis_t, None)
-    return z_raw.squeeze(0).detach()
+    z_raw, z_proj = world_model.encode(vis_t, None)
+    return z_raw.squeeze(0).detach(), z_proj.squeeze(0).detach()
 
 
 # ---- PPO execution ------------------------------------------------------- #
@@ -614,8 +634,7 @@ def export_video(stem, frames, stride, fps):
             append_images=pil_frames[1:], duration=duration, loop=0,
         )
 
-def draw_topdown_trajectory(out_path, obstacle_layout, beacon_layout, path_xy, breadcrumb_xy):
-    size = 900
+def compute_topdown_half_extent(obstacle_layout, path_xy, pad=0.3):
     max_ext = 0.5
     for obs in obstacle_layout.obstacles:
         max_ext = max(max_ext,
@@ -623,7 +642,11 @@ def draw_topdown_trajectory(out_path, obstacle_layout, beacon_layout, path_xy, b
                       abs(float(obs.pos[1])) + 0.5 * float(obs.size[1]))
     for xy in path_xy:
         max_ext = max(max_ext, abs(float(xy[0])), abs(float(xy[1])))
-    half = max_ext + 0.3
+    return max_ext + pad
+
+def draw_topdown_trajectory(out_path, obstacle_layout, beacon_layout, path_xy, breadcrumb_xy):
+    size = 900
+    half = compute_topdown_half_extent(obstacle_layout, path_xy)
 
     def w2c(x, y):
         s = (size - 1) / (2.0 * half)
@@ -662,6 +685,190 @@ def draw_topdown_trajectory(out_path, obstacle_layout, beacon_layout, path_xy, b
         draw.ellipse((bx - r, by - r, bx + r, by + r), fill=(255, 210, 40), outline=(0, 0, 0), width=2)
 
     img.save(out_path)
+
+def densify_path_xy(path_xy, step_m=0.04):
+    if not path_xy:
+        return []
+    dense = [np.asarray(path_xy[0], dtype=np.float32)]
+    for prev_xy, cur_xy in zip(path_xy, path_xy[1:]):
+        prev = np.asarray(prev_xy, dtype=np.float32)
+        cur = np.asarray(cur_xy, dtype=np.float32)
+        delta = cur - prev
+        dist = float(np.linalg.norm(delta))
+        if dist < 1e-6:
+            continue
+        n_steps = max(1, int(math.ceil(dist / step_m)))
+        for i in range(1, n_steps + 1):
+            alpha = float(i) / float(n_steps)
+            dense.append(prev + alpha * delta)
+    return dense
+
+def make_coverage_tracker(
+    obstacle_layout,
+    size=900,
+    coverage_sigma_m=0.12,
+    coverage_radius_m=0.30,
+    coverage_threshold=0.20,
+):
+    half = compute_topdown_half_extent(obstacle_layout, [])
+    meters_per_px = (2.0 * half) / float(size - 1)
+    area_per_px = meters_per_px * meters_per_px
+    scale = (size - 1) / (2.0 * half)
+
+    sigma_px = max(1.0, coverage_sigma_m / meters_per_px)
+    radius_px = max(1, int(math.ceil(coverage_radius_m / meters_per_px)))
+    grid = np.arange(-radius_px, radius_px + 1, dtype=np.float32)
+    yy, xx = np.meshgrid(grid, grid, indexing="ij")
+    dist_sq = xx * xx + yy * yy
+    kernel = np.exp(-0.5 * dist_sq / (sigma_px * sigma_px))
+    kernel[dist_sq > float(radius_px * radius_px)] = 0.0
+
+    return {
+        "size": int(size),
+        "half": float(half),
+        "scale": float(scale),
+        "area_per_px": float(area_per_px),
+        "coverage_sigma_m": float(coverage_sigma_m),
+        "coverage_radius_m": float(coverage_radius_m),
+        "coverage_threshold": float(coverage_threshold),
+        "radius_px": int(radius_px),
+        "kernel": kernel,
+        "coverage": np.zeros((size, size), dtype=np.float32),
+        "covered_px": 0,
+    }
+
+def stamp_coverage_tracker(tracker, xy):
+    size = int(tracker["size"])
+    half = float(tracker["half"])
+    scale = float(tracker["scale"])
+    radius_px = int(tracker["radius_px"])
+    kernel = tracker["kernel"]
+    threshold = float(tracker["coverage_threshold"])
+    coverage = tracker["coverage"]
+
+    cx_f = (float(xy[0]) + half) * scale
+    cy_f = (half - float(xy[1])) * scale
+    cx = int(round(cx_f))
+    cy = int(round(cy_f))
+    x0 = max(0, cx - radius_px)
+    x1 = min(size, cx + radius_px + 1)
+    y0 = max(0, cy - radius_px)
+    y1 = min(size, cy + radius_px + 1)
+    if x0 >= x1 or y0 >= y1:
+        return
+    kx0 = x0 - (cx - radius_px)
+    kx1 = kx0 + (x1 - x0)
+    ky0 = y0 - (cy - radius_px)
+    ky1 = ky0 + (y1 - y0)
+    prev = coverage[y0:y1, x0:x1]
+    prev_mask = prev >= threshold
+    updated = np.maximum(prev, kernel[ky0:ky1, kx0:kx1])
+    new_mask = updated >= threshold
+    tracker["covered_px"] += int(np.count_nonzero(new_mask & (~prev_mask)))
+    coverage[y0:y1, x0:x1] = updated
+
+def update_coverage_tracker(tracker, prev_xy, cur_xy):
+    segment = [cur_xy] if prev_xy is None else [prev_xy, cur_xy]
+    dense = densify_path_xy(segment)
+    if prev_xy is not None and dense:
+        dense = dense[1:]
+    for xy in dense:
+        stamp_coverage_tracker(tracker, xy)
+
+def coverage_tracker_metrics(tracker):
+    coverage = tracker["coverage"]
+    soft_coverage_area_m2 = float(tracker["covered_px"]) * float(tracker["area_per_px"])
+    return {
+        "coverage_sigma_m": float(tracker["coverage_sigma_m"]),
+        "coverage_radius_m": float(tracker["coverage_radius_m"]),
+        "coverage_threshold": float(tracker["coverage_threshold"]),
+        "soft_coverage_area_m2": soft_coverage_area_m2,
+        "soft_coverage_peak": float(coverage.max()) if coverage.size else 0.0,
+        "soft_coverage_mean": float(coverage.mean()) if coverage.size else 0.0,
+    }
+
+def render_coverage_tracker(
+    out_path,
+    tracker,
+    obstacle_layout,
+    beacon_layout,
+    path_xy,
+    breadcrumb_xy,
+):
+    size = int(tracker["size"])
+    half = float(tracker["half"])
+    scale = float(tracker["scale"])
+    coverage = tracker["coverage"]
+
+    def w2c(x, y):
+        return (x + half) * scale, (half - y) * scale
+
+    bg = np.full((size, size, 3), (250, 248, 242), dtype=np.float32)
+    alpha = np.clip(np.power(coverage, 0.75), 0.0, 1.0) * 0.82
+    heat_color = np.zeros_like(bg)
+    heat_color[..., 0] = 72.0
+    heat_color[..., 1] = 195.0
+    heat_color[..., 2] = 176.0
+    canvas = bg * (1.0 - alpha[..., None]) + heat_color * alpha[..., None]
+    img = Image.fromarray(np.clip(canvas, 0.0, 255.0).astype(np.uint8))
+    draw = ImageDraw.Draw(img)
+
+    for obs in obstacle_layout.obstacles:
+        hx, hy = 0.5 * float(obs.size[0]), 0.5 * float(obs.size[1])
+        x0, y0 = w2c(float(obs.pos[0]) - hx, float(obs.pos[1]) + hy)
+        x1, y1 = w2c(float(obs.pos[0]) + hx, float(obs.pos[1]) - hy)
+        draw.rectangle((x0, y0, x1, y1), fill=(88, 92, 101), outline=(58, 62, 70))
+
+    for b in beacon_layout.beacons:
+        hx, hy = 0.5 * float(b.size[0]), 0.5 * float(b.size[1])
+        x0, y0 = w2c(float(b.pos[0]) - hx, float(b.pos[1]) + hy)
+        x1, y1 = w2c(float(b.pos[0]) + hx, float(b.pos[1]) - hy)
+        c = tuple(int(max(0, min(1, v)) * 255) for v in b.color)
+        draw.rectangle((x0, y0, x1, y1), fill=c, outline=(0, 0, 0), width=2)
+
+    if len(path_xy) >= 2:
+        pts = [w2c(float(x), float(y)) for x, y in path_xy]
+        draw.line(pts, fill=(30, 110, 210), width=3)
+
+    if path_xy:
+        sx, sy = w2c(float(path_xy[0][0]), float(path_xy[0][1]))
+        ex, ey = w2c(float(path_xy[-1][0]), float(path_xy[-1][1]))
+        r = 8
+        draw.ellipse((sx - r, sy - r, sx + r, sy + r), fill=(40, 170, 90), outline=(0, 0, 0))
+        draw.ellipse((ex - r, ey - r, ex + r, ey + r), fill=(220, 50, 60), outline=(0, 0, 0))
+
+    if breadcrumb_xy:
+        bx, by = w2c(float(breadcrumb_xy[0]), float(breadcrumb_xy[1]))
+        r = 10
+        draw.ellipse((bx - r, by - r, bx + r, by + r), fill=(255, 210, 40), outline=(0, 0, 0), width=2)
+
+    img.save(out_path)
+
+def draw_topdown_coverage(
+    out_path,
+    obstacle_layout,
+    beacon_layout,
+    path_xy,
+    breadcrumb_xy,
+    coverage_sigma_m=0.12,
+    coverage_radius_m=0.30,
+    coverage_threshold=0.20,
+):
+    tracker = make_coverage_tracker(
+        obstacle_layout,
+        size=900,
+        coverage_sigma_m=coverage_sigma_m,
+        coverage_radius_m=coverage_radius_m,
+        coverage_threshold=coverage_threshold,
+    )
+    prev_xy = None
+    for xy in path_xy:
+        update_coverage_tracker(tracker, prev_xy, xy)
+        prev_xy = xy
+    render_coverage_tracker(
+        out_path, tracker, obstacle_layout, beacon_layout, path_xy, breadcrumb_xy,
+    )
+    return coverage_tracker_metrics(tracker)
 
 def beacon_claim_xy(beacon, wall_thickness, stand_off=0.03):
     normal = np.array(beacon.normal[:2], dtype=np.float32)
@@ -762,7 +969,7 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
-          f"iters={args.cem_iters}, K={args.mpc_execute}, "
+          f"iters={args.cem_iters}, K={args.mpc_execute}, Score={args.score_space}, "
           f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
           f"HistLen={args.history_len}")
 
@@ -778,6 +985,11 @@ def main():
     latent_history: List[torch.Tensor] = []
     terminate_reason = "max_steps"
     collision_count = 0
+    frame_substitution_count = 0
+    first_collision_step: int | None = None
+    min_goal_dist_m = float("inf")
+    coverage_tracker = make_coverage_tracker(obstacle_layout)
+    last_logged_coverage_area_m2 = 0.0
 
     try:
         import genesis as gs
@@ -799,12 +1011,18 @@ def main():
 
         z_breadcrumb = None
         if target_beacon is not None:
-            z_breadcrumb = encode_breadcrumb(
+            z_breadcrumb_raw, z_breadcrumb_proj = encode_breadcrumb(
                 world_model, ego_scene, ego_robot, ego_act_dofs, ego_cam,
                 target_beacon, args.breadcrumb_view_dist,
                 planning_device, q0, gs, torch,
             )
-            print(f"Goal latent encoded (z_raw): ||z_g||={float(z_breadcrumb.norm()):.3f}")
+            z_breadcrumb = select_score_latent(
+                z_breadcrumb_raw, z_breadcrumb_proj, args.score_space,
+            )
+            print(
+                f"Goal latents encoded: ||z_raw||={float(z_breadcrumb_raw.norm()):.3f} "
+                f"||z_proj||={float(z_breadcrumb_proj.norm()):.3f}"
+            )
 
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
@@ -819,6 +1037,7 @@ def main():
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
+            score_space=args.score_space,
             novelty_weight=args.novelty_weight,
             action_penalty_weight=args.action_penalty_weight,
         )
@@ -845,8 +1064,19 @@ def main():
         tp_frames_hwc.append(tp_frame)
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+        update_coverage_tracker(coverage_tracker, None, path_xy[-1])
         
-        latent_history.append(obs["z_raw"].squeeze(0).detach())
+        latent_history.append(
+            select_score_latent(obs["z_raw"], obs["z_proj"], args.score_space).squeeze(0).detach(),
+        )
+
+        if target_claim_xy is not None:
+            min_goal_dist_m = min(
+                min_goal_dist_m,
+                float(np.linalg.norm(
+                    np.asarray(obs["pos_np"][:2], dtype=np.float32) - target_claim_xy,
+                )),
+            )
 
         for step in range(args.steps):
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
@@ -883,9 +1113,15 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
+            if obs["frame_substituted"]:
+                frame_substitution_count += 1
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                latent_history.append(obs["z_raw"].squeeze(0).detach())
+                latent_history.append(
+                    select_score_latent(
+                        obs["z_raw"], obs["z_proj"], args.score_space,
+                    ).squeeze(0).detach(),
+                )
                 if len(latent_history) > args.history_len:
                     latent_history.pop(0)
 
@@ -899,7 +1135,9 @@ def main():
             tp_frames_hwc.append(tp_frame)
             combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
             cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
+            prev_xy = path_xy[-1]
             path_xy.append(cur_xy)
+            update_coverage_tracker(coverage_tracker, prev_xy, cur_xy)
 
             pos_xy_t = torch.from_numpy(
                 np.asarray(obs["pos_np"][:2], dtype=np.float32),
@@ -910,6 +1148,8 @@ def main():
             
             if collided:
                 collision_count += 1
+                if first_collision_step is None:
+                    first_collision_step = step
                 planner.reset()
                 plan_seq = None
 
@@ -923,6 +1163,7 @@ def main():
                 dist_claim = float(np.linalg.norm(
                     np.asarray(cur_xy, dtype=np.float32) - target_claim_xy,
                 ))
+                min_goal_dist_m = min(min_goal_dist_m, dist_claim)
                 frontness = float(np.dot(
                     np.asarray(cur_xy, dtype=np.float32) - np.array(target_beacon.pos[:2], dtype=np.float32),
                     np.array(target_beacon.normal[:2], dtype=np.float32),
@@ -936,11 +1177,15 @@ def main():
                     reached = True
 
                 if step % 20 == 0 or reached:
+                    cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
+                    cov_delta = cov_area - last_logged_coverage_area_m2
+                    last_logged_coverage_area_m2 = cov_area
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
                         f"cost={costs_log[-1]:.3f} d_goal={dist_claim:.2f}m "
-                        f"coll={collision_count}"
+                        f"coll={collision_count} cov={cov_area:.2f}m^2 "
+                        f"cov+={cov_delta:+.2f}"
                     )
 
             if reached:
@@ -960,6 +1205,23 @@ def main():
             pass
 
     elapsed = time.time() - t0
+    path_length_m = 0.0
+    for prev_xy, cur_xy in zip(path_xy, path_xy[1:]):
+        dx = float(cur_xy[0]) - float(prev_xy[0])
+        dy = float(cur_xy[1]) - float(prev_xy[1])
+        path_length_m += math.hypot(dx, dy)
+    min_goal_dist_out = None if math.isinf(min_goal_dist_m) else min_goal_dist_m
+    coverage_metrics = coverage_tracker_metrics(coverage_tracker) if path_xy else {}
+    if path_xy:
+        render_coverage_tracker(
+            str(out_dir / "coverage_map.png"),
+            coverage_tracker,
+            obstacle_layout, beacon_layout, path_xy, breadcrumb_xy,
+        )
+    soft_coverage_area_m2 = coverage_metrics.get("soft_coverage_area_m2")
+    soft_coverage_gain_per_m = None
+    if soft_coverage_area_m2 is not None and path_length_m > 1e-6:
+        soft_coverage_gain_per_m = soft_coverage_area_m2 / path_length_m
 
     summary = {
         "approach": "pure_world_model_terminal_cost",
@@ -970,6 +1232,12 @@ def main():
         "result": terminate_reason,
         "steps": len(cmds_log),
         "collisions": collision_count,
+        "first_collision_step": first_collision_step,
+        "frame_substitutions": frame_substitution_count,
+        "min_goal_dist_m": min_goal_dist_out,
+        "path_length_m": path_length_m,
+        "soft_coverage_area_m2": soft_coverage_area_m2,
+        "soft_coverage_gain_per_m": soft_coverage_gain_per_m,
         "elapsed_sec": elapsed,
         "planner": {
             "horizon": args.plan_horizon,
@@ -977,10 +1245,12 @@ def main():
             "cem_iters": args.cem_iters,
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
+            "score_space": args.score_space,
             "novelty_weight": args.novelty_weight,
             "action_penalty_weight": args.action_penalty_weight,
             "history_len": args.history_len,
         },
+        "coverage": coverage_metrics,
         "path_xy": path_xy,
         "commands": cmds_log,
         "costs": costs_log,
