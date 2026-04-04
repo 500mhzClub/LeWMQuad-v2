@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — score-space ablation + smoothness prior.
+"""Pure world-model maze inference — score-space ablation + persistent novelty.
 
 Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
 the world model directly without hand-cranked safety heuristics. The planner can
@@ -7,7 +7,8 @@ score trajectories in three spaces:
   - ``mixed``: current baseline, raw observation/goal history vs projected rollout
   - ``raw``: raw observation/goal history vs raw rollout
   - ``proj``: projected observation/goal history vs projected rollout
-Exploration is driven by Sequence Novelty, balanced by an L2 Action Penalty.
+Exploration is driven by per-step novelty against a persistent visited-state
+bank, balanced by an L2 Action Penalty.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -134,7 +135,7 @@ class PureCEMPlanner:
         self,
         z_start_raw: torch.Tensor,
         z_goal_score: torch.Tensor | None = None,
-        history_windows: torch.Tensor | None = None,
+        visited_bank: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
@@ -180,22 +181,20 @@ class PureCEMPlanner:
                 cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
                 costs += (1.0 - cos_sim)
 
-            # 2. Sequence novelty in the configured score space.
-            if history_windows is not None and self.novelty_weight > 0.0:
-                B, H, D = z_rollouts.shape
-                M = history_windows.shape[0]
+            # 2. Per-step novelty against a persistent visited-state bank.
+            if visited_bank is not None and self.novelty_weight > 0.0:
+                M = visited_bank.shape[0]
                 if M > 0:
-                    z_flat = z_rollouts.reshape(B, H * D)
-                    h_flat = history_windows.reshape(M, H * D)
-                    
-                    z_norm = F.normalize(z_flat, p=2, dim=-1)
-                    h_norm = F.normalize(h_flat, p=2, dim=-1)
-                    
-                    sim_matrix = torch.mm(z_norm, h_norm.transpose(0, 1))
+                    z_norm = F.normalize(z_rollouts, p=2, dim=-1)
+                    bank_norm = F.normalize(
+                        visited_bank.to(self.device, dtype=torch.float32),
+                        p=2, dim=-1,
+                    )
+                    sim_matrix = torch.einsum("bhd,md->bhm", z_norm, bank_norm)
                     max_sim = sim_matrix.max(dim=-1).values
-                    
-                    seq_novelty_dist = 1.0 - max_sim
-                    costs -= self.novelty_weight * seq_novelty_dist
+                    step_novelty = 1.0 - max_sim
+                    traj_novelty = step_novelty.mean(dim=-1)
+                    costs -= self.novelty_weight * traj_novelty
 
             # 3. Action Smoothness Penalty (L2)
             if self.action_penalty_weight > 0.0:
@@ -255,7 +254,10 @@ def parse_args() -> argparse.Namespace:
     
     p.add_argument("--novelty_weight", type=float, default=10.0)
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
-    p.add_argument("--history_len", type=int, default=100)
+    p.add_argument("--visited_bank_size", type=int, default=512,
+                   help="Persistent novelty-bank size. Uses reservoir sampling over all visited states.")
+    p.add_argument("--history_len", type=int, default=None,
+                   help="Deprecated alias for --visited_bank_size.")
     p.add_argument("--success_range", type=float, default=0.4)
     
     p.add_argument("--out_dir", type=str, default=None)
@@ -272,7 +274,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lookahead", type=float, default=0.3)
     p.add_argument("--breadcrumb_view_dist", type=float, default=0.5)
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.history_len is not None:
+        args.visited_bank_size = args.history_len
+    return args
 
 
 # ---- Model loading ------------------------------------------------------- #
@@ -517,6 +522,27 @@ def select_score_latent(
     if score_space == "proj":
         return z_proj
     return z_raw
+
+
+def update_reservoir_bank(
+    bank: list[torch.Tensor],
+    latent: torch.Tensor,
+    n_seen: int,
+    max_size: int,
+    rng: np.random.Generator,
+) -> int:
+    """Reservoir-sample visited latents so novelty memory spans the full run."""
+    latent = latent.detach().cpu()
+    n_seen += 1
+    if max_size <= 0:
+        return n_seen
+    if len(bank) < max_size:
+        bank.append(latent)
+        return n_seen
+    replace_idx = int(rng.integers(0, n_seen))
+    if replace_idx < max_size:
+        bank[replace_idx] = latent
+    return n_seen
 
 
 # ---- Breadcrumb encoding ------------------------------------------------- #
@@ -904,6 +930,7 @@ def main():
     planning_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    novelty_rng = np.random.default_rng(args.seed)
 
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
     camera_cfg = ego_camera_config_from_args(args)
@@ -971,7 +998,7 @@ def main():
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Score={args.score_space}, "
           f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
-          f"HistLen={args.history_len}")
+          f"Bank={args.visited_bank_size}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -982,7 +1009,8 @@ def main():
     path_xy: List[List[float]] = []
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
-    latent_history: List[torch.Tensor] = []
+    visited_bank: List[torch.Tensor] = []
+    visited_seen = 0
     terminate_reason = "max_steps"
     collision_count = 0
     frame_substitution_count = 0
@@ -1066,8 +1094,12 @@ def main():
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
         
-        latent_history.append(
-            select_score_latent(obs["z_raw"], obs["z_proj"], args.score_space).squeeze(0).detach(),
+        visited_seen = update_reservoir_bank(
+            visited_bank,
+            select_score_latent(obs["z_raw"], obs["z_proj"], args.score_space).squeeze(0),
+            visited_seen,
+            args.visited_bank_size,
+            novelty_rng,
         )
 
         if target_claim_xy is not None:
@@ -1082,15 +1114,11 @@ def main():
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
 
             if need_replan:
-                history_windows = None
-                if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
-                    H = args.plan_horizon
-                    windows = []
-                    for i in range(len(latent_history) - H + 1):
-                        windows.append(torch.stack(latent_history[i : i + H]))
-                    history_windows = torch.stack(windows).to(planning_device)
+                novelty_bank = None
+                if args.novelty_weight > 0.0 and visited_bank:
+                    novelty_bank = torch.stack(visited_bank).to(planning_device)
 
-                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb, history_windows)
+                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb, novelty_bank)
                 plan_step_idx = 0
                 costs_log.append(cost)
 
@@ -1117,13 +1145,15 @@ def main():
                 frame_substitution_count += 1
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                latent_history.append(
+                visited_seen = update_reservoir_bank(
+                    visited_bank,
                     select_score_latent(
                         obs["z_raw"], obs["z_proj"], args.score_space,
-                    ).squeeze(0).detach(),
+                    ).squeeze(0),
+                    visited_seen,
+                    args.visited_bank_size,
+                    novelty_rng,
                 )
-                if len(latent_history) > args.history_len:
-                    latent_history.pop(0)
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
@@ -1248,7 +1278,8 @@ def main():
             "score_space": args.score_space,
             "novelty_weight": args.novelty_weight,
             "action_penalty_weight": args.action_penalty_weight,
-            "history_len": args.history_len,
+            "visited_bank_size": args.visited_bank_size,
+            "visited_samples_seen": visited_seen,
         },
         "coverage": coverage_metrics,
         "path_xy": path_xy,

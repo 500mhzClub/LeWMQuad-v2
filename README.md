@@ -59,3 +59,61 @@ python scripts/demo_no_clipping.py
 # End-to-end data quality: runs mini rollout and counts clipped frames
 python scripts/demo_data_quality.py --ckpt <ppo_ckpt>
 ```
+
+## Inference Notes
+
+### Score-space ablation
+
+The inference script supports three score spaces:
+
+- `mixed`: raw observation / memory anchors with projected rollout predictions
+- `raw`: raw anchors with raw rollout predictions
+- `proj`: projected anchors with projected rollout predictions
+
+In short 400-step maze runs, `mixed` has been the strongest baseline so far.
+The likely reason is architectural:
+
+- Raw encoder states preserve more local place detail for anchors such as
+  breadcrumbs and visited-state memory.
+- Projected rollout latents are the space the predictor is actually trained to
+  match at the next step.
+- True `raw` scoring underperforms because raw rollout latents are not directly
+  supervised by the training loss.
+- True `proj` scoring underperforms because cosine geometry in projector space
+  is not guaranteed to be a good planning metric even if it is good for the
+  JEPA training objective.
+
+### Novelty failure mode
+
+The original novelty signal in `scripts/6_infer_pure_wm.py` used a sliding
+recent-history window and compared full `H`-step rollout windows after
+flattening them to a single vector. That caused three problems:
+
+- The planner forgot older regions once the fixed recent-history buffer rolled
+  over.
+- Whole-window cosine similarity was too blunt; small pose and gait changes
+  could make a familiar corridor look novel enough.
+- The agent had no persistent notion of "already explored area", so it could
+  return to old regions with little or no penalty.
+
+The current novelty implementation fixes this without adding oracle geometry or
+handwritten maze heuristics:
+
+- Visited states are stored in a persistent novelty bank using reservoir
+  sampling, so memory spans the full run instead of just the recent past.
+- Novelty is computed per predicted step against that bank, then averaged over
+  the rollout horizon. This is sharper than comparing a flattened `H*D` window.
+
+### Coverage diagnostics
+
+Exploration quality should not be judged by a discrete "visit every cell"
+target. The inference script now exports a soft coverage diagnostic instead:
+
+- `coverage_map.png` renders a continuous heatmap over the map showing where the
+  robot has meaningfully expanded into new space.
+- `summary.json` records `soft_coverage_area_m2` and
+  `soft_coverage_gain_per_m`.
+- Stdout logs also report live coverage growth as `cov=...m^2` and `cov+=...`.
+
+This is diagnostic only. It does not affect the planner or add any non-visual
+oracle input to the policy.
