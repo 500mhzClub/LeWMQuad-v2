@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — score-space ablation + persistent novelty.
+"""Pure world-model maze inference — score-space ablation + prototype novelty.
 
 Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
 the world model directly without hand-cranked safety heuristics. The planner can
@@ -7,8 +7,8 @@ score trajectories in three spaces:
   - ``mixed``: current baseline, raw observation/goal history vs projected rollout
   - ``raw``: raw observation/goal history vs raw rollout
   - ``proj``: projected observation/goal history vs projected rollout
-Exploration is driven by per-step novelty against a persistent visited-state
-bank, balanced by an L2 Action Penalty.
+Exploration is driven by per-step novelty against a diversity-preserving latent
+prototype bank, balanced by an L2 Action Penalty.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -89,6 +89,15 @@ class RobotSimConfig:
     decimation: int = 4
     collision_margin: float = 0.15
     min_z: float = 0.04
+
+
+@dataclass(frozen=True)
+class PrototypeBankUpdate:
+    n_seen: int
+    action: str
+    nearest_sim: float | None = None
+    filled_now: bool = False
+    replace_idx: int | None = None
 
 
 # ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
@@ -255,7 +264,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--novelty_weight", type=float, default=10.0)
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--visited_bank_size", type=int, default=512,
-                   help="Persistent novelty-bank size. Uses reservoir sampling over all visited states.")
+                   help="Prototype-bank capacity for novelty memory.")
+    p.add_argument("--prototype_sim_threshold", type=float, default=0.995,
+                   help="Add a new prototype only when cosine similarity to the nearest stored prototype is below this threshold.")
     p.add_argument("--history_len", type=int, default=None,
                    help="Deprecated alias for --visited_bank_size.")
     p.add_argument("--success_range", type=float, default=0.4)
@@ -524,27 +535,88 @@ def select_score_latent(
     return z_raw
 
 
-def update_reservoir_bank(
+def choose_redundant_prototype(
     bank: list[torch.Tensor],
+    hit_counts: list[int],
+) -> int:
+    """Replace the most redundant prototype, biased against high-hit entries."""
+    if len(bank) <= 1:
+        return 0
+
+    bank_tensor = torch.stack(bank)
+    sim_matrix = bank_tensor @ bank_tensor.T
+    sim_matrix.fill_diagonal_(-1.0)
+    redundancy = sim_matrix.max(dim=1).values
+
+    best_idx = 0
+    best_key = (-float("inf"), -float("inf"))
+    for idx, hits in enumerate(hit_counts):
+        key = (float(redundancy[idx].item()), -float(hits))
+        if key > best_key:
+            best_key = key
+            best_idx = idx
+    return best_idx
+
+
+def update_prototype_bank(
+    bank: list[torch.Tensor],
+    hit_counts: list[int],
     latent: torch.Tensor,
     n_seen: int,
     max_size: int,
-    rng: np.random.Generator,
-) -> tuple[int, bool]:
-    """Reservoir-sample visited latents so novelty memory spans the full run."""
-    latent = latent.detach().cpu()
+    sim_threshold: float,
+) -> PrototypeBankUpdate:
+    """Maintain a novelty bank of distinct latent prototypes."""
     n_seen += 1
     if max_size <= 0:
-        return n_seen, False
+        return PrototypeBankUpdate(n_seen=n_seen, action="off")
+
+    latent = latent.detach().cpu().float()
+    latent = F.normalize(latent.unsqueeze(0), p=2, dim=-1).squeeze(0)
     filled_before = len(bank) >= max_size
+
+    if not bank:
+        bank.append(latent)
+        hit_counts.append(1)
+        return PrototypeBankUpdate(
+            n_seen=n_seen,
+            action="inserted",
+            filled_now=(not filled_before and len(bank) >= max_size),
+        )
+
+    bank_tensor = torch.stack(bank)
+    sims = torch.mv(bank_tensor, latent)
+    nearest_sim, nearest_idx = sims.max(dim=0)
+    nearest_sim_f = float(nearest_sim.item())
+    nearest_idx_i = int(nearest_idx.item())
+
+    if nearest_sim_f >= sim_threshold:
+        hit_counts[nearest_idx_i] += 1
+        return PrototypeBankUpdate(
+            n_seen=n_seen,
+            action="hit",
+            nearest_sim=nearest_sim_f,
+        )
+
     if len(bank) < max_size:
         bank.append(latent)
-        filled_after = len(bank) >= max_size
-        return n_seen, (not filled_before and filled_after)
-    replace_idx = int(rng.integers(0, n_seen))
-    if replace_idx < max_size:
-        bank[replace_idx] = latent
-    return n_seen, False
+        hit_counts.append(1)
+        return PrototypeBankUpdate(
+            n_seen=n_seen,
+            action="inserted",
+            nearest_sim=nearest_sim_f,
+            filled_now=(not filled_before and len(bank) >= max_size),
+        )
+
+    replace_idx = choose_redundant_prototype(bank, hit_counts)
+    bank[replace_idx] = latent
+    hit_counts[replace_idx] = 1
+    return PrototypeBankUpdate(
+        n_seen=n_seen,
+        action="replaced",
+        nearest_sim=nearest_sim_f,
+        replace_idx=replace_idx,
+    )
 
 
 # ---- Breadcrumb encoding ------------------------------------------------- #
@@ -932,7 +1004,6 @@ def main():
     planning_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    novelty_rng = np.random.default_rng(args.seed)
 
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
     camera_cfg = ego_camera_config_from_args(args)
@@ -1000,7 +1071,7 @@ def main():
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Score={args.score_space}, "
           f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
-          f"Bank={args.visited_bank_size}")
+          f"Bank={args.visited_bank_size}, ProtoThresh={args.prototype_sim_threshold:.3f}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -1012,12 +1083,17 @@ def main():
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
     visited_bank: List[torch.Tensor] = []
+    visited_bank_hits: List[int] = []
     visited_seen = 0
+    visited_insertions = 0
+    visited_replacements = 0
+    visited_hits_total = 0
     terminate_reason = "max_steps"
     collision_count = 0
     frame_substitution_count = 0
     first_collision_step: int | None = None
     visited_bank_fill_step: int | None = None
+    visited_bank_replacement_step: int | None = None
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
@@ -1097,16 +1173,26 @@ def main():
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
         
-        visited_seen, bank_filled_now = update_reservoir_bank(
+        bank_update = update_prototype_bank(
             visited_bank,
+            visited_bank_hits,
             select_score_latent(obs["z_raw"], obs["z_proj"], args.score_space).squeeze(0),
             visited_seen,
             args.visited_bank_size,
-            novelty_rng,
+            args.prototype_sim_threshold,
         )
-        if bank_filled_now:
+        visited_seen = bank_update.n_seen
+        if bank_update.action == "inserted":
+            visited_insertions += 1
+        elif bank_update.action == "replaced":
+            visited_replacements += 1
+            if visited_bank_replacement_step is None:
+                visited_bank_replacement_step = 0
+        elif bank_update.action == "hit":
+            visited_hits_total += 1
+        if bank_update.filled_now:
             visited_bank_fill_step = 0
-            print("Visited bank full at initial observation; switching to reservoir replacement")
+            print("Prototype bank full at initial observation; novel states will replace redundant prototypes")
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1151,20 +1237,34 @@ def main():
                 frame_substitution_count += 1
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                visited_seen, bank_filled_now = update_reservoir_bank(
+                bank_update = update_prototype_bank(
                     visited_bank,
+                    visited_bank_hits,
                     select_score_latent(
                         obs["z_raw"], obs["z_proj"], args.score_space,
                     ).squeeze(0),
                     visited_seen,
                     args.visited_bank_size,
-                    novelty_rng,
+                    args.prototype_sim_threshold,
                 )
-                if bank_filled_now and visited_bank_fill_step is None:
+                visited_seen = bank_update.n_seen
+                if bank_update.action == "inserted":
+                    visited_insertions += 1
+                elif bank_update.action == "replaced":
+                    visited_replacements += 1
+                    if visited_bank_replacement_step is None:
+                        visited_bank_replacement_step = step
+                        print(
+                            f"Prototype bank replacement started at step {step:03d}; "
+                            "replacing redundant prototypes"
+                        )
+                elif bank_update.action == "hit":
+                    visited_hits_total += 1
+                if bank_update.filled_now and visited_bank_fill_step is None:
                     visited_bank_fill_step = step
                     print(
-                        f"Visited bank full at step {step:03d}; "
-                        "switching to reservoir replacement"
+                        f"Prototype bank full at step {step:03d}; "
+                        "novel states will replace redundant prototypes"
                     )
 
             tp_frame = render_third_person_frame(
@@ -1231,7 +1331,8 @@ def main():
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
                         f"cost={costs_log[-1]:.3f} d_goal={dist_claim:.2f}m "
                         f"coll={collision_count} cov={cov_area:.2f}m^2 "
-                        f"cov+={cov_delta:+.2f} bank={bank_status}"
+                        f"cov+={cov_delta:+.2f} proto={bank_status} "
+                        f"ins={visited_insertions} rep={visited_replacements}"
                     )
 
             if reached:
@@ -1294,9 +1395,15 @@ def main():
             "score_space": args.score_space,
             "novelty_weight": args.novelty_weight,
             "action_penalty_weight": args.action_penalty_weight,
+            "memory_type": "prototype_bank",
             "visited_bank_size": args.visited_bank_size,
+            "prototype_sim_threshold": args.prototype_sim_threshold,
             "visited_samples_seen": visited_seen,
+            "visited_insertions": visited_insertions,
+            "visited_replacements": visited_replacements,
+            "visited_hits": visited_hits_total,
             "visited_bank_fill_step": visited_bank_fill_step,
+            "visited_bank_replacement_step": visited_bank_replacement_step,
         },
         "coverage": coverage_metrics,
         "path_xy": path_xy,
