@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — projected-space scoring + smoothness prior.
+"""Pure world-model maze inference — Aligned Latents and Smoothness Prior.
 
-Implements the planning approach from Section 3.2 of the LeWM paper. The
-predictor rolls out from the current observation's ``z_raw`` state, while goal
-matching and novelty are scored in ``z_proj`` space where the JEPA loss is
-defined. Exploration is driven by stepwise memory novelty, balanced by an L2
-action penalty to encourage smooth, deliberate quadrupedal movement.
+Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
+strictly aligned z_raw latents for planning, memory, and goal tracking.
+Exploration is driven by Sequence Novelty, balanced by an L2 Action Penalty
+to encourage smooth, deliberate quadrupedal movement without safety heuristics.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -88,10 +87,10 @@ class RobotSimConfig:
     min_z: float = 0.04
 
 
-# ---- Pure CEM planner (z_raw rollout + z_proj scoring) ------------------- #
+# ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
 
 class PureCEMPlanner:
-    """CEM planner with raw-state rollout and projected-space scoring."""
+    """CEM planner operating strictly in z_raw space with an L2 action prior."""
 
     def __init__(
         self,
@@ -106,7 +105,6 @@ class PureCEMPlanner:
         min_std: torch.Tensor,
         device: torch.device,
         novelty_weight: float = 10.0,
-        bad_state_weight: float = 0.5,
         action_penalty_weight: float = 0.001,
     ):
         self.world_model = world_model
@@ -120,7 +118,6 @@ class PureCEMPlanner:
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
         self.novelty_weight = novelty_weight
-        self.bad_state_weight = bad_state_weight
         self.action_penalty_weight = action_penalty_weight
         self._warm_start: torch.Tensor | None = None
 
@@ -131,18 +128,17 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_proj: torch.Tensor | None = None,
-        history_latents_proj: torch.Tensor | None = None,
-        bad_latents_proj: torch.Tensor | None = None,
+        z_goal_raw: torch.Tensor | None = None,
+        history_windows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, float]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
         
         z_goal_batch = None
-        if z_goal_proj is not None:
-            if z_goal_proj.ndim == 1:
-                z_goal_proj = z_goal_proj.unsqueeze(0)
-            z_goal_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
+        if z_goal_raw is not None:
+            if z_goal_raw.ndim == 1:
+                z_goal_raw = z_goal_raw.unsqueeze(0)
+            z_goal_batch = z_goal_raw.to(self.device, dtype=torch.float32).expand(
                 self.n_candidates, -1,
             )
 
@@ -167,44 +163,34 @@ class PureCEMPlanner:
             )
             samples[0] = mean
 
-            # plan_rollout returns predicted latents in z_proj space.
+            # z_rollouts are raw latents predicted by the world model
             z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
-            z_norm = None
 
-            # 1. Terminal Goal Cost (z_proj space)
+            # 1. Terminal Goal Cost (Aligned z_raw space)
             if z_goal_batch is not None:
                 z_terminal = z_rollouts[:, -1, :]
                 cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
                 costs += (1.0 - cos_sim)
 
-            # 2. Stepwise memory novelty against visited projected states.
-            if history_latents_proj is not None and self.novelty_weight > 0.0:
+            # 2. Sequence Novelty (Aligned z_raw space)
+            if history_windows is not None and self.novelty_weight > 0.0:
                 B, H, D = z_rollouts.shape
-                memory = history_latents_proj.to(self.device, dtype=torch.float32)
-                M = memory.shape[0]
+                M = history_windows.shape[0]
                 if M > 0:
-                    z_norm = F.normalize(z_rollouts, p=2, dim=-1)
-                    h_norm = F.normalize(memory, p=2, dim=-1)
-                    sim_matrix = torch.einsum("bhd,md->bhm", z_norm, h_norm)
+                    z_flat = z_rollouts.reshape(B, H * D)
+                    h_flat = history_windows.reshape(M, H * D)
+                    
+                    z_norm = F.normalize(z_flat, p=2, dim=-1)
+                    h_norm = F.normalize(h_flat, p=2, dim=-1)
+                    
+                    sim_matrix = torch.mm(z_norm, h_norm.transpose(0, 1))
                     max_sim = sim_matrix.max(dim=-1).values
-                    step_novelty = 1.0 - max_sim
-                    traj_novelty = step_novelty.mean(dim=-1)
-                    costs -= self.novelty_weight * traj_novelty
+                    
+                    seq_novelty_dist = 1.0 - max_sim
+                    costs -= self.novelty_weight * seq_novelty_dist
 
-            # 3. Online repulsion from collision states.
-            if bad_latents_proj is not None and self.bad_state_weight > 0.0:
-                bad_memory = bad_latents_proj.to(self.device, dtype=torch.float32)
-                if bad_memory.shape[0] > 0:
-                    if z_norm is None:
-                        z_norm = F.normalize(z_rollouts, p=2, dim=-1)
-                    bad_norm = F.normalize(bad_memory, p=2, dim=-1)
-                    bad_sim = torch.einsum("bhd,md->bhm", z_norm, bad_norm)
-                    bad_match = bad_sim.max(dim=-1).values.clamp_min(0.0)
-                    bad_penalty = bad_match.mean(dim=-1)
-                    costs += self.bad_state_weight * bad_penalty
-
-            # 4. Action Smoothness Penalty (L2)
+            # 3. Action Smoothness Penalty (L2)
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -259,10 +245,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
     p.add_argument("--novelty_weight", type=float, default=10.0)
-    p.add_argument("--bad_state_weight", type=float, default=0.5)
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--history_len", type=int, default=100)
-    p.add_argument("--bad_state_len", type=int, default=256)
     p.add_argument("--success_range", type=float, default=0.4)
     
     p.add_argument("--out_dir", type=str, default=None)
@@ -515,23 +499,6 @@ def observe(
     }
 
 
-@torch.no_grad()
-def infer_substituted_latent(
-    world_model: LeWorldModel,
-    z_prev_raw: torch.Tensor,
-    cmd_executed: torch.Tensor,
-    planning_device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Advance the latent one step when perception falls back to a stale frame."""
-    z_prev_raw = z_prev_raw.to(planning_device, dtype=torch.float32)
-    if z_prev_raw.ndim == 1:
-        z_prev_raw = z_prev_raw.unsqueeze(0)
-    cmd_step = cmd_executed.to(planning_device, dtype=torch.float32).view(1, 1, -1)
-    z_next_raw = world_model.predictor.rollout(z_prev_raw, cmd_step)[:, -1, :]
-    z_next_proj = world_model.pred_projector(z_next_raw)
-    return z_next_raw.detach(), z_next_proj.detach()
-
-
 # ---- Breadcrumb encoding ------------------------------------------------- #
 
 @torch.no_grad()
@@ -539,7 +506,7 @@ def encode_breadcrumb(
     world_model, render_scene, render_robot, render_act_dofs, cam,
     beacon, view_dist, planning_device, q0, gs, torch_mod,
 ) -> torch.Tensor:
-    """Return the projected latent z_proj of the goal view for scoring."""
+    """Return the RAW latent z_raw of the goal view for accurate planning."""
     render_robot.set_pos(
         torch_mod.tensor([[999.0, 999.0, -10.0]], device=gs.device, dtype=torch_mod.float32),
         zero_velocity=True,
@@ -575,8 +542,8 @@ def encode_breadcrumb(
     rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
     vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
     
-    _, z_proj = world_model.encode(vis_t, None)
-    return z_proj.squeeze(0).detach()
+    z_raw, _ = world_model.encode(vis_t, None)
+    return z_raw.squeeze(0).detach()
 
 
 # ---- PPO execution ------------------------------------------------------- #
@@ -796,8 +763,8 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, "
-          f"Novelty={args.novelty_weight}, BadState={args.bad_state_weight}, "
-          f"ActionPen={args.action_penalty_weight}, HistLen={args.history_len}")
+          f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
+          f"HistLen={args.history_len}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -809,10 +776,8 @@ def main():
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
     latent_history: List[torch.Tensor] = []
-    bad_state_bank: List[torch.Tensor] = []
     terminate_reason = "max_steps"
     collision_count = 0
-    ego_frame_substitutions = 0
 
     try:
         import genesis as gs
@@ -839,7 +804,7 @@ def main():
                 target_beacon, args.breadcrumb_view_dist,
                 planning_device, q0, gs, torch,
             )
-            print(f"Goal latent encoded (z_proj): ||z_g||={float(z_breadcrumb.norm()):.3f}")
+            print(f"Goal latent encoded (z_raw): ||z_g||={float(z_breadcrumb.norm()):.3f}")
 
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
 
@@ -855,7 +820,6 @@ def main():
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
             novelty_weight=args.novelty_weight,
-            bad_state_weight=args.bad_state_weight,
             action_penalty_weight=args.action_penalty_weight,
         )
 
@@ -882,22 +846,21 @@ def main():
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         
-        latent_history.append(obs["z_proj"].squeeze(0).detach())
+        latent_history.append(obs["z_raw"].squeeze(0).detach())
 
         for step in range(args.steps):
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
 
             if need_replan:
-                history_latents_proj = None
-                bad_latents_proj = None
-                if args.novelty_weight > 0.0 and latent_history:
-                    history_latents_proj = torch.stack(latent_history).to(planning_device)
-                if args.bad_state_weight > 0.0 and bad_state_bank:
-                    bad_latents_proj = torch.stack(bad_state_bank).to(planning_device)
+                history_windows = None
+                if args.novelty_weight > 0.0 and len(latent_history) >= args.plan_horizon:
+                    H = args.plan_horizon
+                    windows = []
+                    for i in range(len(latent_history) - H + 1):
+                        windows.append(torch.stack(latent_history[i : i + H]))
+                    history_windows = torch.stack(windows).to(planning_device)
 
-                plan_seq, cost = planner.plan(
-                    obs["z_raw"], z_breadcrumb, history_latents_proj, bad_latents_proj,
-                )
+                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb, history_windows)
                 plan_step_idx = 0
                 costs_log.append(cost)
 
@@ -912,7 +875,6 @@ def main():
                 nominal_cmd.to(gs.device), sim_cfg, gs, torch,
             )
             prev_action = actions.detach().clone()
-            prev_z_raw = obs["z_raw"].detach()
 
             obs = observe(
                 physics_robot, physics_act_dofs,
@@ -921,17 +883,9 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
-            if obs["frame_substituted"]:
-                ego_frame_substitutions += 1
-                z_raw_pred, z_proj_pred = infer_substituted_latent(
-                    world_model, prev_z_raw, nominal_cmd, planning_device,
-                )
-                obs["z_raw"] = z_raw_pred
-                obs["z_proj"] = z_proj_pred
-            
             if not obs["frame_substituted"]:
                 last_clean_frame = obs["frame_hwc"].copy()
-                latent_history.append(obs["z_proj"].squeeze(0).detach())
+                latent_history.append(obs["z_raw"].squeeze(0).detach())
                 if len(latent_history) > args.history_len:
                     latent_history.pop(0)
 
@@ -956,9 +910,6 @@ def main():
             
             if collided:
                 collision_count += 1
-                bad_state_bank.append(obs["z_proj"].squeeze(0).detach())
-                if len(bad_state_bank) > args.bad_state_len:
-                    bad_state_bank.pop(0)
                 planner.reset()
                 plan_seq = None
 
@@ -1020,7 +971,6 @@ def main():
         "steps": len(cmds_log),
         "collisions": collision_count,
         "elapsed_sec": elapsed,
-        "ego_frame_substitutions": ego_frame_substitutions,
         "planner": {
             "horizon": args.plan_horizon,
             "candidates": args.n_candidates,
@@ -1028,10 +978,8 @@ def main():
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
             "novelty_weight": args.novelty_weight,
-            "bad_state_weight": args.bad_state_weight,
             "action_penalty_weight": args.action_penalty_weight,
             "history_len": args.history_len,
-            "bad_state_len": args.bad_state_len,
         },
         "path_xy": path_xy,
         "commands": cmds_log,
