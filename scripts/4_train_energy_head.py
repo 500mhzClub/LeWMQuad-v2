@@ -42,6 +42,7 @@ from lewm.models import (
     LeWorldModel,
     LatentEnergyHead,
     GoalEnergyHead,
+    ProgressEnergyHead,
     ExplorationBonus,
     TrajectoryScorer,
     composite_safety_target,
@@ -69,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patch_size", type=int, default=None)
     p.add_argument("--use_proprio", action="store_true")
     # Shared
-    p.add_argument("--out_dir", type=str, default="energy_head_checkpoints")
-    p.add_argument("--log_dir", type=str, default="energy_head_logs")
+    p.add_argument("--out_dir", type=str, default="energy_head_checkpoints_keyframe_exec")
+    p.add_argument("--log_dir", type=str, default="energy_head_logs_keyframe_exec")
     p.add_argument("--cache_dir", type=str, default=None,
                    help="Directory for cached latents. Defaults to <out_dir>/latent_cache_v2.")
     p.add_argument("--extract_only", action="store_true",
@@ -104,6 +105,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--goal_lr", type=float, default=3e-4)
     p.add_argument("--goal_batch_size", type=int, default=4096)
     p.add_argument("--beacon_clip", type=float, default=5.0)
+    # Progress head
+    p.add_argument("--skip_progress", action="store_true",
+                   help="Skip ProgressEnergyHead training.")
+    p.add_argument("--progress_epochs", type=int, default=5)
+    p.add_argument("--progress_lr", type=float, default=3e-4)
+    p.add_argument("--progress_batch_size", type=int, default=256,
+                   help="Sequence micro-batch size for progress training.")
+    p.add_argument("--progress_seq_len", type=int, default=4,
+                   help="Sequence length for progress-head training.")
+    p.add_argument("--progress_visible_bonus", type=float, default=0.35,
+                   help="Target progress bonus when the target beacon becomes newly visible.")
     # Exploration bonus
     p.add_argument("--skip_exploration", action="store_true",
                    help="Skip ExplorationBonus (RND) training.")
@@ -112,6 +124,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exploration_feature_dim", type=int, default=128)
     # TrajectoryScorer weights
     p.add_argument("--goal_weight", type=float, default=1.0)
+    p.add_argument("--progress_weight", type=float, default=1.0)
     p.add_argument("--exploration_weight", type=float, default=0.1)
     p.add_argument("--no_progress", action="store_true",
                    help="Disable animated tqdm progress bars and emit plain logs only.")
@@ -348,6 +361,95 @@ def load_cached_latents(cache_dir: str):
     n_contact = (st > 0.9).sum().item()
     print(f"  High-energy samples (>0.9): {n_contact:,} ({100*n_contact/len(st):.1f}%)")
     return z, st, bid, br
+
+
+def build_goal_latent_pools(
+    z_all: torch.Tensor,
+    beacon_identity: torch.Tensor,
+    beacon_range: torch.Tensor,
+    beacon_clip: float,
+) -> dict[int, torch.Tensor]:
+    """Collect close-range goal examples for each beacon identity."""
+    pools: dict[int, list[int]] = {}
+    close_thresh = max(0.75, 0.35 * float(beacon_clip))
+    for idx in range(len(z_all)):
+        bid = int(beacon_identity[idx].item())
+        br = float(beacon_range[idx].item())
+        if bid < 0 or br >= close_thresh:
+            continue
+        pools.setdefault(bid, []).append(idx)
+
+    if not pools:
+        for idx in range(len(z_all)):
+            bid = int(beacon_identity[idx].item())
+            br = float(beacon_range[idx].item())
+            if bid < 0 or br >= float(beacon_clip) * 2.0:
+                continue
+            pools.setdefault(bid, []).append(idx)
+
+    goal_pools = {
+        bid: z_all[torch.tensor(indices, dtype=torch.long)]
+        for bid, indices in pools.items()
+        if indices
+    }
+    return goal_pools
+
+
+def sample_progress_batch(
+    z_now: torch.Tensor,
+    z_future: torch.Tensor,
+    bid_now: torch.Tensor,
+    br_now: torch.Tensor,
+    bid_future: torch.Tensor,
+    br_future: torch.Tensor,
+    goal_pools: dict[int, torch.Tensor],
+    beacon_clip: float,
+    visible_bonus: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Construct goal latents and scalar progress targets for one minibatch."""
+    valid_ids = list(goal_pools.keys())
+    if not valid_ids:
+        raise ValueError("No goal pools available for progress training.")
+
+    n_pairs = z_now.shape[0]
+    device = z_now.device
+    dtype = z_now.dtype
+    z_goal = torch.empty_like(z_now)
+    targets = torch.zeros(n_pairs, device=device, dtype=dtype)
+
+    for idx in range(n_pairs):
+        cur_bid = int(bid_now[idx].item())
+        nxt_bid = int(bid_future[idx].item())
+        cur_visible = cur_bid >= 0 and float(br_now[idx].item()) < beacon_clip * 2.0
+        nxt_visible = nxt_bid >= 0 and float(br_future[idx].item()) < beacon_clip * 2.0
+
+        positive_ids: list[int] = []
+        if cur_visible:
+            positive_ids.append(cur_bid)
+        if nxt_visible and nxt_bid not in positive_ids:
+            positive_ids.append(nxt_bid)
+
+        choose_positive = positive_ids and torch.rand((), device=device).item() < 0.6
+        if choose_positive:
+            goal_id = positive_ids[int(torch.randint(len(positive_ids), (1,), device=device).item())]
+        else:
+            goal_id = valid_ids[int(torch.randint(len(valid_ids), (1,), device=device).item())]
+
+        pool = goal_pools[goal_id]
+        pool_idx = int(torch.randint(len(pool), (1,), device=device).item())
+        z_goal[idx] = pool[pool_idx].to(device=device, dtype=dtype)
+
+        progress = 0.0
+        cur_match = cur_visible and cur_bid == goal_id
+        nxt_match = nxt_visible and nxt_bid == goal_id
+        if cur_match and nxt_match:
+            delta = (float(br_now[idx].item()) - float(br_future[idx].item())) / max(1e-6, beacon_clip)
+            progress = max(0.0, min(1.0, delta))
+        elif (not cur_match) and nxt_match:
+            progress = float(visible_bonus)
+        targets[idx] = progress
+
+    return z_goal, targets
 
 
 # --------------------------------------------------------------------- #
@@ -606,12 +708,154 @@ def train_goal_head(args, z_all, beacon_identity, beacon_range, device):
 
 
 # --------------------------------------------------------------------- #
-# Phase 4: Train ExplorationBonus (RND)
+# Phase 4: Train ProgressEnergyHead
+# --------------------------------------------------------------------- #
+
+def train_progress_head(args, goal_pools, device):
+    print("\n" + "=" * 60)
+    print("Phase 4: Training ProgressEnergyHead (short-horizon goal progress)")
+    print("=" * 60)
+
+    if not goal_pools:
+        print("  Skipping: no goal pools with visible beacons were found.")
+        return None
+
+    encoder = load_frozen_encoder(args, device)
+    dataset = StreamingJEPADataset(
+        data_dir=args.data_dir,
+        seq_len=max(2, args.progress_seq_len),
+        batch_size=args.progress_batch_size,
+        require_no_done=False,
+        require_no_collision=False,
+        num_workers=12,
+        load_labels=True,
+    )
+    dataloader = DataLoader(
+        dataset, batch_size=None, num_workers=12,
+        pin_memory=True, prefetch_factor=2,
+    )
+
+    head = ProgressEnergyHead(
+        latent_dim=args.latent_dim,
+        dropout=args.dropout,
+    ).to(device)
+    head = torch.compile(head)
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(
+        head.parameters(), lr=args.progress_lr, weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.progress_epochs)
+
+    csv_path = os.path.join(args.log_dir, "progress_head_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow(["step", "epoch", "loss", "mean_bonus", "mean_target", "lr"])
+
+    global_step = 0
+    for epoch in range(args.progress_epochs):
+        head.train()
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+
+        with make_progress(args, dataloader, desc=f"  Progress {epoch + 1}/{args.progress_epochs}") as pbar:
+            for batch in pbar:
+                vision, proprio, _cmds, _dones, _collisions, labels = batch
+                if "beacon_identity" not in labels or "beacon_range" not in labels:
+                    continue
+
+                vision = vision.to(device, non_blocking=True).float().div_(255.0)
+                proprio = proprio.to(device, non_blocking=True)
+                beacon_identity = labels["beacon_identity"].to(device, non_blocking=True).long()
+                beacon_range = labels["beacon_range"].to(device, non_blocking=True).float()
+
+                with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
+                    _, z_proj = encoder.encode_seq(vision, proprio)
+                z_proj = z_proj.float()
+
+                z_now = z_proj[:, :-1, :].reshape(-1, z_proj.shape[-1])
+                z_future = z_proj[:, 1:, :].reshape(-1, z_proj.shape[-1])
+                bid_now = beacon_identity[:, :-1].reshape(-1)
+                bid_future = beacon_identity[:, 1:].reshape(-1)
+                br_now = beacon_range[:, :-1].reshape(-1)
+                br_future = beacon_range[:, 1:].reshape(-1)
+
+                try:
+                    z_goal, target = sample_progress_batch(
+                        z_now,
+                        z_future,
+                        bid_now,
+                        br_now,
+                        bid_future,
+                        br_future,
+                        goal_pools,
+                        beacon_clip=args.beacon_clip,
+                        visible_bonus=args.progress_visible_bonus,
+                    )
+                except ValueError:
+                    continue
+
+                optimizer.zero_grad(set_to_none=True)
+                pred = head(z_now, z_future, z_goal)
+                loss = nn.functional.mse_loss(pred, target)
+                loss.backward()
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    head.parameters(), max_norm=args.grad_clip,
+                ).item()
+                if not torch.isfinite(loss) or not math.isfinite(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                optimizer.step()
+                global_step += 1
+                loss_val = loss.item()
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step, epoch + 1, f"{loss_val:.6f}",
+                        f"{pred.detach().mean().item():.4f}",
+                        f"{target.detach().mean().item():.4f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        bonus=f"{pred.detach().mean().item():.3f}",
+                        target=f"{target.detach().mean().item():.3f}",
+                    )
+
+                if global_step % args.save_every == 0:
+                    ckpt_path = os.path.join(args.out_dir, f"progress_step_{global_step}.pt")
+                    torch.save({"head_state_dict": head.state_dict(), "step": global_step}, ckpt_path)
+                    progress_write(f"    Saved: {ckpt_path}", pbar)
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.4f} | time={time.time() - t0:.0f}s")
+
+        torch.save(
+            {"head_state_dict": head.state_dict(), "step": global_step, "epoch": epoch},
+            os.path.join(args.out_dir, f"progress_epoch_{epoch + 1}.pt"),
+        )
+
+    print("  Progress head training complete.")
+    del encoder
+    torch.cuda.empty_cache()
+    return head
+
+
+# --------------------------------------------------------------------- #
+# Phase 5: Train ExplorationBonus (RND)
 # --------------------------------------------------------------------- #
 
 def train_exploration(args, z_all, device):
     print("\n" + "=" * 60)
-    print("Phase 4: Training ExplorationBonus (RND)")
+    print("Phase 5: Training ExplorationBonus (RND)")
     print("=" * 60)
 
     dataset = TensorDataset(z_all)
@@ -700,7 +944,10 @@ def train(args):
               f"contact_clearance={args.contact_clearance}m")
     else:
         print(f"  w_safety={args.w_safety}, w_mobility={args.w_mobility}")
-    print(f"Goal weight: {args.goal_weight}, Exploration weight: {args.exploration_weight}")
+    print(
+        f"Goal weight: {args.goal_weight}, Progress weight: {args.progress_weight}, "
+        f"Exploration weight: {args.exploration_weight}"
+    )
 
     # Phase 1: extract (or reuse cache)
     cache_dir = extract_latents(args, device)
@@ -719,7 +966,13 @@ def train(args):
     if not args.skip_goal:
         goal_head = train_goal_head(args, z_all, beacon_id, beacon_range, device)
 
-    # Phase 4: exploration bonus
+    # Phase 4: progress head
+    progress_head = None
+    if not args.skip_progress:
+        goal_pools = build_goal_latent_pools(z_all, beacon_id, beacon_range, args.beacon_clip)
+        progress_head = train_progress_head(args, goal_pools, device)
+
+    # Phase 5: exploration bonus
     exploration = None
     if not args.skip_exploration:
         exploration = train_exploration(args, z_all, device)
@@ -729,8 +982,10 @@ def train(args):
     scorer_data = {
         "safety_head": safety_head.state_dict(),
         "goal_head": goal_head.state_dict() if goal_head is not None else None,
+        "progress_head": progress_head.state_dict() if progress_head is not None else None,
         "exploration": exploration.state_dict() if exploration is not None else None,
         "goal_weight": args.goal_weight,
+        "progress_weight": args.progress_weight,
         "exploration_weight": args.exploration_weight,
         "latent_dim": args.latent_dim,
         "hidden_dim": args.hidden_dim,

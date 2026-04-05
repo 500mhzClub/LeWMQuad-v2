@@ -44,10 +44,18 @@ python scripts/1_physics_rollout.py --ckpt <ppo_ckpt> --steps 1000 --chunks 5
 python scripts/2_visual_renderer.py --raw_dir jepa_raw_data --out_dir jepa_final_dataset
 
 # 3. Train LeWorldModel
-python scripts/3_train_lewm.py --data_dir jepa_final_dataset --sigreg_lambda 0.09
+python scripts/3_train_lewm.py \
+  --data_dir jepa_final_dataset \
+  --sigreg_lambda 0.09 \
+  --out_dir lewm_checkpoints_keyframe_exec \
+  --log_dir lewm_logs_keyframe_exec
 
 # 4. Train energy head (optional, for planning)
-python scripts/4_train_energy_head.py --data_dir jepa_final_dataset --checkpoint lewm_checkpoints/latest.pt
+python scripts/4_train_energy_head.py \
+  --data_dir jepa_final_dataset \
+  --checkpoint lewm_checkpoints_keyframe_exec/latest.pt \
+  --out_dir energy_head_checkpoints_keyframe_exec \
+  --log_dir energy_head_logs_keyframe_exec
 ```
 
 ## Validation scripts

@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--resume_from", type=str, default=None)
-    p.add_argument("--out_dir", type=str, default="lewm_checkpoints")
-    p.add_argument("--log_dir", type=str, default="lewm_logs")
+    p.add_argument("--out_dir", type=str, default="lewm_checkpoints_keyframe_exec")
+    p.add_argument("--log_dir", type=str, default="lewm_logs_keyframe_exec")
     # LeWM-specific hypers
     p.add_argument("--sigreg_lambda", type=float, default=0.09,
                     help="Weight λ for SIGReg regularisation (only tunable hyper).")

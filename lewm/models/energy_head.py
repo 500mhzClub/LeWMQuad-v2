@@ -50,6 +50,53 @@ class GoalEnergyHead(nn.Module):
         return per_step.sum(dim=-1)                   # (B,)
 
 
+class ProgressEnergyHead(nn.Module):
+    """Predicts whether a short transition makes progress toward a goal latent.
+
+    Inputs are the current latent, a future/predicted latent, and a goal latent.
+    The output is a bounded progress bonus in ``[0, 1]`` where larger is better.
+    """
+
+    def __init__(self, latent_dim: int = 192, dropout: float = 0.0):
+        super().__init__()
+        in_dim = latent_dim * 6
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 1024), nn.LayerNorm(1024), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(1024, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(512, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(
+        self,
+        z_now: torch.Tensor,
+        z_future: torch.Tensor,
+        z_goal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return progress bonus in ``[0, 1]`` for each sample."""
+        x = torch.cat([
+            z_now,
+            z_future,
+            z_goal,
+            z_future - z_now,
+            z_goal - z_now,
+            z_goal - z_future,
+        ], dim=-1)
+        return self.net(x).squeeze(-1)
+
+    def score_trajectory(
+        self,
+        z_seq: torch.Tensor,
+        z_now: torch.Tensor,
+        z_goal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return terminal progress bonus for each trajectory."""
+        if z_seq.dim() != 3:
+            raise ValueError(f"Expected z_seq shape (B, H, D), got {tuple(z_seq.shape)}")
+        z_terminal = z_seq[:, -1, :]
+        return self.forward(z_now, z_terminal, z_goal)
+
+
 class LatentEnergyHead(nn.Module):
     """Maps a single latent to a scalar energy for trajectory scoring.
 
@@ -366,21 +413,26 @@ class TrajectoryScorer(nn.Module):
         self,
         safety_head: LatentEnergyHead,
         goal_head: GoalEnergyHead | None = None,
+        progress_head: ProgressEnergyHead | None = None,
         exploration: ExplorationBonus | None = None,
         goal_weight: float = 1.0,
+        progress_weight: float = 0.0,
         exploration_weight: float = 0.1,
     ):
         super().__init__()
         self.safety_head = safety_head
         self.goal_head = goal_head
+        self.progress_head = progress_head
         self.exploration = exploration
         self.goal_weight = goal_weight
+        self.progress_weight = progress_weight
         self.exploration_weight = exploration_weight
 
     def score(
         self,
         z_seq: torch.Tensor,
         z_goal: torch.Tensor | None = None,
+        z_now: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Score candidate trajectories.
 
@@ -395,6 +447,11 @@ class TrajectoryScorer(nn.Module):
 
         if self.goal_head is not None and z_goal is not None:
             cost = cost + self.goal_weight * self.goal_head.score_trajectory(z_seq, z_goal)
+
+        if self.progress_head is not None and z_goal is not None and z_now is not None:
+            cost = cost - self.progress_weight * self.progress_head.score_trajectory(
+                z_seq, z_now, z_goal,
+            )
 
         if self.exploration is not None:
             B, H, D = z_seq.shape

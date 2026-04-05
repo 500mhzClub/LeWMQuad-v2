@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — score-space ablation + prototype novelty.
+"""Pure world-model maze inference with keyframe routing and learned progress.
 
 Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
 the world model directly without hand-cranked safety heuristics. The planner can
@@ -7,8 +7,11 @@ score trajectories in three spaces:
   - ``mixed``: current baseline, raw observation/goal history vs projected rollout
   - ``raw``: raw observation/goal history vs raw rollout
   - ``proj``: projected observation/goal history vs projected rollout
-Exploration is driven by per-step novelty against a diversity-preserving latent
-prototype bank, balanced by an L2 Action Penalty.
+Exploration is driven by a persistent novelty bank and an immutable keyframe
+graph built from onboard-valid signals. The MPC stays short-horizon and uses
+rollout progress, latent-density frontier bonuses, optional learned safety /
+progress heads, and short-hop route following. Simulator geometry is kept for
+offline metrics only; it is not used for action selection.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -18,6 +21,7 @@ python3 scripts/6_infer_pure_wm.py \
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import os
@@ -52,7 +56,13 @@ from lewm.checkpoint_utils import clean_state_dict, load_ppo_checkpoint
 from lewm.genesis_utils import init_genesis_once, to_numpy
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import generate_enclosed_maze
-from lewm.models import ActorCritic, LeWorldModel
+from lewm.models import (
+    ActorCritic,
+    GoalEnergyHead,
+    LatentEnergyHead,
+    LeWorldModel,
+    ProgressEnergyHead,
+)
 from lewm.obstacle_utils import add_obstacles_to_scene, detect_collisions
 
 torch.backends.cudnn.benchmark = True
@@ -101,6 +111,28 @@ class PrototypeBankUpdate:
     prototype_idx: int | None = None
 
 
+@dataclass
+class KeyframeNode:
+    idx: int
+    score_latent: torch.Tensor
+    proj_latent: torch.Tensor
+    step: int
+    last_seen_step: int
+    visit_count: int
+    odom_xy: tuple[float, float]
+    yaw_rad: float
+
+
+@dataclass
+class PlannerHeads:
+    safety_head: LatentEnergyHead | None = None
+    goal_head: GoalEnergyHead | None = None
+    progress_head: ProgressEnergyHead | None = None
+    goal_weight: float = 0.0
+    progress_weight: float = 0.0
+    safety_weight: float = 1.0
+
+
 # ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
 
 class PureCEMPlanner:
@@ -119,7 +151,11 @@ class PureCEMPlanner:
         min_std: torch.Tensor,
         device: torch.device,
         score_space: str = "mixed",
-        novelty_weight: float = 10.0,
+        frontier_weight: float = 10.0,
+        frontier_knn: int = 8,
+        goal_progress_weight: float = 8.0,
+        route_progress_weight: float = 7.0,
+        displacement_weight: float = 2.5,
         action_penalty_weight: float = 0.001,
     ):
         self.world_model = world_model
@@ -133,7 +169,11 @@ class PureCEMPlanner:
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
         self.score_space = score_space
-        self.novelty_weight = novelty_weight
+        self.frontier_weight = frontier_weight
+        self.frontier_knn = max(1, int(frontier_knn))
+        self.goal_progress_weight = goal_progress_weight
+        self.route_progress_weight = route_progress_weight
+        self.displacement_weight = displacement_weight
         self.action_penalty_weight = action_penalty_weight
         self._warm_start: torch.Tensor | None = None
 
@@ -144,17 +184,39 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_score: torch.Tensor | None = None,
+        z_start_score: torch.Tensor,
+        z_start_proj: torch.Tensor,
         visited_bank: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, float]:
+        z_goal_score: torch.Tensor | None = None,
+        z_goal_proj: torch.Tensor | None = None,
+        z_route_score: torch.Tensor | None = None,
+        mode: str = "search",
+        heads: PlannerHeads | None = None,
+    ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         z0_batch = z0.expand(self.n_candidates, -1)
-        
+        z_start_score = z_start_score.to(self.device, dtype=torch.float32).view(1, -1)
+        z_start_proj = z_start_proj.to(self.device, dtype=torch.float32).view(1, -1)
+
         z_goal_batch = None
         if z_goal_score is not None:
             if z_goal_score.ndim == 1:
                 z_goal_score = z_goal_score.unsqueeze(0)
             z_goal_batch = z_goal_score.to(self.device, dtype=torch.float32).expand(
+                self.n_candidates, -1,
+            )
+        z_goal_proj_batch = None
+        if z_goal_proj is not None:
+            if z_goal_proj.ndim == 1:
+                z_goal_proj = z_goal_proj.unsqueeze(0)
+            z_goal_proj_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
+                self.n_candidates, -1,
+            )
+        z_route_batch = None
+        if z_route_score is not None:
+            if z_route_score.ndim == 1:
+                z_route_score = z_route_score.unsqueeze(0)
+            z_route_batch = z_route_score.to(self.device, dtype=torch.float32).expand(
                 self.n_candidates, -1,
             )
 
@@ -167,6 +229,21 @@ class PureCEMPlanner:
 
         best_seq = mean.clone()
         best_cost = float("inf")
+        best_metrics: dict[str, float] = {}
+        goal_sim_now = None
+        if z_goal_batch is not None:
+            goal_sim_now = F.cosine_similarity(
+                F.normalize(z_start_score, p=2, dim=-1),
+                F.normalize(z_goal_batch[:1], p=2, dim=-1),
+                dim=-1,
+            ).item()
+        route_sim_now = None
+        if z_route_batch is not None:
+            route_sim_now = F.cosine_similarity(
+                F.normalize(z_start_score, p=2, dim=-1),
+                F.normalize(z_route_batch[:1], p=2, dim=-1),
+                dim=-1,
+            ).item()
 
         for _ in range(self.cem_iters):
             noise = torch.randn(
@@ -179,42 +256,94 @@ class PureCEMPlanner:
             )
             samples[0] = mean
 
+            z_rollouts_proj = self.world_model.plan_rollout(z0_batch, samples)
             if self.score_space == "raw":
-                z_rollouts = self.world_model.plan_rollout_raw(z0_batch, samples)
+                z_rollouts_score = self.world_model.plan_rollout_raw(z0_batch, samples)
             else:
-                z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
+                z_rollouts_score = z_rollouts_proj
             costs = torch.zeros(self.n_candidates, device=self.device)
+            metrics: dict[str, torch.Tensor] = {}
 
-            # 1. Terminal goal cost in the configured score space.
-            if z_goal_batch is not None:
-                z_terminal = z_rollouts[:, -1, :]
-                cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
-                costs += (1.0 - cos_sim)
+            if heads is not None and heads.safety_head is not None:
+                safety_cost = heads.safety_weight * heads.safety_head.score_trajectory(z_rollouts_proj)
+                costs += safety_cost
+                metrics["safety_cost"] = safety_cost
 
-            # 2. Per-step novelty against a persistent visited-state bank.
-            if visited_bank is not None and self.novelty_weight > 0.0:
+            if heads is not None and heads.goal_head is not None and z_goal_proj_batch is not None:
+                goal_energy = heads.goal_weight * heads.goal_head.score_trajectory(
+                    z_rollouts_proj, z_goal_proj_batch,
+                )
+                costs += goal_energy
+                metrics["goal_energy"] = goal_energy
+
+            if z_goal_batch is not None and goal_sim_now is not None:
+                z_terminal = z_rollouts_score[:, -1, :]
+                cos_sim = F.cosine_similarity(
+                    F.normalize(z_terminal, p=2, dim=-1),
+                    F.normalize(z_goal_batch, p=2, dim=-1),
+                    dim=-1,
+                )
+                goal_progress = (cos_sim - goal_sim_now).clamp_min(0.0)
+                costs -= self.goal_progress_weight * goal_progress
+                metrics["goal_progress"] = goal_progress
+
+            if heads is not None and heads.progress_head is not None and z_goal_proj_batch is not None:
+                progress_bonus = heads.progress_head.score_trajectory(
+                    z_rollouts_proj,
+                    z_start_proj.expand(self.n_candidates, -1),
+                    z_goal_proj_batch,
+                )
+                costs -= heads.progress_weight * progress_bonus
+                metrics["learned_progress"] = progress_bonus
+
+            if z_route_batch is not None and route_sim_now is not None:
+                z_terminal = z_rollouts_score[:, -1, :]
+                route_sim = F.cosine_similarity(
+                    F.normalize(z_terminal, p=2, dim=-1),
+                    F.normalize(z_route_batch, p=2, dim=-1),
+                    dim=-1,
+                )
+                route_progress = (route_sim - route_sim_now).clamp_min(0.0)
+                costs -= self.route_progress_weight * route_progress
+                metrics["route_progress"] = route_progress
+
+            if visited_bank is not None and self.frontier_weight > 0.0:
                 M = visited_bank.shape[0]
                 if M > 0:
-                    z_norm = F.normalize(z_rollouts, p=2, dim=-1)
+                    z_norm = F.normalize(z_rollouts_score, p=2, dim=-1)
                     bank_norm = F.normalize(
                         visited_bank.to(self.device, dtype=torch.float32),
                         p=2, dim=-1,
                     )
                     sim_matrix = torch.einsum("bhd,md->bhm", z_norm, bank_norm)
-                    max_sim = sim_matrix.max(dim=-1).values
-                    step_novelty = 1.0 - max_sim
-                    traj_novelty = step_novelty.mean(dim=-1)
-                    costs -= self.novelty_weight * traj_novelty
+                    k = min(self.frontier_knn, M)
+                    knn_sim = sim_matrix.topk(k=k, dim=-1, largest=True).values.mean(dim=-1)
+                    frontier_bonus = (1.0 - knn_sim).mean(dim=-1)
+                    costs -= self.frontier_weight * frontier_bonus
+                    metrics["frontier_bonus"] = frontier_bonus
 
-            # 3. Action Smoothness Penalty (L2)
+            if mode == "recover":
+                terminal_disp = 1.0 - F.cosine_similarity(
+                    F.normalize(z_rollouts_score[:, -1, :], p=2, dim=-1),
+                    F.normalize(z_start_score.expand(self.n_candidates, -1), p=2, dim=-1),
+                    dim=-1,
+                )
+                costs -= self.displacement_weight * terminal_disp
+                metrics["recover_disp"] = terminal_disp
+
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
+                metrics["action_penalty"] = act_penalty
 
             min_cost, min_idx = costs.min(dim=0)
             if min_cost.item() < best_cost:
                 best_cost = min_cost.item()
                 best_seq = samples[min_idx.item()].detach().clone()
+                best_metrics = {
+                    name: float(values[min_idx.item()].item())
+                    for name, values in metrics.items()
+                }
 
             elite_idx = torch.topk(costs, k=self.n_elite, largest=False).indices
             elite = samples[elite_idx]
@@ -225,7 +354,7 @@ class PureCEMPlanner:
             [best_seq[1:], best_seq[-1:].clone()], dim=0,
         ).detach()
 
-        return best_seq, best_cost
+        return best_seq, best_cost, best_metrics
 
 
 # ---- Argument parsing ---------------------------------------------------- #
@@ -236,6 +365,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
+    p.add_argument("--scorer_ckpt", type=str, default=None,
+                   help="Optional trajectory scorer checkpoint with safety / goal / progress heads.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grid_rows", type=int, default=4)
     p.add_argument("--grid_cols", type=int, default=4)
@@ -262,22 +393,61 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
-    p.add_argument("--novelty_weight", type=float, default=10.0)
+    p.add_argument("--novelty_weight", type=float, default=10.0,
+                   help="Frontier-density bonus weight over the persistent novelty bank.")
+    p.add_argument("--frontier_knn", type=int, default=8,
+                   help="Number of nearest novelty-bank entries used to estimate latent density.")
+    p.add_argument("--goal_progress_weight", type=float, default=8.0,
+                   help="Weight on rollout progress toward the beacon breadcrumb.")
+    p.add_argument("--route_progress_weight", type=float, default=7.0,
+                   help="Weight on rollout progress toward the next route keyframe.")
+    p.add_argument("--recover_displacement_weight", type=float, default=2.5,
+                   help="Extra terminal displacement bonus while in recover mode.")
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--visited_bank_size", type=int, default=512,
                    help="Prototype-bank capacity for novelty memory.")
     p.add_argument("--prototype_sim_threshold", type=float, default=0.995,
                    help="Add a new prototype only when cosine similarity to the nearest stored prototype is below this threshold.")
+    p.add_argument("--keyframe_sim_threshold", type=float, default=0.985,
+                   help="Match the current observation to an existing keyframe node above this similarity.")
+    p.add_argument("--keyframe_match_radius_m", type=float, default=1.5,
+                   help="Maximum dead-reckoned distance allowed for keyframe reuse.")
+    p.add_argument("--keyframe_min_step_gap", type=int, default=8,
+                   help="Minimum temporal separation before matching the current node back onto an older keyframe.")
+    p.add_argument("--keyframe_add_interval", type=int, default=24,
+                   help="Add a fresh keyframe if this many steps pass without a new node.")
     p.add_argument("--stall_plateau_steps", type=int, default=200,
-                   help="Trigger a temporary frontier subgoal after this many steps without a novel prototype.")
+                   help="Trigger routing after this many steps without a novel prototype or route/goal progress.")
     p.add_argument("--subgoal_budget_steps", type=int, default=120,
-                   help="Maximum number of control steps to spend on a temporary frontier subgoal.")
+                   help="Maximum number of control steps to spend following graph waypoints during a route episode.")
     p.add_argument("--subgoal_min_age_steps", type=int, default=120,
-                   help="A prototype must not have been visited for at least this many steps to qualify as a subgoal.")
+                   help="A keyframe must not have been visited for at least this many steps to qualify as a route target.")
     p.add_argument("--subgoal_frontier_window_steps", type=int, default=800,
-                   help="Only consider prototypes inserted within this many steps of the latest novel prototype when choosing a frontier subgoal.")
+                   help="Prefer keyframes inserted within this recent window when choosing a frontier route target.")
     p.add_argument("--subgoal_cooldown_steps", type=int, default=120,
-                   help="Minimum wait before another plateau-triggered subgoal can activate.")
+                   help="Minimum wait before another plateau-triggered route can activate.")
+    p.add_argument("--route_min_hops", type=int, default=3,
+                   help="Minimum keyframe-graph distance required for a route target.")
+    p.add_argument("--goal_direct_sim_threshold", type=float, default=0.72,
+                   help="Enter pursue mode once current observation similarity exceeds this value.")
+    p.add_argument("--goal_route_improve_margin", type=float, default=0.03,
+                   help="Require a route target to improve breadcrumb similarity by at least this margin before treating it as goal-directed.")
+    p.add_argument("--success_goal_sim_threshold", type=float, default=0.90,
+                   help="Perception-only success threshold on current breadcrumb similarity.")
+    p.add_argument("--success_hold_steps", type=int, default=6,
+                   help="Require this many consecutive high-similarity frames before declaring success.")
+    p.add_argument("--stuck_window_steps", type=int, default=12,
+                   help="Window for stuck detection using odometry and latent displacement.")
+    p.add_argument("--stuck_cmd_threshold", type=float, default=0.25,
+                   help="Minimum commanded magnitude for a step to count toward stuck detection.")
+    p.add_argument("--stuck_odom_threshold", type=float, default=0.015,
+                   help="Maximum mean dead-reckoned XY motion per step while still considered stuck.")
+    p.add_argument("--stuck_latent_threshold", type=float, default=0.010,
+                   help="Maximum mean latent displacement per step while still considered stuck.")
+    p.add_argument("--recover_budget_steps", type=int, default=28,
+                   help="Duration of recover mode after a stuck event.")
+    p.add_argument("--recover_cooldown_steps", type=int, default=24,
+                   help="Minimum wait before another recover episode can trigger.")
     p.add_argument("--history_len", type=int, default=None,
                    help="Deprecated alias for --visited_bank_size.")
     p.add_argument("--success_range", type=float, default=0.4)
@@ -336,6 +506,54 @@ def load_world_model(ckpt_path: str, device: torch.device):
         "latent_dim": latent_dim, "image_size": image_size,
         "patch_size": patch_size, "use_proprio": use_proprio,
     }
+
+
+def load_planner_heads(
+    ckpt_path: str | None,
+    device: torch.device,
+    latent_dim: int,
+) -> tuple[PlannerHeads, dict[str, Any]]:
+    heads = PlannerHeads()
+    meta: dict[str, Any] = {}
+    if ckpt_path is None:
+        return heads, meta
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"scorer checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    hidden_dim = int(ckpt.get("hidden_dim", 512))
+    dropout = float(ckpt.get("dropout", 0.0))
+
+    if ckpt.get("safety_head") is not None:
+        safety = LatentEnergyHead(latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
+        clean_load_state(safety, ckpt["safety_head"])
+        safety.eval()
+        heads.safety_head = safety
+
+    if ckpt.get("goal_head") is not None:
+        goal = GoalEnergyHead(latent_dim=latent_dim, dropout=dropout).to(device)
+        clean_load_state(goal, ckpt["goal_head"])
+        goal.eval()
+        heads.goal_head = goal
+
+    if ckpt.get("progress_head") is not None:
+        progress = ProgressEnergyHead(latent_dim=latent_dim, dropout=dropout).to(device)
+        clean_load_state(progress, ckpt["progress_head"])
+        progress.eval()
+        heads.progress_head = progress
+
+    heads.goal_weight = float(ckpt.get("goal_weight", 0.0))
+    heads.progress_weight = float(ckpt.get("progress_weight", 0.0))
+    heads.safety_weight = 1.0
+    meta = {
+        "has_safety_head": heads.safety_head is not None,
+        "has_goal_head": heads.goal_head is not None,
+        "has_progress_head": heads.progress_head is not None,
+        "goal_weight": heads.goal_weight,
+        "progress_weight": heads.progress_weight,
+        "safety_mode": ckpt.get("safety_mode"),
+    }
+    return heads, meta
 
 def load_frozen_policy(ckpt_path: str, gs) -> ActorCritic:
     model = ActorCritic(obs_dim=50, act_dim=12).to(gs.device)
@@ -658,57 +876,328 @@ def apply_prototype_update_steps(
         insert_steps[idx] = step
 
 
-def choose_frontier_subgoal(
+def apply_prototype_update_graph(
+    neighbors: list[set[int]],
+    update: PrototypeBankUpdate,
+) -> None:
+    """Keep prototype-transition graph aligned with bank mutations."""
+    idx = update.prototype_idx
+    if idx is None:
+        return
+    if update.action == "inserted":
+        if idx == len(neighbors):
+            neighbors.append(set())
+        elif 0 <= idx < len(neighbors):
+            stale = list(neighbors[idx])
+            for other in stale:
+                if 0 <= other < len(neighbors):
+                    neighbors[other].discard(idx)
+            neighbors[idx].clear()
+        return
+    if update.action == "replaced" and 0 <= idx < len(neighbors):
+        stale = list(neighbors[idx])
+        for other in stale:
+            if 0 <= other < len(neighbors):
+                neighbors[other].discard(idx)
+        neighbors[idx].clear()
+
+
+def add_prototype_graph_edge(
+    neighbors: list[set[int]],
+    prev_idx: int | None,
+    cur_idx: int | None,
+) -> None:
+    if prev_idx is None or cur_idx is None or prev_idx == cur_idx:
+        return
+    if prev_idx < 0 or cur_idx < 0:
+        return
+    if prev_idx >= len(neighbors) or cur_idx >= len(neighbors):
+        return
+    neighbors[prev_idx].add(cur_idx)
+    neighbors[cur_idx].add(prev_idx)
+
+
+def cosine_similarity_scalar(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_norm = F.normalize(a.detach().cpu().float().unsqueeze(0), p=2, dim=-1)
+    b_norm = F.normalize(b.detach().cpu().float().unsqueeze(0), p=2, dim=-1)
+    return float(F.cosine_similarity(a_norm, b_norm, dim=-1).item())
+
+
+def latent_displacement(a: torch.Tensor, b: torch.Tensor) -> float:
+    return max(0.0, 1.0 - cosine_similarity_scalar(a, b))
+
+
+def estimate_dead_reckoning_step(
+    prev_xy: np.ndarray,
+    yaw_rad: float,
+    proprio: torch.Tensor,
+    dt_s: float,
+) -> np.ndarray:
+    """Integrate a short XY odometry step from body-frame velocity."""
+    prop_np = proprio[0].detach().cpu().numpy()
+    vel_b = np.asarray(prop_np[5:8], dtype=np.float32)
+    c = math.cos(yaw_rad)
+    s = math.sin(yaw_rad)
+    vel_world_xy = np.array([
+        c * vel_b[0] - s * vel_b[1],
+        s * vel_b[0] + c * vel_b[1],
+    ], dtype=np.float32)
+    return np.asarray(prev_xy, dtype=np.float32) + vel_world_xy * float(dt_s)
+
+
+def match_keyframe_node(
+    nodes: list[KeyframeNode],
+    score_latent: torch.Tensor,
+    odom_xy: np.ndarray,
+    step: int,
+    sim_threshold: float,
+    match_radius_m: float,
+    min_step_gap: int,
+) -> int | None:
+    if not nodes:
+        return None
+
+    best_idx = None
+    best_sim = -1.0
+    for node in nodes:
+        if step - node.last_seen_step < min_step_gap:
+            continue
+        odom_dist = float(np.linalg.norm(np.asarray(node.odom_xy, dtype=np.float32) - odom_xy))
+        if odom_dist > match_radius_m:
+            continue
+        sim = cosine_similarity_scalar(score_latent, node.score_latent)
+        if sim >= sim_threshold and sim > best_sim:
+            best_sim = sim
+            best_idx = node.idx
+    return best_idx
+
+
+def add_keyframe_node(
+    nodes: list[KeyframeNode],
+    neighbors: list[set[int]],
+    score_latent: torch.Tensor,
+    proj_latent: torch.Tensor,
+    odom_xy: np.ndarray,
+    yaw_rad: float,
+    step: int,
+) -> int:
+    node_idx = len(nodes)
+    nodes.append(KeyframeNode(
+        idx=node_idx,
+        score_latent=score_latent.detach().cpu().float().clone(),
+        proj_latent=proj_latent.detach().cpu().float().clone(),
+        step=step,
+        last_seen_step=step,
+        visit_count=1,
+        odom_xy=(float(odom_xy[0]), float(odom_xy[1])),
+        yaw_rad=float(yaw_rad),
+    ))
+    neighbors.append(set())
+    return node_idx
+
+
+def touch_keyframe_node(
+    node: KeyframeNode,
+    odom_xy: np.ndarray,
+    yaw_rad: float,
+    step: int,
+) -> None:
+    node.last_seen_step = step
+    node.visit_count += 1
+    node.odom_xy = (float(odom_xy[0]), float(odom_xy[1]))
+    node.yaw_rad = float(yaw_rad)
+
+
+def bfs_shortest_paths(
+    neighbors: list[set[int]],
+    start_idx: int,
+) -> tuple[dict[int, int], dict[int, int | None]]:
+    from collections import deque
+
+    dist: dict[int, int] = {start_idx: 0}
+    parent: dict[int, int | None] = {start_idx: None}
+    queue = deque([start_idx])
+    while queue:
+        idx = queue.popleft()
+        for nxt in neighbors[idx]:
+            if nxt in dist:
+                continue
+            dist[nxt] = dist[idx] + 1
+            parent[nxt] = idx
+            queue.append(nxt)
+    return dist, parent
+
+
+def reconstruct_path(
+    parent: dict[int, int | None],
+    target_idx: int,
+) -> list[int]:
+    path: list[int] = []
+    idx: int | None = target_idx
+    while idx is not None:
+        path.append(idx)
+        idx = parent.get(idx)
+    path.reverse()
+    return path
+
+
+def choose_route_path(
     bank: list[torch.Tensor],
     hit_counts: list[int],
     last_seen_steps: list[int],
     insert_steps: list[int],
-    current_latent: torch.Tensor,
+    neighbors: list[set[int]],
+    current_idx: int,
     current_step: int,
     min_age_steps: int,
     frontier_window_steps: int,
-) -> int | None:
-    """Pick a low-hit frontier prototype rather than deep history behind the robot."""
-    if not bank:
+    min_hops: int,
+    goal_latent: torch.Tensor | None,
+    goal_route_improve_margin: float,
+) -> tuple[str, int, list[int], float | None] | None:
+    """Choose a graph route toward either a better goal basin or a frontier node."""
+    if not bank or current_idx < 0 or current_idx >= len(bank):
         return None
 
-    current = current_latent.detach().cpu().float()
-    current = F.normalize(current.unsqueeze(0), p=2, dim=-1).squeeze(0)
-    bank_tensor = torch.stack(bank)
-    sims = torch.mv(bank_tensor, current)
+    dist, parent = bfs_shortest_paths(neighbors, current_idx)
+    reachable = [
+        idx for idx, hops in dist.items()
+        if idx != current_idx and hops >= max(1, min_hops)
+    ]
+    if not reachable:
+        return None
+
+    current_goal_sim = None
+    goal_sims: list[float] | None = None
+    if goal_latent is not None:
+        goal_sims = [cosine_similarity_scalar(node, goal_latent) for node in bank]
+        current_goal_sim = goal_sims[current_idx]
+        better_goal_nodes = [
+            idx for idx in reachable
+            if goal_sims[idx] >= current_goal_sim + goal_route_improve_margin
+        ]
+        if better_goal_nodes:
+            target_idx = max(
+                better_goal_nodes,
+                key=lambda idx: (
+                    goal_sims[idx],
+                    -dist[idx],
+                    -hit_counts[idx],
+                    insert_steps[idx],
+                ),
+            )
+            path = reconstruct_path(parent, target_idx)
+            if len(path) >= 2:
+                return ("goal", target_idx, path[1:], goal_sims[target_idx])
 
     newest_insert = max(insert_steps) if insert_steps else current_step
     frontier_cutoff = newest_insert - max(0, frontier_window_steps)
-
-    eligible: list[int] = []
-    for idx in range(len(bank)):
-        age = current_step - int(last_seen_steps[idx])
-        if age < min_age_steps:
-            continue
-        if int(insert_steps[idx]) < frontier_cutoff:
-            continue
-        eligible.append(idx)
-
-    if not eligible:
-        for idx in range(len(bank)):
-            age = current_step - int(last_seen_steps[idx])
-            if age >= min_age_steps:
-                eligible.append(idx)
-    if not eligible:
+    frontier_nodes = [
+        idx for idx in reachable
+        if (current_step - int(last_seen_steps[idx])) >= min_age_steps
+        and int(insert_steps[idx]) >= frontier_cutoff
+    ]
+    if not frontier_nodes:
+        frontier_nodes = [
+            idx for idx in reachable
+            if (current_step - int(last_seen_steps[idx])) >= min_age_steps
+        ]
+    if not frontier_nodes:
+        frontier_nodes = reachable
+    if not frontier_nodes:
         return None
 
-    best_idx = eligible[0]
-    best_key = None
-    for idx in eligible:
-        key = (
-            int(insert_steps[idx]),
-            -int(hit_counts[idx]),
-            -float(sims[idx].item()),
-        )
-        if best_key is None or key > best_key:
-            best_key = key
-            best_idx = idx
-    return best_idx
+    target_idx = max(
+        frontier_nodes,
+        key=lambda idx: (
+            -hit_counts[idx],
+            -len(neighbors[idx]),
+            insert_steps[idx],
+            dist[idx],
+        ),
+    )
+    path = reconstruct_path(parent, target_idx)
+    if len(path) < 2:
+        return None
+    target_goal_sim = None if goal_sims is None else goal_sims[target_idx]
+    return ("frontier", target_idx, path[1:], target_goal_sim)
+
+
+def choose_keyframe_route_path(
+    nodes: list[KeyframeNode],
+    neighbors: list[set[int]],
+    current_idx: int,
+    current_step: int,
+    min_age_steps: int,
+    frontier_window_steps: int,
+    min_hops: int,
+    goal_latent: torch.Tensor | None,
+    goal_route_improve_margin: float,
+) -> tuple[str, int, list[int], float | None] | None:
+    if not nodes or current_idx < 0 or current_idx >= len(nodes):
+        return None
+
+    dist, parent = bfs_shortest_paths(neighbors, current_idx)
+    reachable = [
+        idx for idx, hops in dist.items()
+        if idx != current_idx and hops >= max(1, min_hops)
+    ]
+    if not reachable:
+        return None
+
+    goal_sims: dict[int, float] = {}
+    if goal_latent is not None:
+        current_goal_sim = cosine_similarity_scalar(nodes[current_idx].score_latent, goal_latent)
+        better_goal_nodes = []
+        for idx in reachable:
+            sim = cosine_similarity_scalar(nodes[idx].score_latent, goal_latent)
+            goal_sims[idx] = sim
+            if sim >= current_goal_sim + goal_route_improve_margin:
+                better_goal_nodes.append(idx)
+        if better_goal_nodes:
+            target_idx = max(
+                better_goal_nodes,
+                key=lambda idx: (
+                    goal_sims[idx],
+                    -dist[idx],
+                    -nodes[idx].visit_count,
+                    nodes[idx].step,
+                ),
+            )
+            path = reconstruct_path(parent, target_idx)
+            if len(path) >= 2:
+                return ("goal", target_idx, path[1:], goal_sims[target_idx])
+
+    newest_insert = max(node.step for node in nodes)
+    frontier_cutoff = newest_insert - max(0, frontier_window_steps)
+    frontier_nodes = [
+        idx for idx in reachable
+        if (current_step - nodes[idx].last_seen_step) >= min_age_steps
+        and nodes[idx].step >= frontier_cutoff
+    ]
+    if not frontier_nodes:
+        frontier_nodes = [
+            idx for idx in reachable
+            if (current_step - nodes[idx].last_seen_step) >= min_age_steps
+        ]
+    if not frontier_nodes:
+        frontier_nodes = reachable
+    if not frontier_nodes:
+        return None
+
+    target_idx = max(
+        frontier_nodes,
+        key=lambda idx: (
+            -nodes[idx].visit_count,
+            -len(neighbors[idx]),
+            nodes[idx].step,
+            dist[idx],
+        ),
+    )
+    path = reconstruct_path(parent, target_idx)
+    if len(path) < 2:
+        return None
+    return ("frontier", target_idx, path[1:], goal_sims.get(target_idx))
 
 
 # ---- Breadcrumb encoding ------------------------------------------------- #
@@ -1089,7 +1578,7 @@ def has_line_of_sight(a_xy, b_xy, obstacle_layout, step_size=0.03, margin=0.05):
 def main():
     args = parse_args()
     if args.out_dir is None:
-        args.out_dir = os.path.join("inference_runs", f"pure_wm_seed_{args.seed:04d}")
+        args.out_dir = os.path.join("inference_runs", f"keyframe_exec_seed_{args.seed:04d}")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1098,10 +1587,20 @@ def main():
     torch.manual_seed(args.seed)
 
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
+    planner_heads, scorer_meta = load_planner_heads(
+        args.scorer_ckpt, planning_device, wm_meta["latent_dim"],
+    )
     camera_cfg = ego_camera_config_from_args(args)
 
     print(f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
           f"image_size={wm_meta['image_size']}")
+    if args.scorer_ckpt is not None:
+        print(
+            "Loaded planner heads: "
+            f"safety={scorer_meta.get('has_safety_head', False)} "
+            f"goal={scorer_meta.get('has_goal_head', False)} "
+            f"progress={scorer_meta.get('has_progress_head', False)}"
+        )
 
     obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
         seed=args.seed,
@@ -1127,32 +1626,9 @@ def main():
                 target_beacon = b
                 break
     if target_beacon is None and beacon_layout.beacons:
-        best_dist = -1.0
-        for b in beacon_layout.beacons:
-            d = float(np.linalg.norm(np.array(b.pos[:2]) - spawn_xy))
-            if d > best_dist:
-                best_dist = d
-                target_beacon = b
+        target_beacon = sorted(beacon_layout.beacons, key=lambda b: b.identity)[0]
 
     spawn_yaw = 0.0
-    best_score = -float("inf")
-    for probe_yaw in [0.0, math.pi / 2, math.pi, -math.pi / 2]:
-        probe_xy = spawn_xy + 0.3 * np.array(
-            [math.cos(probe_yaw), math.sin(probe_yaw)], dtype=np.float32,
-        )
-        blocked = bool(detect_collisions(
-            torch.from_numpy(probe_xy.reshape(1, 2)),
-            obstacle_layout, margin=0.12,
-        )[0].item())
-        if not blocked:
-            score = 1.0
-            if target_beacon is not None:
-                dx = float(target_beacon.pos[0]) - float(spawn_xy[0])
-                dy = float(target_beacon.pos[1]) - float(spawn_xy[1])
-                score = math.cos(probe_yaw - math.atan2(dy, dx))
-            if score > best_score:
-                best_score = score
-                spawn_yaw = probe_yaw
 
     target_claim_xy = beacon_claim_xy(target_beacon, args.wall_thickness) if target_beacon else None
     breadcrumb_xy = [float(target_beacon.pos[0]), float(target_beacon.pos[1])] if target_beacon else None
@@ -1162,9 +1638,11 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Score={args.score_space}, "
-          f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
+          f"Frontier={args.novelty_weight}, GoalProg={args.goal_progress_weight}, "
+          f"RouteProg={args.route_progress_weight}, ActionPen={args.action_penalty_weight}, "
           f"Bank={args.visited_bank_size}, ProtoThresh={args.prototype_sim_threshold:.3f}, "
-          f"Plateau={args.stall_plateau_steps}, SubgoalBudget={args.subgoal_budget_steps}")
+          f"Plateau={args.stall_plateau_steps}, RouteBudget={args.subgoal_budget_steps}, "
+          f"RouteHops={args.route_min_hops}, DirectGoal={args.goal_direct_sim_threshold:.2f}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -1173,12 +1651,16 @@ def main():
     tp_frames_hwc: List[np.ndarray] = []
     combined_frames: List[np.ndarray] = []
     path_xy: List[List[float]] = []
+    oracle_path_xy: List[List[float]] = []
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
+    mode_log: List[str] = []
     visited_bank: List[torch.Tensor] = []
     visited_bank_hits: List[int] = []
     visited_bank_last_seen_steps: List[int] = []
     visited_bank_insert_steps: List[int] = []
+    keyframe_nodes: List[KeyframeNode] = []
+    keyframe_neighbors: List[set[int]] = []
     visited_seen = 0
     visited_insertions = 0
     visited_replacements = 0
@@ -1186,23 +1668,34 @@ def main():
     last_novel_prototype_step = 0
     terminate_reason = "max_steps"
     collision_count = 0
+    runtime_stuck_events = 0
     frame_substitution_count = 0
     first_collision_step: int | None = None
     visited_bank_fill_step: int | None = None
     visited_bank_replacement_step: int | None = None
-    subgoal_active = False
-    subgoal_target_idx: int | None = None
-    subgoal_target_latent: torch.Tensor | None = None
-    subgoal_end_step: int | None = None
-    subgoal_exit_reason: str | None = None
-    subgoal_cooldown_until = 0
-    subgoal_activations = 0
-    subgoal_steps_total = 0
-    subgoal_last_activation_step: int | None = None
-    subgoal_last_target_idx: int | None = None
+    current_keyframe_idx: int | None = None
+    prev_keyframe_idx: int | None = None
+    route_active = False
+    route_waypoints: List[int] = []
+    route_target_idx: int | None = None
+    route_target_kind: str | None = None
+    route_end_step: int | None = None
+    route_exit_reason: str | None = None
+    route_cooldown_until = 0
+    route_activations = 0
+    route_steps_total = 0
+    route_last_activation_step: int | None = None
+    route_last_target_idx: int | None = None
+    recover_active_until = -1
+    recover_cooldown_until = 0
+    success_hold_count = 0
+    oracle_goal_reached = False
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
+    recent_cmd_mag = deque(maxlen=max(1, args.stuck_window_steps))
+    recent_odom_disp = deque(maxlen=max(1, args.stuck_window_steps))
+    recent_latent_disp = deque(maxlen=max(1, args.stuck_window_steps))
 
     try:
         import genesis as gs
@@ -1223,6 +1716,7 @@ def main():
         )
 
         z_breadcrumb = None
+        z_breadcrumb_proj_ref = None
         if target_beacon is not None:
             z_breadcrumb_raw, z_breadcrumb_proj = encode_breadcrumb(
                 world_model, ego_scene, ego_robot, ego_act_dofs, ego_cam,
@@ -1232,6 +1726,7 @@ def main():
             z_breadcrumb = select_score_latent(
                 z_breadcrumb_raw, z_breadcrumb_proj, args.score_space,
             )
+            z_breadcrumb_proj_ref = z_breadcrumb_proj.detach().clone()
             print(
                 f"Goal latents encoded: ||z_raw||={float(z_breadcrumb_raw.norm()):.3f} "
                 f"||z_proj||={float(z_breadcrumb_proj.norm()):.3f}"
@@ -1251,14 +1746,20 @@ def main():
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
             score_space=args.score_space,
-            novelty_weight=args.novelty_weight,
+            frontier_weight=args.novelty_weight,
+            frontier_knn=args.frontier_knn,
+            goal_progress_weight=args.goal_progress_weight,
+            route_progress_weight=args.route_progress_weight,
+            displacement_weight=args.recover_displacement_weight,
             action_penalty_weight=args.action_penalty_weight,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
         last_clean_frame: np.ndarray | None = None
         plan_seq: torch.Tensor | None = None
-        plan_step_idx = 0 
+        plan_step_idx = 0
+        plan_metrics_last: dict[str, float] = {}
+        step_dt_s = 0.01 * float(sim_cfg.decimation)
 
         obs = observe(
             physics_robot, physics_act_dofs,
@@ -1276,11 +1777,15 @@ def main():
         )
         tp_frames_hwc.append(tp_frame)
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
-        path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+        odom_xy = spawn_xy.astype(np.float32).copy()
+        path_xy.append([float(odom_xy[0]), float(odom_xy[1])])
+        oracle_path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
         score_latent_now = select_score_latent(
             obs["z_raw"], obs["z_proj"], args.score_space,
         ).squeeze(0)
+        prev_score_latent = score_latent_now.detach().cpu().float().clone()
+        prev_odom_xy = odom_xy.copy()
         
         bank_update = update_prototype_bank(
             visited_bank,
@@ -1311,6 +1816,17 @@ def main():
             visited_bank_fill_step = 0
             print("Prototype bank full at initial observation; novel states will replace redundant prototypes")
 
+        current_keyframe_idx = add_keyframe_node(
+            keyframe_nodes,
+            keyframe_neighbors,
+            score_latent_now,
+            obs["z_proj"].squeeze(0),
+            odom_xy,
+            obs["yaw_rad"],
+            0,
+        )
+        prev_keyframe_idx = current_keyframe_idx
+
         if target_claim_xy is not None:
             min_goal_dist_m = min(
                 min_goal_dist_m,
@@ -1320,76 +1836,123 @@ def main():
             )
 
         for step in range(args.steps):
-            if subgoal_active and (
-                subgoal_exit_reason is not None
-                or (subgoal_end_step is not None and step >= subgoal_end_step)
+            goal_sim_now = None
+            if z_breadcrumb is not None:
+                goal_sim_now = cosine_similarity_scalar(score_latent_now, z_breadcrumb)
+            pursue_active = (
+                z_breadcrumb is not None
+                and goal_sim_now is not None
+                and goal_sim_now >= args.goal_direct_sim_threshold
+            )
+
+            if route_active and pursue_active:
+                route_exit_reason = "goal_basin"
+
+            if route_active and (
+                route_exit_reason is not None
+                or (route_end_step is not None and step >= route_end_step)
             ):
-                reason = subgoal_exit_reason or "budget"
+                reason = route_exit_reason or "budget"
+                next_mode = "pursue" if reason == "goal_basin" else "search"
                 print(
-                    f"Step {step:03d} | return to beacon "
-                    f"(reason={reason}, subgoal_idx={subgoal_target_idx})"
+                    f"Step {step:03d} | return to {next_mode} "
+                    f"(reason={reason}, route_target={route_target_kind}:{route_target_idx})"
                 )
-                subgoal_active = False
-                subgoal_target_idx = None
-                subgoal_target_latent = None
-                subgoal_end_step = None
-                subgoal_exit_reason = None
-                subgoal_cooldown_until = step + args.subgoal_cooldown_steps
+                route_active = False
+                route_waypoints = []
+                route_target_idx = None
+                route_target_kind = None
+                route_end_step = None
+                route_exit_reason = None
+                route_cooldown_until = step + args.subgoal_cooldown_steps
                 planner.reset()
                 plan_seq = None
 
+            recent_goal_signal = (
+                float(plan_metrics_last.get("goal_progress", 0.0))
+                + float(plan_metrics_last.get("learned_progress", 0.0))
+            )
             if (
-                not subgoal_active
-                and step >= subgoal_cooldown_until
-                and len(visited_bank) >= 4
+                not route_active
+                and step >= route_cooldown_until
+                and step >= recover_cooldown_until
+                and len(keyframe_nodes) >= 4
+                and current_keyframe_idx is not None
                 and (step - last_novel_prototype_step) >= args.stall_plateau_steps
+                and recent_goal_signal < 0.025
+                and not pursue_active
             ):
-                frontier_idx = choose_frontier_subgoal(
-                    visited_bank,
-                    visited_bank_hits,
-                    visited_bank_last_seen_steps,
-                    visited_bank_insert_steps,
-                    score_latent_now,
+                route_selection = choose_keyframe_route_path(
+                    keyframe_nodes,
+                    keyframe_neighbors,
+                    current_keyframe_idx,
                     step,
                     args.subgoal_min_age_steps,
                     args.subgoal_frontier_window_steps,
+                    args.route_min_hops,
+                    z_breadcrumb,
+                    args.goal_route_improve_margin,
                 )
-                if frontier_idx is not None:
-                    frontier_age = step - int(visited_bank_last_seen_steps[frontier_idx])
-                    frontier_insert_age = step - int(visited_bank_insert_steps[frontier_idx])
-                    subgoal_active = True
-                    subgoal_target_idx = frontier_idx
-                    subgoal_target_latent = visited_bank[frontier_idx].detach().clone().to(planning_device)
-                    subgoal_end_step = step + args.subgoal_budget_steps
-                    subgoal_exit_reason = None
-                    subgoal_activations += 1
-                    subgoal_last_activation_step = step
-                    subgoal_last_target_idx = frontier_idx
+                if route_selection is not None:
+                    route_kind, target_idx, path_waypoints, target_goal_sim = route_selection
+                    route_active = True
+                    route_waypoints = path_waypoints
+                    route_target_idx = target_idx
+                    route_target_kind = route_kind
+                    route_end_step = step + args.subgoal_budget_steps
+                    route_exit_reason = None
+                    route_activations += 1
+                    route_last_activation_step = step
+                    route_last_target_idx = target_idx
                     planner.reset()
                     plan_seq = None
+                    first_hop = path_waypoints[0] if path_waypoints else None
+                    target_goal_str = "n/a" if target_goal_sim is None else f"{target_goal_sim:.3f}"
                     print(
-                        f"Step {step:03d} | plateau escape -> frontier subgoal "
-                        f"idx={frontier_idx} hits={visited_bank_hits[frontier_idx]} "
-                        f"age={frontier_age} insert_age={frontier_insert_age}"
+                        f"Step {step:03d} | route -> {route_kind} "
+                        f"target={target_idx} hops={len(path_waypoints)} next={first_hop} "
+                        f"goal_sim={target_goal_str}"
                     )
 
-            need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
+            if step < recover_active_until:
+                mode = "recover"
+            elif route_active and route_waypoints:
+                mode = "route"
+            elif pursue_active:
+                mode = "pursue"
+            else:
+                mode = "search"
+            mode_log.append(mode)
 
+            need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
             if need_replan:
                 novelty_bank = None
                 if args.novelty_weight > 0.0 and visited_bank:
                     novelty_bank = torch.stack(visited_bank).to(planning_device)
-                active_goal = subgoal_target_latent if subgoal_active else z_breadcrumb
-                plan_seq, cost = planner.plan(obs["z_raw"], active_goal, novelty_bank)
+                route_score = None
+                if route_active and route_waypoints:
+                    route_score = keyframe_nodes[route_waypoints[0]].score_latent.to(planning_device)
+                plan_seq, cost, plan_metrics_last = planner.plan(
+                    obs["z_raw"],
+                    score_latent_now,
+                    obs["z_proj"].squeeze(0),
+                    visited_bank=novelty_bank,
+                    z_goal_score=z_breadcrumb,
+                    z_goal_proj=z_breadcrumb_proj_ref,
+                    z_route_score=route_score,
+                    mode=mode,
+                    heads=planner_heads,
+                )
                 plan_step_idx = 0
                 costs_log.append(cost)
 
             nominal_cmd = plan_seq[plan_step_idx]
             plan_step_idx += 1
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
+            cmd_mag = float(np.linalg.norm(np.asarray(cmd_vals, dtype=np.float32)))
             cmds_log.append(cmd_vals)
-            if subgoal_active:
-                subgoal_steps_total += 1
+            if route_active:
+                route_steps_total += 1
 
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
@@ -1408,9 +1971,26 @@ def main():
             score_latent_now = select_score_latent(
                 obs["z_raw"], obs["z_proj"], args.score_space,
             ).squeeze(0)
+            goal_sim_now = None
+            if z_breadcrumb is not None:
+                goal_sim_now = cosine_similarity_scalar(score_latent_now, z_breadcrumb)
+
+            odom_xy = estimate_dead_reckoning_step(
+                prev_odom_xy,
+                obs["yaw_rad"],
+                obs["proprio"],
+                step_dt_s,
+            )
+            cur_xy = [float(odom_xy[0]), float(odom_xy[1])]
+            prev_xy = path_xy[-1]
+            path_xy.append(cur_xy)
+            update_coverage_tracker(coverage_tracker, prev_xy, cur_xy)
+            oracle_cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
+            oracle_path_xy.append(oracle_cur_xy)
+
             if obs["frame_substituted"]:
                 frame_substitution_count += 1
-            if not obs["frame_substituted"]:
+            else:
                 last_clean_frame = obs["frame_hwc"].copy()
                 bank_update = update_prototype_bank(
                     visited_bank,
@@ -1430,13 +2010,9 @@ def main():
                 if bank_update.action == "inserted":
                     visited_insertions += 1
                     last_novel_prototype_step = step
-                    if subgoal_active:
-                        subgoal_exit_reason = "novel_prototype"
                 elif bank_update.action == "replaced":
                     visited_replacements += 1
                     last_novel_prototype_step = step
-                    if subgoal_active:
-                        subgoal_exit_reason = "novel_prototype"
                     if visited_bank_replacement_step is None:
                         visited_bank_replacement_step = step
                         print(
@@ -1451,31 +2027,72 @@ def main():
                         f"Prototype bank full at step {step:03d}; "
                         "novel states will replace redundant prototypes"
                     )
-            if subgoal_active and subgoal_target_latent is not None:
-                current_norm = F.normalize(
-                    score_latent_now.detach().cpu().float().unsqueeze(0),
-                    p=2, dim=-1,
+
+                matched_idx = match_keyframe_node(
+                    keyframe_nodes,
+                    score_latent_now,
+                    odom_xy,
+                    step,
+                    args.keyframe_sim_threshold,
+                    args.keyframe_match_radius_m,
+                    args.keyframe_min_step_gap,
                 )
-                target_norm = subgoal_target_latent.detach().cpu().float().unsqueeze(0)
-                sim_to_subgoal = float(F.cosine_similarity(
-                    current_norm, target_norm, dim=-1,
-                ).item())
-                if sim_to_subgoal >= args.prototype_sim_threshold:
-                    subgoal_exit_reason = "subgoal_reached"
+                if matched_idx is not None:
+                    current_keyframe_idx = matched_idx
+                    touch_keyframe_node(
+                        keyframe_nodes[current_keyframe_idx],
+                        odom_xy,
+                        obs["yaw_rad"],
+                        step,
+                    )
+                else:
+                    add_new_keyframe = (
+                        current_keyframe_idx is None
+                        or bank_update.action in {"inserted", "replaced"}
+                        or (step - keyframe_nodes[current_keyframe_idx].step) >= args.keyframe_add_interval
+                    )
+                    if add_new_keyframe:
+                        current_keyframe_idx = add_keyframe_node(
+                            keyframe_nodes,
+                            keyframe_neighbors,
+                            score_latent_now,
+                            obs["z_proj"].squeeze(0),
+                            odom_xy,
+                            obs["yaw_rad"],
+                            step,
+                        )
+                    elif current_keyframe_idx is not None:
+                        touch_keyframe_node(
+                            keyframe_nodes[current_keyframe_idx],
+                            odom_xy,
+                            obs["yaw_rad"],
+                            step,
+                        )
+
+                if (
+                    prev_keyframe_idx is not None
+                    and current_keyframe_idx is not None
+                    and prev_keyframe_idx != current_keyframe_idx
+                ):
+                    keyframe_neighbors[prev_keyframe_idx].add(current_keyframe_idx)
+                    keyframe_neighbors[current_keyframe_idx].add(prev_keyframe_idx)
+                prev_keyframe_idx = current_keyframe_idx
+
+                if route_active and route_waypoints and current_keyframe_idx == route_waypoints[0]:
+                    route_waypoints.pop(0)
+                    planner.reset()
+                    plan_seq = None
+                    if not route_waypoints:
+                        route_exit_reason = "route_complete"
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
                 tp_robot, tp_act_dofs, tp_cam,
                 args.chase_dist, args.chase_height, args.side_offset, args.lookahead,
             )
-
             ego_frames_hwc.append(obs["frame_hwc"])
             tp_frames_hwc.append(tp_frame)
             combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
-            cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
-            prev_xy = path_xy[-1]
-            path_xy.append(cur_xy)
-            update_coverage_tracker(coverage_tracker, prev_xy, cur_xy)
 
             pos_xy_t = torch.from_numpy(
                 np.asarray(obs["pos_np"][:2], dtype=np.float32),
@@ -1483,61 +2100,105 @@ def main():
             collided = bool(detect_collisions(
                 pos_xy_t, obstacle_layout, margin=sim_cfg.collision_margin,
             )[0].item())
-            
             if collided:
                 collision_count += 1
                 if first_collision_step is None:
                     first_collision_step = step
+
+            odom_step_disp = float(np.linalg.norm(odom_xy - prev_odom_xy))
+            latent_step_disp = latent_displacement(prev_score_latent, score_latent_now)
+            recent_cmd_mag.append(cmd_mag)
+            recent_odom_disp.append(odom_step_disp)
+            recent_latent_disp.append(latent_step_disp)
+            prev_odom_xy = odom_xy.copy()
+            prev_score_latent = score_latent_now.detach().cpu().float().clone()
+
+            stuck_now = (
+                len(recent_cmd_mag) == recent_cmd_mag.maxlen
+                and float(np.mean(recent_cmd_mag)) >= args.stuck_cmd_threshold
+                and float(np.mean(recent_odom_disp)) <= args.stuck_odom_threshold
+                and float(np.mean(recent_latent_disp)) <= args.stuck_latent_threshold
+            )
+            if stuck_now and step >= recover_cooldown_until and step >= recover_active_until:
+                runtime_stuck_events += 1
+                recover_active_until = step + args.recover_budget_steps
+                recover_cooldown_until = step + args.recover_cooldown_steps
                 planner.reset()
                 plan_seq = None
+                if route_active:
+                    route_active = False
+                    route_waypoints = []
+                    route_target_idx = None
+                    route_target_kind = None
+                    route_end_step = None
+                    route_exit_reason = None
+                    route_cooldown_until = step + args.subgoal_cooldown_steps
+                print(
+                    f"Step {step:03d} | recover trigger "
+                    f"(cmd={float(np.mean(recent_cmd_mag)):.2f}, "
+                    f"odom={float(np.mean(recent_odom_disp)):.3f}, "
+                    f"latent={float(np.mean(recent_latent_disp)):.3f})"
+                )
 
-            if obs["pos_np"][2] < sim_cfg.min_z:
+            if float(obs["proprio"][0, 0].item()) < sim_cfg.min_z:
                 terminate_reason = "fallen"
                 print(f"Step {step:03d} | fallen")
                 break
 
             reached = False
+            if goal_sim_now is not None and goal_sim_now >= args.success_goal_sim_threshold:
+                success_hold_count += 1
+            else:
+                success_hold_count = 0
+            if success_hold_count >= args.success_hold_steps:
+                reached = True
+
+            dist_claim = None
             if target_beacon is not None and target_claim_xy is not None:
                 dist_claim = float(np.linalg.norm(
-                    np.asarray(cur_xy, dtype=np.float32) - target_claim_xy,
+                    np.asarray(oracle_cur_xy, dtype=np.float32) - target_claim_xy,
                 ))
                 min_goal_dist_m = min(min_goal_dist_m, dist_claim)
                 frontness = float(np.dot(
-                    np.asarray(cur_xy, dtype=np.float32) - np.array(target_beacon.pos[:2], dtype=np.float32),
+                    np.asarray(oracle_cur_xy, dtype=np.float32) - np.array(target_beacon.pos[:2], dtype=np.float32),
                     np.array(target_beacon.normal[:2], dtype=np.float32),
                 ))
                 los = has_line_of_sight(
-                    np.asarray(cur_xy, dtype=np.float32),
+                    np.asarray(oracle_cur_xy, dtype=np.float32),
                     target_claim_xy, obstacle_layout,
                     step_size=0.02, margin=0.01,
                 )
-                if dist_claim <= args.success_range and los and frontness > 0:
-                    reached = True
+                oracle_goal_reached = oracle_goal_reached or (
+                    dist_claim <= args.success_range and los and frontness > 0
+                )
 
-                if step % 20 == 0 or reached:
-                    cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
-                    cov_delta = cov_area - last_logged_coverage_area_m2
-                    last_logged_coverage_area_m2 = cov_area
-                    if args.visited_bank_size > 0:
-                        bank_status = f"{len(visited_bank)}/{args.visited_bank_size}"
-                    else:
-                        bank_status = "off"
-                    goal_mode = "beacon"
-                    if subgoal_active and subgoal_target_idx is not None:
-                        goal_mode = f"sub:{subgoal_target_idx}"
-                    print(
-                        f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
-                        f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                        f"cost={costs_log[-1]:.3f} d_goal={dist_claim:.2f}m "
-                        f"coll={collision_count} cov={cov_area:.2f}m^2 "
-                        f"cov+={cov_delta:+.2f} proto={bank_status} "
-                        f"ins={visited_insertions} rep={visited_replacements} "
-                        f"goal={goal_mode}"
-                    )
+            if step % 20 == 0 or reached:
+                cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
+                cov_delta = cov_area - last_logged_coverage_area_m2
+                last_logged_coverage_area_m2 = cov_area
+                if args.visited_bank_size > 0:
+                    bank_status = f"{len(visited_bank)}/{args.visited_bank_size}"
+                else:
+                    bank_status = "off"
+                progress_str = (
+                    f"g={plan_metrics_last.get('goal_progress', 0.0):.3f} "
+                    f"lp={plan_metrics_last.get('learned_progress', 0.0):.3f} "
+                    f"r={plan_metrics_last.get('route_progress', 0.0):.3f} "
+                    f"f={plan_metrics_last.get('frontier_bonus', 0.0):.3f}"
+                )
+                goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
+                print(
+                    f"Step {step:03d} | odom=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
+                    f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
+                    f"cost={costs_log[-1]:.3f} d_goal={goal_str} "
+                    f"cov={cov_area:.2f}m^2 cov+={cov_delta:+.2f} "
+                    f"proto={bank_status} keyframes={len(keyframe_nodes)} "
+                    f"mode={mode} {progress_str}"
+                )
 
             if reached:
                 terminate_reason = "goal_reached"
-                print(f"Step {step:03d} | REACHED {target_beacon.identity}")
+                print(f"Step {step:03d} | REACHED {target_beacon.identity if target_beacon else 'goal'}")
                 break
 
     finally:
@@ -1571,14 +2232,16 @@ def main():
         soft_coverage_gain_per_m = soft_coverage_area_m2 / path_length_m
 
     summary = {
-        "approach": "pure_world_model_terminal_cost",
+        "approach": "pure_world_model_keyframe_exec",
         "paper_section": "3.2",
         "seed": args.seed,
         "grid": f"{args.grid_rows}x{args.grid_cols}",
         "target": target_beacon.identity if target_beacon else None,
         "result": terminate_reason,
+        "oracle_goal_reached": oracle_goal_reached,
         "steps": len(cmds_log),
-        "collisions": collision_count,
+        "oracle_collisions": collision_count,
+        "runtime_stuck_events": runtime_stuck_events,
         "first_collision_step": first_collision_step,
         "frame_substitutions": frame_substitution_count,
         "min_goal_dist_m": min_goal_dist_out,
@@ -1593,29 +2256,53 @@ def main():
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
             "score_space": args.score_space,
-            "novelty_weight": args.novelty_weight,
+            "frontier_weight": args.novelty_weight,
+            "frontier_knn": args.frontier_knn,
+            "goal_progress_weight": args.goal_progress_weight,
+            "route_progress_weight": args.route_progress_weight,
+            "recover_displacement_weight": args.recover_displacement_weight,
             "action_penalty_weight": args.action_penalty_weight,
-            "memory_type": "prototype_bank",
+            "memory_type": "prototype_bank_plus_keyframe_graph",
             "visited_bank_size": args.visited_bank_size,
             "prototype_sim_threshold": args.prototype_sim_threshold,
+            "keyframe_sim_threshold": args.keyframe_sim_threshold,
+            "keyframe_match_radius_m": args.keyframe_match_radius_m,
+            "keyframe_min_step_gap": args.keyframe_min_step_gap,
+            "keyframe_add_interval": args.keyframe_add_interval,
             "stall_plateau_steps": args.stall_plateau_steps,
-            "subgoal_budget_steps": args.subgoal_budget_steps,
-            "subgoal_min_age_steps": args.subgoal_min_age_steps,
-            "subgoal_frontier_window_steps": args.subgoal_frontier_window_steps,
-            "subgoal_cooldown_steps": args.subgoal_cooldown_steps,
+            "route_budget_steps": args.subgoal_budget_steps,
+            "route_min_age_steps": args.subgoal_min_age_steps,
+            "route_frontier_window_steps": args.subgoal_frontier_window_steps,
+            "route_cooldown_steps": args.subgoal_cooldown_steps,
+            "route_min_hops": args.route_min_hops,
+            "goal_pursue_sim_threshold": args.goal_direct_sim_threshold,
+            "goal_route_improve_margin": args.goal_route_improve_margin,
+            "success_goal_sim_threshold": args.success_goal_sim_threshold,
+            "success_hold_steps": args.success_hold_steps,
+            "stuck_window_steps": args.stuck_window_steps,
+            "stuck_cmd_threshold": args.stuck_cmd_threshold,
+            "stuck_odom_threshold": args.stuck_odom_threshold,
+            "stuck_latent_threshold": args.stuck_latent_threshold,
+            "recover_budget_steps": args.recover_budget_steps,
+            "recover_cooldown_steps": args.recover_cooldown_steps,
             "visited_samples_seen": visited_seen,
             "visited_insertions": visited_insertions,
             "visited_replacements": visited_replacements,
             "visited_hits": visited_hits_total,
             "visited_bank_fill_step": visited_bank_fill_step,
             "visited_bank_replacement_step": visited_bank_replacement_step,
-            "subgoal_activations": subgoal_activations,
-            "subgoal_steps_total": subgoal_steps_total,
-            "subgoal_last_activation_step": subgoal_last_activation_step,
-            "subgoal_last_target_idx": subgoal_last_target_idx,
+            "graph_nodes": len(keyframe_nodes),
+            "graph_edges": int(sum(len(nbrs) for nbrs in keyframe_neighbors) // 2),
+            "route_activations": route_activations,
+            "route_steps_total": route_steps_total,
+            "route_last_activation_step": route_last_activation_step,
+            "route_last_target_idx": route_last_target_idx,
+            "planner_heads": scorer_meta,
         },
         "coverage": coverage_metrics,
         "path_xy": path_xy,
+        "oracle_path_xy": oracle_path_xy,
+        "modes": mode_log,
         "commands": cmds_log,
         "costs": costs_log,
     }
@@ -1636,7 +2323,7 @@ def main():
 
     print("=" * 60)
     print(f"RESULT: {terminate_reason} | steps={len(cmds_log)} | "
-          f"collisions={collision_count} | time={elapsed:.1f}s")
+          f"oracle_collisions={collision_count} | stuck={runtime_stuck_events} | time={elapsed:.1f}s")
     print(f"Output: {out_dir}")
     print("=" * 60)
 
