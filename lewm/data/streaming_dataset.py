@@ -27,6 +27,11 @@ class StreamingJEPADataset(IterableDataset):
     Args:
         data_dir: directory containing rendered chunk files (``*_rgb.h5``).
         seq_len: number of timesteps per returned sequence.
+        temporal_stride: spacing in raw timesteps between returned observations.
+        action_block_size: raw timesteps aggregated into each returned command.
+            Defaults to ``temporal_stride`` so each model step spans one stride.
+        window_stride: spacing in raw timesteps between sequence starts.
+            Defaults to ``seq_len * temporal_stride`` for non-overlapping windows.
         batch_size: worker-side micro-batch size.
         require_no_done: skip sequences that contain a ``done`` flag.
         require_no_collision: skip sequences that contain a ``collision`` flag.
@@ -49,6 +54,9 @@ class StreamingJEPADataset(IterableDataset):
         self,
         data_dir: str,
         seq_len: int = 4,
+        temporal_stride: int = 1,
+        action_block_size: int | None = None,
+        window_stride: int | None = None,
         batch_size: int = 256,
         require_no_done: bool = True,
         require_no_collision: bool = True,
@@ -60,12 +68,23 @@ class StreamingJEPADataset(IterableDataset):
         if not self.files:
             raise FileNotFoundError(f"No rendered HDF5 chunk files found in {data_dir}")
         self.seq_len = seq_len
+        self.temporal_stride = max(1, int(temporal_stride))
+        self.action_block_size = max(
+            1,
+            int(action_block_size if action_block_size is not None else self.temporal_stride),
+        )
+        default_window_stride = self.seq_len * self.temporal_stride
+        self.window_stride = max(
+            1,
+            int(window_stride if window_stride is not None else default_window_stride),
+        )
         self.batch_size = batch_size
         self.require_no_done = require_no_done
         self.require_no_collision = require_no_collision
         self._num_workers = max(1, num_workers)
         self.load_labels = load_labels
         self.vision_shape, self.proprio_dim = self._inspect_schema()
+        self.raw_span = (self.seq_len - 1) * self.temporal_stride + self.action_block_size
 
         # Pre-build index table: list of (file_path, env_idx, t0)
         # Scans dones/collisions at init (small arrays, ~10 MB total).
@@ -110,6 +129,8 @@ class StreamingJEPADataset(IterableDataset):
         for fpath in self.files:
             with h5py.File(fpath, "r") as h5f:
                 n_envs, T = h5f["vision"].shape[:2]
+                if T < self.raw_span:
+                    continue
                 dones = (
                     h5f["dones"][:] if ("dones" in h5f and self.require_no_done) else None
                 )
@@ -119,8 +140,8 @@ class StreamingJEPADataset(IterableDataset):
                     else None
                 )
                 for e in range(n_envs):
-                    for t0 in range(0, T - self.seq_len + 1, self.seq_len):
-                        t1 = t0 + self.seq_len
+                    for t0 in range(0, T - self.raw_span + 1, self.window_stride):
+                        t1 = t0 + self.raw_span
                         if dones is not None and np.any(dones[e, t0:t1]):
                             continue
                         if collisions is not None and np.any(collisions[e, t0:t1]):
@@ -192,20 +213,25 @@ class StreamingJEPADataset(IterableDataset):
                     if fpath not in open_files:
                         open_files[fpath] = h5py.File(fpath, "r")
                     h5f = open_files[fpath]
-                    t1 = t0 + self.seq_len
-                    vis[i] = h5f["vision"][e, t0:t1]
-                    prop[i] = h5f["proprio"][e, t0:t1]
-                    cmds[i] = h5f["cmds"][e, t0:t1]
-                    if "dones" in h5f:
-                        dones[i] = h5f["dones"][e, t0:t1]
-                    if "collisions" in h5f:
-                        collisions[i] = h5f["collisions"][e, t0:t1]
+                    obs_idx = t0 + np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
+                    vis[i] = h5f["vision"][e, obs_idx]
+                    prop[i] = h5f["proprio"][e, obs_idx]
+
+                    for step_idx, raw_start in enumerate(obs_idx.tolist()):
+                        raw_end = raw_start + self.action_block_size
+                        cmds[i, step_idx] = h5f["cmds"][e, raw_start:raw_end].mean(axis=0)
+                        if "dones" in h5f:
+                            dones[i, step_idx] = np.any(h5f["dones"][e, raw_start:raw_end])
+                        if "collisions" in h5f:
+                            collisions[i, step_idx] = np.any(
+                                h5f["collisions"][e, raw_start:raw_end]
+                            )
 
                     # Load extended labels if available
                     if self.load_labels:
                         for field in self.LABEL_FIELDS:
                             if field in h5f:
-                                label_arrays[field][i] = h5f[field][e, t0:t1]
+                                label_arrays[field][i] = h5f[field][e, obs_idx]
 
                 # Build label dict of tensors
                 labels = {}

@@ -376,7 +376,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_distractors", type=int, default=0)
     p.add_argument("--target_beacon", type=str, default=None)
     
-    p.add_argument("--steps", type=int, default=480)
+    p.add_argument("--steps", type=int, default=480,
+                   help="Number of planner steps (each may repeat the low-level controller).")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--sim_backend", type=str, default="auto")
     p.add_argument("--show_viewer", action="store_true")
@@ -386,6 +387,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem_iters", type=int, default=30)
     p.add_argument("--elite_frac", type=float, default=0.10)
     p.add_argument("--mpc_execute", type=int, default=1)
+    p.add_argument("--macro_action_repeat", type=int, default=1,
+                   help="Low-level control repeats per world-model planner step.")
     p.add_argument("--score_space", type=str, default="mixed",
                    choices=["mixed", "raw", "proj"])
     p.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
@@ -419,7 +422,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stall_plateau_steps", type=int, default=200,
                    help="Trigger routing after this many steps without a novel prototype or route/goal progress.")
     p.add_argument("--subgoal_budget_steps", type=int, default=120,
-                   help="Maximum number of control steps to spend following graph waypoints during a route episode.")
+                   help="Maximum number of planner steps to spend following graph waypoints during a route episode.")
     p.add_argument("--subgoal_min_age_steps", type=int, default=120,
                    help="A keyframe must not have been visited for at least this many steps to qualify as a route target.")
     p.add_argument("--subgoal_frontier_window_steps", type=int, default=800,
@@ -1249,25 +1252,30 @@ def encode_breadcrumb(
 
 # ---- PPO execution ------------------------------------------------------- #
 
+@torch.no_grad()
 def execute_command(
     scene, robot, policy, act_dofs, q0, prev_action,
-    nominal_cmd, sim_cfg, gs, torch_mod,
+    nominal_cmd, sim_cfg, gs, torch_mod, macro_action_repeat=1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    proprio, _, _ = collect_proprio(robot, act_dofs, q0, prev_action)
     cmd = nominal_cmd.to(device=gs.device, dtype=torch_mod.float32).view(1, 3)
-    obs_tensor = torch.cat([proprio, cmd], dim=1)
-    actions = policy.act_deterministic(obs_tensor)
+    last_action = prev_action.detach().clone()
+    repeats = max(1, int(macro_action_repeat))
+    for _ in range(repeats):
+        proprio, _, _ = collect_proprio(robot, act_dofs, q0, last_action)
+        obs_tensor = torch.cat([proprio, cmd], dim=1)
+        actions = policy.act_deterministic(obs_tensor)
 
-    q_tgt = q0.unsqueeze(0) + sim_cfg.action_scale * actions
-    q_tgt[:, 0:4] = torch_mod.clamp(q_tgt[:, 0:4], -0.8, 0.8)
-    q_tgt[:, 4:8] = torch_mod.clamp(q_tgt[:, 4:8], -1.5, 1.5)
-    q_tgt[:, 8:12] = torch_mod.clamp(q_tgt[:, 8:12], -2.5, -0.5)
+        q_tgt = q0.unsqueeze(0) + sim_cfg.action_scale * actions
+        q_tgt[:, 0:4] = torch_mod.clamp(q_tgt[:, 0:4], -0.8, 0.8)
+        q_tgt[:, 4:8] = torch_mod.clamp(q_tgt[:, 4:8], -1.5, 1.5)
+        q_tgt[:, 8:12] = torch_mod.clamp(q_tgt[:, 8:12], -2.5, -0.5)
 
-    robot.control_dofs_position(q_tgt, act_dofs)
-    for _ in range(sim_cfg.decimation):
-        scene.step()
+        robot.control_dofs_position(q_tgt, act_dofs)
+        for _ in range(sim_cfg.decimation):
+            scene.step()
+        last_action = actions.detach().clone()
 
-    return cmd.detach().clone(), actions.detach().clone()
+    return cmd.detach().clone(), last_action
 
 
 # ---- Visualization ------------------------------------------------------- #
@@ -1637,7 +1645,8 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
-          f"iters={args.cem_iters}, K={args.mpc_execute}, Score={args.score_space}, "
+          f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
+          f"Score={args.score_space}, "
           f"Frontier={args.novelty_weight}, GoalProg={args.goal_progress_weight}, "
           f"RouteProg={args.route_progress_weight}, ActionPen={args.action_penalty_weight}, "
           f"Bank={args.visited_bank_size}, ProtoThresh={args.prototype_sim_threshold:.3f}, "
@@ -1759,7 +1768,7 @@ def main():
         plan_seq: torch.Tensor | None = None
         plan_step_idx = 0
         plan_metrics_last: dict[str, float] = {}
-        step_dt_s = 0.01 * float(sim_cfg.decimation)
+        step_dt_s = 0.01 * float(sim_cfg.decimation) * float(max(1, args.macro_action_repeat))
 
         obs = observe(
             physics_robot, physics_act_dofs,
@@ -1958,6 +1967,7 @@ def main():
                 physics_scene, physics_robot, policy,
                 physics_act_dofs, q0, prev_action,
                 nominal_cmd.to(gs.device), sim_cfg, gs, torch,
+                macro_action_repeat=args.macro_action_repeat,
             )
             prev_action = actions.detach().clone()
 
@@ -2240,6 +2250,7 @@ def main():
         "result": terminate_reason,
         "oracle_goal_reached": oracle_goal_reached,
         "steps": len(cmds_log),
+        "low_level_control_steps": len(cmds_log) * max(1, args.macro_action_repeat),
         "oracle_collisions": collision_count,
         "runtime_stuck_events": runtime_stuck_events,
         "first_collision_step": first_collision_step,
@@ -2255,6 +2266,7 @@ def main():
             "cem_iters": args.cem_iters,
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
+            "macro_action_repeat": args.macro_action_repeat,
             "score_space": args.score_space,
             "frontier_weight": args.novelty_weight,
             "frontier_knn": args.frontier_knn,

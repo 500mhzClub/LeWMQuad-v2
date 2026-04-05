@@ -46,16 +46,24 @@ python scripts/2_visual_renderer.py --raw_dir jepa_raw_data --out_dir jepa_final
 # 3. Train LeWorldModel
 python scripts/3_train_lewm.py \
   --data_dir jepa_final_dataset \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --use_proprio \
   --sigreg_lambda 0.09 \
-  --out_dir lewm_checkpoints_keyframe_exec \
-  --log_dir lewm_logs_keyframe_exec
+  --out_dir lewm_checkpoints_keyframe_exec_stride5 \
+  --log_dir lewm_logs_keyframe_exec_stride5
 
 # 4. Train energy head (optional, for planning)
 python scripts/4_train_energy_head.py \
   --data_dir jepa_final_dataset \
-  --checkpoint lewm_checkpoints_keyframe_exec/latest.pt \
-  --out_dir energy_head_checkpoints_keyframe_exec \
-  --log_dir energy_head_logs_keyframe_exec
+  --checkpoint lewm_checkpoints_keyframe_exec_stride5/latest.pt \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --use_proprio \
+  --out_dir energy_head_checkpoints_keyframe_exec_stride5 \
+  --log_dir energy_head_logs_keyframe_exec_stride5
 ```
 
 ## Validation scripts

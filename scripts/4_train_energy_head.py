@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=256,
                    help="Batch size for latent extraction.")
     p.add_argument("--seq_len", type=int, default=4)
+    p.add_argument("--temporal_stride", type=int, default=1,
+                   help="Raw-step spacing between model observations.")
+    p.add_argument("--action_block_size", type=int, default=None,
+                   help="Raw-step action-block size per model step. Defaults to --temporal_stride.")
+    p.add_argument("--window_stride", type=int, default=None,
+                   help="Raw-step spacing between extraction sequence starts. Defaults to seq_len * temporal_stride.")
     p.add_argument("--image_size", type=int, default=None)
     p.add_argument("--patch_size", type=int, default=None)
     p.add_argument("--use_proprio", action="store_true")
@@ -73,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out_dir", type=str, default="energy_head_checkpoints_keyframe_exec")
     p.add_argument("--log_dir", type=str, default="energy_head_logs_keyframe_exec")
     p.add_argument("--cache_dir", type=str, default=None,
-                   help="Directory for cached latents. Defaults to <out_dir>/latent_cache_v2.")
+                   help="Directory for cached latents. Defaults to a stride/block-specific cache under <out_dir>.")
     p.add_argument("--extract_only", action="store_true",
                    help="Only extract latents, skip training.")
     # Model dims (must match encoder checkpoint)
@@ -163,7 +169,7 @@ def load_frozen_encoder(args, device):
 # --------------------------------------------------------------------- #
 
 SHARD_SAMPLES = 1_000_000  # ~750 MB per shard at dim=192
-CACHE_VERSION = 3          # v3: adds collisions to shards for consequence target
+CACHE_VERSION = 4          # v4: temporal abstraction metadata (stride / action blocks)
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -192,16 +198,34 @@ def progress_write(message: str, pbar=None) -> None:
 def extract_latents(args, device) -> str:
     """Encode the full dataset once and cache (z_proj, safety_target,
     beacon_identity, beacon_range) shards to disk."""
-    cache_dir = args.cache_dir or os.path.join(args.out_dir, "latent_cache_v2")
+    action_block_size = (
+        args.action_block_size if args.action_block_size is not None else args.temporal_stride
+    )
+    window_stride = (
+        args.window_stride
+        if args.window_stride is not None
+        else args.seq_len * args.temporal_stride
+    )
+    cache_name = (
+        f"latent_cache_seq{args.seq_len}_stride{args.temporal_stride}"
+        f"_block{action_block_size}_window{window_stride}"
+    )
+    cache_dir = args.cache_dir or os.path.join(args.out_dir, cache_name)
     manifest_path = os.path.join(cache_dir, "manifest.pt")
 
     if os.path.exists(manifest_path):
         info = torch.load(manifest_path, map_location="cpu")
-        if info.get("version", 1) >= CACHE_VERSION:
+        expected_cfg = {
+            "seq_len": int(args.seq_len),
+            "temporal_stride": int(args.temporal_stride),
+            "action_block_size": int(action_block_size),
+            "window_stride": int(window_stride),
+        }
+        if info.get("version", 1) >= CACHE_VERSION and info.get("temporal_cfg") == expected_cfg:
             print(f"Latent cache found: {info['n_samples']:,} samples in "
                   f"{info['n_shards']} shards (v{info.get('version', 1)})")
             return cache_dir
-        print("Cache version mismatch — re-extracting.")
+        print("Cache version/config mismatch — re-extracting.")
 
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -212,6 +236,9 @@ def extract_latents(args, device) -> str:
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
+        temporal_stride=args.temporal_stride,
+        action_block_size=args.action_block_size,
+        window_stride=args.window_stride,
         batch_size=args.batch_size,
         require_no_done=False,
         require_no_collision=False,
@@ -332,6 +359,12 @@ def extract_latents(args, device) -> str:
         "n_shards": shard_idx,
         "latent_dim": args.latent_dim,
         "version": CACHE_VERSION,
+        "temporal_cfg": {
+            "seq_len": int(args.seq_len),
+            "temporal_stride": int(args.temporal_stride),
+            "action_block_size": int(action_block_size),
+            "window_stride": int(window_stride),
+        },
     }, manifest_path)
     print(f"Extraction complete: {total_samples:,} samples, "
           f"{shard_idx} shards, {elapsed:.0f}s")
@@ -724,6 +757,9 @@ def train_progress_head(args, goal_pools, device):
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=max(2, args.progress_seq_len),
+        temporal_stride=args.temporal_stride,
+        action_block_size=args.action_block_size,
+        window_stride=args.window_stride,
         batch_size=args.progress_batch_size,
         require_no_done=False,
         require_no_collision=False,
@@ -939,6 +975,19 @@ def train(args):
 
     print(f"Training planning heads on {device}")
     print(f"Safety mode: {args.safety_mode}")
+    action_block_size = (
+        args.action_block_size if args.action_block_size is not None else args.temporal_stride
+    )
+    window_stride = (
+        args.window_stride
+        if args.window_stride is not None
+        else args.seq_len * args.temporal_stride
+    )
+    print(
+        "Temporal abstraction: "
+        f"seq_len={args.seq_len}, stride={args.temporal_stride}, "
+        f"action_block={action_block_size}, window_stride={window_stride}"
+    )
     if args.safety_mode == "consequence":
         print(f"  w_contact={args.w_contact}, w_mobility={args.w_mobility}, "
               f"contact_clearance={args.contact_clearance}m")
@@ -992,6 +1041,10 @@ def train(args):
         "dropout": args.dropout,
         "exploration_feature_dim": args.exploration_feature_dim,
         "safety_mode": args.safety_mode,
+        "seq_len": args.seq_len,
+        "temporal_stride": args.temporal_stride,
+        "action_block_size": action_block_size,
+        "window_stride": window_stride,
     }
     torch.save(scorer_data, scorer_path)
     print(f"\nTrajectoryScorer checkpoint saved: {scorer_path}")

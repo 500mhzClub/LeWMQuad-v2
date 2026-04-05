@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--seq_len", type=int, default=4)
+    p.add_argument("--temporal_stride", type=int, default=1,
+                   help="Raw-step spacing between model observations.")
+    p.add_argument("--action_block_size", type=int, default=None,
+                   help="Raw-step action-block size per model step. Defaults to --temporal_stride.")
+    p.add_argument("--window_stride", type=int, default=None,
+                   help="Raw-step spacing between sequence starts. Defaults to seq_len * temporal_stride.")
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--warmup_steps", type=int, default=1000,
                     help="Number of linear LR warmup steps before cosine decay.")
@@ -140,12 +146,28 @@ def progress_write(message: str, pbar=None) -> None:
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Initialising LeWorldModel training on {device}")
+    action_block_size = (
+        args.action_block_size if args.action_block_size is not None else args.temporal_stride
+    )
+    window_stride = (
+        args.window_stride
+        if args.window_stride is not None
+        else args.seq_len * args.temporal_stride
+    )
+    print(
+        "Temporal abstraction: "
+        f"seq_len={args.seq_len}, stride={args.temporal_stride}, "
+        f"action_block={action_block_size}, window_stride={window_stride}"
+    )
 
     # ---- Dataset / DataLoader ----------------------------------------
     num_workers = 12
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
+        temporal_stride=args.temporal_stride,
+        action_block_size=args.action_block_size,
+        window_stride=args.window_stride,
         batch_size=args.batch_size,
         require_no_done=False,
         require_no_collision=False,
