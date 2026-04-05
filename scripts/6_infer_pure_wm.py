@@ -98,6 +98,7 @@ class PrototypeBankUpdate:
     nearest_sim: float | None = None
     filled_now: bool = False
     replace_idx: int | None = None
+    prototype_idx: int | None = None
 
 
 # ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
@@ -267,6 +268,16 @@ def parse_args() -> argparse.Namespace:
                    help="Prototype-bank capacity for novelty memory.")
     p.add_argument("--prototype_sim_threshold", type=float, default=0.995,
                    help="Add a new prototype only when cosine similarity to the nearest stored prototype is below this threshold.")
+    p.add_argument("--stall_plateau_steps", type=int, default=200,
+                   help="Trigger a temporary frontier subgoal after this many steps without a novel prototype.")
+    p.add_argument("--subgoal_budget_steps", type=int, default=120,
+                   help="Maximum number of control steps to spend on a temporary frontier subgoal.")
+    p.add_argument("--subgoal_min_age_steps", type=int, default=120,
+                   help="A prototype must not have been visited for at least this many steps to qualify as a subgoal.")
+    p.add_argument("--subgoal_frontier_window_steps", type=int, default=800,
+                   help="Only consider prototypes inserted within this many steps of the latest novel prototype when choosing a frontier subgoal.")
+    p.add_argument("--subgoal_cooldown_steps", type=int, default=120,
+                   help="Minimum wait before another plateau-triggered subgoal can activate.")
     p.add_argument("--history_len", type=int, default=None,
                    help="Deprecated alias for --visited_bank_size.")
     p.add_argument("--success_range", type=float, default=0.4)
@@ -582,6 +593,7 @@ def update_prototype_bank(
             n_seen=n_seen,
             action="inserted",
             filled_now=(not filled_before and len(bank) >= max_size),
+            prototype_idx=0,
         )
 
     bank_tensor = torch.stack(bank)
@@ -596,6 +608,7 @@ def update_prototype_bank(
             n_seen=n_seen,
             action="hit",
             nearest_sim=nearest_sim_f,
+            prototype_idx=nearest_idx_i,
         )
 
     if len(bank) < max_size:
@@ -606,6 +619,7 @@ def update_prototype_bank(
             action="inserted",
             nearest_sim=nearest_sim_f,
             filled_now=(not filled_before and len(bank) >= max_size),
+            prototype_idx=len(bank) - 1,
         )
 
     replace_idx = choose_redundant_prototype(bank, hit_counts)
@@ -616,7 +630,85 @@ def update_prototype_bank(
         action="replaced",
         nearest_sim=nearest_sim_f,
         replace_idx=replace_idx,
+        prototype_idx=replace_idx,
     )
+
+
+def apply_prototype_update_steps(
+    last_seen_steps: list[int],
+    insert_steps: list[int],
+    update: PrototypeBankUpdate,
+    step: int,
+) -> None:
+    """Keep per-prototype metadata aligned with bank mutations."""
+    idx = update.prototype_idx
+    if idx is None:
+        return
+    if update.action == "inserted":
+        if idx == len(last_seen_steps):
+            last_seen_steps.append(step)
+            insert_steps.append(step)
+        elif 0 <= idx < len(last_seen_steps):
+            last_seen_steps[idx] = step
+            insert_steps[idx] = step
+        return
+    if 0 <= idx < len(last_seen_steps):
+        last_seen_steps[idx] = step
+    if update.action == "replaced" and 0 <= idx < len(insert_steps):
+        insert_steps[idx] = step
+
+
+def choose_frontier_subgoal(
+    bank: list[torch.Tensor],
+    hit_counts: list[int],
+    last_seen_steps: list[int],
+    insert_steps: list[int],
+    current_latent: torch.Tensor,
+    current_step: int,
+    min_age_steps: int,
+    frontier_window_steps: int,
+) -> int | None:
+    """Pick a low-hit frontier prototype rather than deep history behind the robot."""
+    if not bank:
+        return None
+
+    current = current_latent.detach().cpu().float()
+    current = F.normalize(current.unsqueeze(0), p=2, dim=-1).squeeze(0)
+    bank_tensor = torch.stack(bank)
+    sims = torch.mv(bank_tensor, current)
+
+    newest_insert = max(insert_steps) if insert_steps else current_step
+    frontier_cutoff = newest_insert - max(0, frontier_window_steps)
+
+    eligible: list[int] = []
+    for idx in range(len(bank)):
+        age = current_step - int(last_seen_steps[idx])
+        if age < min_age_steps:
+            continue
+        if int(insert_steps[idx]) < frontier_cutoff:
+            continue
+        eligible.append(idx)
+
+    if not eligible:
+        for idx in range(len(bank)):
+            age = current_step - int(last_seen_steps[idx])
+            if age >= min_age_steps:
+                eligible.append(idx)
+    if not eligible:
+        return None
+
+    best_idx = eligible[0]
+    best_key = None
+    for idx in eligible:
+        key = (
+            int(insert_steps[idx]),
+            -int(hit_counts[idx]),
+            -float(sims[idx].item()),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_idx = idx
+    return best_idx
 
 
 # ---- Breadcrumb encoding ------------------------------------------------- #
@@ -1071,7 +1163,8 @@ def main():
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Score={args.score_space}, "
           f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
-          f"Bank={args.visited_bank_size}, ProtoThresh={args.prototype_sim_threshold:.3f}")
+          f"Bank={args.visited_bank_size}, ProtoThresh={args.prototype_sim_threshold:.3f}, "
+          f"Plateau={args.stall_plateau_steps}, SubgoalBudget={args.subgoal_budget_steps}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -1084,16 +1177,29 @@ def main():
     cmds_log: List[List[float]] = []
     visited_bank: List[torch.Tensor] = []
     visited_bank_hits: List[int] = []
+    visited_bank_last_seen_steps: List[int] = []
+    visited_bank_insert_steps: List[int] = []
     visited_seen = 0
     visited_insertions = 0
     visited_replacements = 0
     visited_hits_total = 0
+    last_novel_prototype_step = 0
     terminate_reason = "max_steps"
     collision_count = 0
     frame_substitution_count = 0
     first_collision_step: int | None = None
     visited_bank_fill_step: int | None = None
     visited_bank_replacement_step: int | None = None
+    subgoal_active = False
+    subgoal_target_idx: int | None = None
+    subgoal_target_latent: torch.Tensor | None = None
+    subgoal_end_step: int | None = None
+    subgoal_exit_reason: str | None = None
+    subgoal_cooldown_until = 0
+    subgoal_activations = 0
+    subgoal_steps_total = 0
+    subgoal_last_activation_step: int | None = None
+    subgoal_last_target_idx: int | None = None
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
@@ -1172,20 +1278,31 @@ def main():
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
         path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
+        score_latent_now = select_score_latent(
+            obs["z_raw"], obs["z_proj"], args.score_space,
+        ).squeeze(0)
         
         bank_update = update_prototype_bank(
             visited_bank,
             visited_bank_hits,
-            select_score_latent(obs["z_raw"], obs["z_proj"], args.score_space).squeeze(0),
+            score_latent_now,
             visited_seen,
             args.visited_bank_size,
             args.prototype_sim_threshold,
         )
         visited_seen = bank_update.n_seen
+        apply_prototype_update_steps(
+            visited_bank_last_seen_steps,
+            visited_bank_insert_steps,
+            bank_update,
+            0,
+        )
         if bank_update.action == "inserted":
             visited_insertions += 1
+            last_novel_prototype_step = 0
         elif bank_update.action == "replaced":
             visited_replacements += 1
+            last_novel_prototype_step = 0
             if visited_bank_replacement_step is None:
                 visited_bank_replacement_step = 0
         elif bank_update.action == "hit":
@@ -1203,14 +1320,67 @@ def main():
             )
 
         for step in range(args.steps):
+            if subgoal_active and (
+                subgoal_exit_reason is not None
+                or (subgoal_end_step is not None and step >= subgoal_end_step)
+            ):
+                reason = subgoal_exit_reason or "budget"
+                print(
+                    f"Step {step:03d} | return to beacon "
+                    f"(reason={reason}, subgoal_idx={subgoal_target_idx})"
+                )
+                subgoal_active = False
+                subgoal_target_idx = None
+                subgoal_target_latent = None
+                subgoal_end_step = None
+                subgoal_exit_reason = None
+                subgoal_cooldown_until = step + args.subgoal_cooldown_steps
+                planner.reset()
+                plan_seq = None
+
+            if (
+                not subgoal_active
+                and step >= subgoal_cooldown_until
+                and len(visited_bank) >= 4
+                and (step - last_novel_prototype_step) >= args.stall_plateau_steps
+            ):
+                frontier_idx = choose_frontier_subgoal(
+                    visited_bank,
+                    visited_bank_hits,
+                    visited_bank_last_seen_steps,
+                    visited_bank_insert_steps,
+                    score_latent_now,
+                    step,
+                    args.subgoal_min_age_steps,
+                    args.subgoal_frontier_window_steps,
+                )
+                if frontier_idx is not None:
+                    frontier_age = step - int(visited_bank_last_seen_steps[frontier_idx])
+                    frontier_insert_age = step - int(visited_bank_insert_steps[frontier_idx])
+                    subgoal_active = True
+                    subgoal_target_idx = frontier_idx
+                    subgoal_target_latent = visited_bank[frontier_idx].detach().clone().to(planning_device)
+                    subgoal_end_step = step + args.subgoal_budget_steps
+                    subgoal_exit_reason = None
+                    subgoal_activations += 1
+                    subgoal_last_activation_step = step
+                    subgoal_last_target_idx = frontier_idx
+                    planner.reset()
+                    plan_seq = None
+                    print(
+                        f"Step {step:03d} | plateau escape -> frontier subgoal "
+                        f"idx={frontier_idx} hits={visited_bank_hits[frontier_idx]} "
+                        f"age={frontier_age} insert_age={frontier_insert_age}"
+                    )
+
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
 
             if need_replan:
                 novelty_bank = None
                 if args.novelty_weight > 0.0 and visited_bank:
                     novelty_bank = torch.stack(visited_bank).to(planning_device)
-
-                plan_seq, cost = planner.plan(obs["z_raw"], z_breadcrumb, novelty_bank)
+                active_goal = subgoal_target_latent if subgoal_active else z_breadcrumb
+                plan_seq, cost = planner.plan(obs["z_raw"], active_goal, novelty_bank)
                 plan_step_idx = 0
                 costs_log.append(cost)
 
@@ -1218,6 +1388,8 @@ def main():
             plan_step_idx += 1
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
             cmds_log.append(cmd_vals)
+            if subgoal_active:
+                subgoal_steps_total += 1
 
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
@@ -1233,6 +1405,9 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
+            score_latent_now = select_score_latent(
+                obs["z_raw"], obs["z_proj"], args.score_space,
+            ).squeeze(0)
             if obs["frame_substituted"]:
                 frame_substitution_count += 1
             if not obs["frame_substituted"]:
@@ -1240,18 +1415,28 @@ def main():
                 bank_update = update_prototype_bank(
                     visited_bank,
                     visited_bank_hits,
-                    select_score_latent(
-                        obs["z_raw"], obs["z_proj"], args.score_space,
-                    ).squeeze(0),
+                    score_latent_now,
                     visited_seen,
                     args.visited_bank_size,
                     args.prototype_sim_threshold,
                 )
                 visited_seen = bank_update.n_seen
+                apply_prototype_update_steps(
+                    visited_bank_last_seen_steps,
+                    visited_bank_insert_steps,
+                    bank_update,
+                    step,
+                )
                 if bank_update.action == "inserted":
                     visited_insertions += 1
+                    last_novel_prototype_step = step
+                    if subgoal_active:
+                        subgoal_exit_reason = "novel_prototype"
                 elif bank_update.action == "replaced":
                     visited_replacements += 1
+                    last_novel_prototype_step = step
+                    if subgoal_active:
+                        subgoal_exit_reason = "novel_prototype"
                     if visited_bank_replacement_step is None:
                         visited_bank_replacement_step = step
                         print(
@@ -1266,6 +1451,17 @@ def main():
                         f"Prototype bank full at step {step:03d}; "
                         "novel states will replace redundant prototypes"
                     )
+            if subgoal_active and subgoal_target_latent is not None:
+                current_norm = F.normalize(
+                    score_latent_now.detach().cpu().float().unsqueeze(0),
+                    p=2, dim=-1,
+                )
+                target_norm = subgoal_target_latent.detach().cpu().float().unsqueeze(0)
+                sim_to_subgoal = float(F.cosine_similarity(
+                    current_norm, target_norm, dim=-1,
+                ).item())
+                if sim_to_subgoal >= args.prototype_sim_threshold:
+                    subgoal_exit_reason = "subgoal_reached"
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
@@ -1326,13 +1522,17 @@ def main():
                         bank_status = f"{len(visited_bank)}/{args.visited_bank_size}"
                     else:
                         bank_status = "off"
+                    goal_mode = "beacon"
+                    if subgoal_active and subgoal_target_idx is not None:
+                        goal_mode = f"sub:{subgoal_target_idx}"
                     print(
                         f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                         f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
                         f"cost={costs_log[-1]:.3f} d_goal={dist_claim:.2f}m "
                         f"coll={collision_count} cov={cov_area:.2f}m^2 "
                         f"cov+={cov_delta:+.2f} proto={bank_status} "
-                        f"ins={visited_insertions} rep={visited_replacements}"
+                        f"ins={visited_insertions} rep={visited_replacements} "
+                        f"goal={goal_mode}"
                     )
 
             if reached:
@@ -1398,12 +1598,21 @@ def main():
             "memory_type": "prototype_bank",
             "visited_bank_size": args.visited_bank_size,
             "prototype_sim_threshold": args.prototype_sim_threshold,
+            "stall_plateau_steps": args.stall_plateau_steps,
+            "subgoal_budget_steps": args.subgoal_budget_steps,
+            "subgoal_min_age_steps": args.subgoal_min_age_steps,
+            "subgoal_frontier_window_steps": args.subgoal_frontier_window_steps,
+            "subgoal_cooldown_steps": args.subgoal_cooldown_steps,
             "visited_samples_seen": visited_seen,
             "visited_insertions": visited_insertions,
             "visited_replacements": visited_replacements,
             "visited_hits": visited_hits_total,
             "visited_bank_fill_step": visited_bank_fill_step,
             "visited_bank_replacement_step": visited_bank_replacement_step,
+            "subgoal_activations": subgoal_activations,
+            "subgoal_steps_total": subgoal_steps_total,
+            "subgoal_last_activation_step": subgoal_last_activation_step,
+            "subgoal_last_target_idx": subgoal_last_target_idx,
         },
         "coverage": coverage_metrics,
         "path_xy": path_xy,
