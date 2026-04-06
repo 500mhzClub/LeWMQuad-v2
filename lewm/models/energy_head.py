@@ -51,10 +51,13 @@ class GoalEnergyHead(nn.Module):
 
 
 class ProgressEnergyHead(nn.Module):
-    """Predicts whether a short transition makes progress toward a goal latent.
+    """Optional auxiliary probe for short-horizon goal progress.
 
     Inputs are the current latent, a future/predicted latent, and a goal latent.
     The output is a bounded progress bonus in ``[0, 1]`` where larger is better.
+
+    This head is useful for experiments, but the default minimal inference stack
+    can rely on safety energy, goal energy, and perceptual exploration alone.
     """
 
     def __init__(self, latent_dim: int = 192, dropout: float = 0.0):

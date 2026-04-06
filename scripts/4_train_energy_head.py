@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Train the full planning stack on frozen LeWM encoder latents.
+"""Train planning heads on frozen LeWM encoder latents.
 
-Three heads are trained on the same cached latent bank:
+The canonical runtime stack is:
+  - unconditional safety energy
+  - identity-conditioned goal energy
+  - optional RND exploration bonus for pure-perception search
+
+An additional progress head can still be trained as an auxiliary probe, but it
+is not required by the default inference script.
+
+The learned components are trained on the same cached latent bank:
 
   Phase 1 — Extract:  run frozen encoder once, cache (z_proj, labels) to disk.
   Phase 2 — Safety:   LatentEnergyHead on composite safety+mobility target.
   Phase 3 — Goal:     GoalEnergyHead on identity-conditioned beacon pairs.
-  Phase 4 — Explore:  ExplorationBonus (RND) on the full latent set.
+  Phase 4 — Progress: optional ProgressEnergyHead auxiliary probe.
+  Phase 5 — Explore:  ExplorationBonus (RND) on the full latent set.
 
-All three are combined at planning time by TrajectoryScorer:
+The default inference-time scorer is:
 
     cost = safety + α·goal − β·exploration
 

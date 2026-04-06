@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference with keyframe routing and learned progress.
+"""Pure-perception maze inference with a minimal learned planner.
 
-Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
-the world model directly without hand-cranked safety heuristics. The planner can
-score trajectories in three spaces:
-  - ``mixed``: current baseline, raw observation/goal history vs projected rollout
-  - ``raw``: raw observation/goal history vs raw rollout
-  - ``proj``: projected observation/goal history vs projected rollout
-Exploration is driven by a persistent novelty bank and an immutable keyframe
-graph built from onboard-valid signals. The MPC stays short-horizon and uses
-rollout progress, latent-density frontier bonuses, optional learned safety /
-progress heads, and short-hop route following. Simulator geometry is kept for
-offline metrics only; it is not used for action selection.
+The active control policy is intentionally simple:
+  - Explore with learned safety + learned novelty.
+  - Switch to goal-seeking once the current view is sufficiently similar to the
+    beacon breadcrumb.
+  - Keep simulator geometry for offline metrics only; never use it to steer.
+
+This file still contains some legacy helpers from earlier routing experiments,
+but the main loop no longer uses prototype banks, keyframe graphs, dead-reckoned
+route following, or learned progress shaping.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -21,7 +19,6 @@ python3 scripts/6_infer_pure_wm.py \
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import json
 import math
 import os
@@ -58,10 +55,10 @@ from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import generate_enclosed_maze
 from lewm.models import (
     ActorCritic,
+    ExplorationBonus,
     GoalEnergyHead,
     LatentEnergyHead,
     LeWorldModel,
-    ProgressEnergyHead,
 )
 from lewm.obstacle_utils import add_obstacles_to_scene, detect_collisions
 
@@ -127,16 +124,16 @@ class KeyframeNode:
 class PlannerHeads:
     safety_head: LatentEnergyHead | None = None
     goal_head: GoalEnergyHead | None = None
-    progress_head: ProgressEnergyHead | None = None
+    exploration: ExplorationBonus | None = None
     goal_weight: float = 0.0
-    progress_weight: float = 0.0
+    exploration_weight: float = 0.0
     safety_weight: float = 1.0
 
 
-# ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
+# ---- Pure CEM planner ---------------------------------------------------- #
 
 class PureCEMPlanner:
-    """CEM planner with configurable rollout / scoring representation."""
+    """CEM planner over learned safety, novelty, and goal energy."""
 
     def __init__(
         self,
@@ -150,12 +147,6 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
-        score_space: str = "mixed",
-        frontier_weight: float = 10.0,
-        frontier_knn: int = 8,
-        goal_progress_weight: float = 8.0,
-        route_progress_weight: float = 7.0,
-        displacement_weight: float = 2.5,
         action_penalty_weight: float = 0.001,
     ):
         self.world_model = world_model
@@ -168,12 +159,6 @@ class PureCEMPlanner:
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
-        self.score_space = score_space
-        self.frontier_weight = frontier_weight
-        self.frontier_knn = max(1, int(frontier_knn))
-        self.goal_progress_weight = goal_progress_weight
-        self.route_progress_weight = route_progress_weight
-        self.displacement_weight = displacement_weight
         self.action_penalty_weight = action_penalty_weight
         self._warm_start: torch.Tensor | None = None
 
@@ -184,39 +169,19 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_start_score: torch.Tensor,
-        z_start_proj: torch.Tensor,
-        visited_bank: torch.Tensor | None = None,
-        z_goal_score: torch.Tensor | None = None,
         z_goal_proj: torch.Tensor | None = None,
-        z_route_score: torch.Tensor | None = None,
-        mode: str = "search",
+        goal_active: bool = False,
         heads: PlannerHeads | None = None,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
+        if z0.ndim != 2 or z0.shape[0] != 1:
+            raise ValueError(f"Expected z_start_raw shape (1, D), got {tuple(z0.shape)}")
         z0_batch = z0.expand(self.n_candidates, -1)
-        z_start_score = z_start_score.to(self.device, dtype=torch.float32).view(1, -1)
-        z_start_proj = z_start_proj.to(self.device, dtype=torch.float32).view(1, -1)
-
-        z_goal_batch = None
-        if z_goal_score is not None:
-            if z_goal_score.ndim == 1:
-                z_goal_score = z_goal_score.unsqueeze(0)
-            z_goal_batch = z_goal_score.to(self.device, dtype=torch.float32).expand(
-                self.n_candidates, -1,
-            )
         z_goal_proj_batch = None
         if z_goal_proj is not None:
             if z_goal_proj.ndim == 1:
                 z_goal_proj = z_goal_proj.unsqueeze(0)
             z_goal_proj_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
-                self.n_candidates, -1,
-            )
-        z_route_batch = None
-        if z_route_score is not None:
-            if z_route_score.ndim == 1:
-                z_route_score = z_route_score.unsqueeze(0)
-            z_route_batch = z_route_score.to(self.device, dtype=torch.float32).expand(
                 self.n_candidates, -1,
             )
 
@@ -230,20 +195,6 @@ class PureCEMPlanner:
         best_seq = mean.clone()
         best_cost = float("inf")
         best_metrics: dict[str, float] = {}
-        goal_sim_now = None
-        if z_goal_batch is not None:
-            goal_sim_now = F.cosine_similarity(
-                F.normalize(z_start_score, p=2, dim=-1),
-                F.normalize(z_goal_batch[:1], p=2, dim=-1),
-                dim=-1,
-            ).item()
-        route_sim_now = None
-        if z_route_batch is not None:
-            route_sim_now = F.cosine_similarity(
-                F.normalize(z_start_score, p=2, dim=-1),
-                F.normalize(z_route_batch[:1], p=2, dim=-1),
-                dim=-1,
-            ).item()
 
         for _ in range(self.cem_iters):
             noise = torch.randn(
@@ -257,10 +208,6 @@ class PureCEMPlanner:
             samples[0] = mean
 
             z_rollouts_proj = self.world_model.plan_rollout(z0_batch, samples)
-            if self.score_space == "raw":
-                z_rollouts_score = self.world_model.plan_rollout_raw(z0_batch, samples)
-            else:
-                z_rollouts_score = z_rollouts_proj
             costs = torch.zeros(self.n_candidates, device=self.device)
             metrics: dict[str, torch.Tensor] = {}
 
@@ -269,67 +216,39 @@ class PureCEMPlanner:
                 costs += safety_cost
                 metrics["safety_cost"] = safety_cost
 
-            if heads is not None and heads.goal_head is not None and z_goal_proj_batch is not None:
+            if (
+                goal_active
+                and heads is not None
+                and heads.goal_head is not None
+                and z_goal_proj_batch is not None
+            ):
                 goal_energy = heads.goal_weight * heads.goal_head.score_trajectory(
                     z_rollouts_proj, z_goal_proj_batch,
                 )
                 costs += goal_energy
                 metrics["goal_energy"] = goal_energy
-
-            if z_goal_batch is not None and goal_sim_now is not None:
-                z_terminal = z_rollouts_score[:, -1, :]
-                cos_sim = F.cosine_similarity(
+            elif goal_active and z_goal_proj_batch is not None:
+                z_terminal = z_rollouts_proj[:, -1, :]
+                goal_cosine_cost = 1.0 - F.cosine_similarity(
                     F.normalize(z_terminal, p=2, dim=-1),
-                    F.normalize(z_goal_batch, p=2, dim=-1),
+                    F.normalize(z_goal_proj_batch, p=2, dim=-1),
                     dim=-1,
                 )
-                goal_progress = (cos_sim - goal_sim_now).clamp_min(0.0)
-                costs -= self.goal_progress_weight * goal_progress
-                metrics["goal_progress"] = goal_progress
+                costs += goal_cosine_cost
+                metrics["goal_cosine_cost"] = goal_cosine_cost
 
-            if heads is not None and heads.progress_head is not None and z_goal_proj_batch is not None:
-                progress_bonus = heads.progress_head.score_trajectory(
-                    z_rollouts_proj,
-                    z_start_proj.expand(self.n_candidates, -1),
-                    z_goal_proj_batch,
-                )
-                costs -= heads.progress_weight * progress_bonus
-                metrics["learned_progress"] = progress_bonus
-
-            if z_route_batch is not None and route_sim_now is not None:
-                z_terminal = z_rollouts_score[:, -1, :]
-                route_sim = F.cosine_similarity(
-                    F.normalize(z_terminal, p=2, dim=-1),
-                    F.normalize(z_route_batch, p=2, dim=-1),
-                    dim=-1,
-                )
-                route_progress = (route_sim - route_sim_now).clamp_min(0.0)
-                costs -= self.route_progress_weight * route_progress
-                metrics["route_progress"] = route_progress
-
-            if visited_bank is not None and self.frontier_weight > 0.0:
-                M = visited_bank.shape[0]
-                if M > 0:
-                    z_norm = F.normalize(z_rollouts_score, p=2, dim=-1)
-                    bank_norm = F.normalize(
-                        visited_bank.to(self.device, dtype=torch.float32),
-                        p=2, dim=-1,
-                    )
-                    sim_matrix = torch.einsum("bhd,md->bhm", z_norm, bank_norm)
-                    k = min(self.frontier_knn, M)
-                    knn_sim = sim_matrix.topk(k=k, dim=-1, largest=True).values.mean(dim=-1)
-                    frontier_bonus = (1.0 - knn_sim).mean(dim=-1)
-                    costs -= self.frontier_weight * frontier_bonus
-                    metrics["frontier_bonus"] = frontier_bonus
-
-            if mode == "recover":
-                terminal_disp = 1.0 - F.cosine_similarity(
-                    F.normalize(z_rollouts_score[:, -1, :], p=2, dim=-1),
-                    F.normalize(z_start_score.expand(self.n_candidates, -1), p=2, dim=-1),
-                    dim=-1,
-                )
-                costs -= self.displacement_weight * terminal_disp
-                metrics["recover_disp"] = terminal_disp
+            if (
+                not goal_active
+                and heads is not None
+                and heads.exploration is not None
+                and heads.exploration_weight > 0.0
+            ):
+                n_cand, horizon, latent_dim = z_rollouts_proj.shape
+                bonus = heads.exploration(
+                    z_rollouts_proj.reshape(n_cand * horizon, latent_dim),
+                ).reshape(n_cand, horizon).sum(dim=-1)
+                costs -= heads.exploration_weight * bonus
+                metrics["exploration_bonus"] = bonus
 
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
@@ -361,12 +280,12 @@ class PureCEMPlanner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pure world-model maze inference (Aligned z_raw latents).",
+        description="Pure-perception maze inference with learned safety, novelty, and goal energy.",
     )
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
     p.add_argument("--scorer_ckpt", type=str, default=None,
-                   help="Optional trajectory scorer checkpoint with safety / goal / progress heads.")
+                   help="Optional trajectory scorer checkpoint with safety / goal / exploration heads.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grid_rows", type=int, default=4)
     p.add_argument("--grid_cols", type=int, default=4)
@@ -390,22 +309,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--macro_action_repeat", type=int, default=1,
                    help="Low-level control repeats per world-model planner step.")
     p.add_argument("--score_space", type=str, default="mixed",
-                   choices=["mixed", "raw", "proj"])
+                   choices=["mixed", "raw", "proj"],
+                   help="Deprecated legacy flag. Planner now always scores in projected latent space.")
     p.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
     p.add_argument("--novelty_weight", type=float, default=10.0,
-                   help="Frontier-density bonus weight over the persistent novelty bank.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--exploration_weight", type=float, default=None,
+                   help="Override learned RND exploration weight from the scorer checkpoint.")
     p.add_argument("--frontier_knn", type=int, default=8,
-                   help="Number of nearest novelty-bank entries used to estimate latent density.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--goal_progress_weight", type=float, default=8.0,
-                   help="Weight on rollout progress toward the beacon breadcrumb.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--route_progress_weight", type=float, default=7.0,
-                   help="Weight on rollout progress toward the next route keyframe.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--recover_displacement_weight", type=float, default=2.5,
-                   help="Extra terminal displacement bonus while in recover mode.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--visited_bank_size", type=int, default=512,
                    help="Prototype-bank capacity for novelty memory.")
@@ -472,51 +394,7 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.history_len is not None:
         args.visited_bank_size = args.history_len
-
-    def flag_provided(flag: str) -> bool:
-        for token in sys.argv[1:]:
-            if token == flag or token.startswith(f"{flag}="):
-                return True
-        return False
-
-    auto_scaled: dict[str, dict[str, float]] = {}
-    repeat = max(1, int(args.macro_action_repeat))
-    if repeat > 1:
-        sqrt_repeat = math.sqrt(float(repeat))
-
-        def maybe_scale_int(attr: str, flag: str, minimum: int = 1) -> None:
-            if flag_provided(flag):
-                return
-            old = int(getattr(args, attr))
-            new = max(minimum, int(math.ceil(old / float(repeat))))
-            if new != old:
-                setattr(args, attr, new)
-                auto_scaled[attr] = {"old": old, "new": new}
-
-        def maybe_scale_float(attr: str, flag: str, scale: float) -> None:
-            if flag_provided(flag):
-                return
-            old = float(getattr(args, attr))
-            new = old * scale
-            if not math.isclose(new, old, rel_tol=1e-9, abs_tol=1e-12):
-                setattr(args, attr, new)
-                auto_scaled[attr] = {"old": old, "new": new}
-
-        maybe_scale_int("keyframe_min_step_gap", "--keyframe_min_step_gap", minimum=2)
-        maybe_scale_int("keyframe_add_interval", "--keyframe_add_interval", minimum=4)
-        maybe_scale_int("stall_plateau_steps", "--stall_plateau_steps", minimum=40)
-        maybe_scale_int("subgoal_budget_steps", "--subgoal_budget_steps", minimum=20)
-        maybe_scale_int("subgoal_min_age_steps", "--subgoal_min_age_steps", minimum=20)
-        maybe_scale_int("subgoal_frontier_window_steps", "--subgoal_frontier_window_steps", minimum=80)
-        maybe_scale_int("subgoal_cooldown_steps", "--subgoal_cooldown_steps", minimum=20)
-        maybe_scale_int("success_hold_steps", "--success_hold_steps", minimum=2)
-        maybe_scale_int("stuck_window_steps", "--stuck_window_steps", minimum=4)
-        maybe_scale_int("recover_budget_steps", "--recover_budget_steps", minimum=6)
-        maybe_scale_int("recover_cooldown_steps", "--recover_cooldown_steps", minimum=6)
-        maybe_scale_float("stuck_odom_threshold", "--stuck_odom_threshold", sqrt_repeat)
-        maybe_scale_float("stuck_latent_threshold", "--stuck_latent_threshold", sqrt_repeat)
-
-    args.auto_scaled_defaults = auto_scaled
+    args.auto_scaled_defaults = {}
     return args
 
 
@@ -608,6 +486,7 @@ def load_planner_heads(
     hidden_dim = int(ckpt.get("hidden_dim", 512))
     dropout = float(ckpt.get("dropout", 0.0))
     latent_dim = int(wm_meta["latent_dim"])
+    exploration_dim = int(ckpt.get("exploration_feature_dim", 128))
 
     if ckpt.get("safety_head") is not None:
         safety = LatentEnergyHead(latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
@@ -621,21 +500,25 @@ def load_planner_heads(
         goal.eval()
         heads.goal_head = goal
 
-    if ckpt.get("progress_head") is not None:
-        progress = ProgressEnergyHead(latent_dim=latent_dim, dropout=dropout).to(device)
-        clean_load_state(progress, ckpt["progress_head"])
-        progress.eval()
-        heads.progress_head = progress
+    if ckpt.get("exploration") is not None:
+        exploration = ExplorationBonus(
+            latent_dim=latent_dim,
+            feature_dim=exploration_dim,
+        ).to(device)
+        clean_load_state(exploration, ckpt["exploration"])
+        exploration.eval()
+        heads.exploration = exploration
 
     heads.goal_weight = float(ckpt.get("goal_weight", 0.0))
-    heads.progress_weight = float(ckpt.get("progress_weight", 0.0))
+    heads.exploration_weight = float(ckpt.get("exploration_weight", 0.0))
     heads.safety_weight = 1.0
     meta = {
         "has_safety_head": heads.safety_head is not None,
         "has_goal_head": heads.goal_head is not None,
-        "has_progress_head": heads.progress_head is not None,
+        "has_exploration": heads.exploration is not None,
+        "has_progress_head_ckpt": ckpt.get("progress_head") is not None,
         "goal_weight": heads.goal_weight,
-        "progress_weight": heads.progress_weight,
+        "exploration_weight": heads.exploration_weight,
         "safety_mode": ckpt.get("safety_mode"),
         "seq_len": ckpt.get("seq_len"),
         "temporal_stride": ckpt.get("temporal_stride"),
@@ -1711,7 +1594,7 @@ def has_line_of_sight(a_xy, b_xy, obstacle_layout, step_size=0.03, margin=0.05):
 def main():
     args = parse_args()
     if args.out_dir is None:
-        args.out_dir = os.path.join("inference_runs", f"keyframe_exec_seed_{args.seed:04d}")
+        args.out_dir = os.path.join("inference_runs", f"perception_only_seed_{args.seed:04d}")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1723,30 +1606,36 @@ def main():
     planner_heads, scorer_meta = load_planner_heads(
         args.scorer_ckpt, planning_device, wm_meta, args.macro_action_repeat,
     )
+    if args.exploration_weight is not None:
+        planner_heads.exploration_weight = float(args.exploration_weight)
     camera_cfg = ego_camera_config_from_args(args)
 
     print(f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
           f"image_size={wm_meta['image_size']}")
+    if wm_meta["use_proprio"]:
+        print(
+            "World-model checkpoint still uses proprio tokens. "
+            "The planner is perception-only at the control-logic level, but a fully "
+            "vision-only forward pass still requires a pure-vision checkpoint."
+        )
     if args.scorer_ckpt is not None:
         print(
             "Loaded planner heads: "
             f"safety={scorer_meta.get('has_safety_head', False)} "
             f"goal={scorer_meta.get('has_goal_head', False)} "
-            f"progress={scorer_meta.get('has_progress_head', False)} "
+            f"exploration={scorer_meta.get('has_exploration', False)} "
             f"(seq={scorer_meta.get('seq_len')}, "
             f"stride={scorer_meta.get('temporal_stride')}, "
             f"block={scorer_meta.get('action_block_size')}, "
             f"use_proprio={scorer_meta.get('use_proprio')})"
         )
-    if getattr(args, "auto_scaled_defaults", None):
-        scaled_pairs = ", ".join(
-            f"{name}={spec['old']}->{spec['new']}"
-            for name, spec in sorted(args.auto_scaled_defaults.items())
-        )
+    if args.score_space != "proj":
         print(
-            "Auto-scaled planner defaults for "
-            f"macro_action_repeat={args.macro_action_repeat}: {scaled_pairs}"
+            f"Ignoring --score_space={args.score_space!r}; "
+            "the active planner always scores projected latents."
         )
+    if scorer_meta.get("has_progress_head_ckpt", False):
+        print("Ignoring legacy progress head stored in scorer checkpoint.")
 
     obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
         seed=args.seed,
@@ -1790,12 +1679,11 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
-          f"Score={args.score_space}, "
-          f"Frontier={args.novelty_weight}, GoalProg={args.goal_progress_weight}, "
-          f"RouteProg={args.route_progress_weight}, ActionPen={args.action_penalty_weight}, "
-          f"Bank={args.visited_bank_size}, ProtoThresh={args.prototype_sim_threshold:.3f}, "
-          f"Plateau={args.stall_plateau_steps}, RouteBudget={args.subgoal_budget_steps}, "
-          f"RouteHops={args.route_min_hops}, DirectGoal={args.goal_direct_sim_threshold:.2f}")
+          f"Latent=proj, GoalAct={args.goal_direct_sim_threshold:.2f}, "
+          f"GoalSucc={args.success_goal_sim_threshold:.2f}, "
+          f"GoalW={planner_heads.goal_weight:.3f}, "
+          f"ExploreW={planner_heads.exploration_weight:.3f}, "
+          f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -1808,47 +1696,17 @@ def main():
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
     mode_log: List[str] = []
-    visited_bank: List[torch.Tensor] = []
-    visited_bank_hits: List[int] = []
-    visited_bank_last_seen_steps: List[int] = []
-    visited_bank_insert_steps: List[int] = []
-    keyframe_nodes: List[KeyframeNode] = []
-    keyframe_neighbors: List[set[int]] = []
-    visited_seen = 0
-    visited_insertions = 0
-    visited_replacements = 0
-    visited_hits_total = 0
-    last_novel_prototype_step = 0
+    goal_similarity_log: List[float | None] = []
     terminate_reason = "max_steps"
     collision_count = 0
-    runtime_stuck_events = 0
     frame_substitution_count = 0
     first_collision_step: int | None = None
-    visited_bank_fill_step: int | None = None
-    visited_bank_replacement_step: int | None = None
-    current_keyframe_idx: int | None = None
-    prev_keyframe_idx: int | None = None
-    route_active = False
-    route_waypoints: List[int] = []
-    route_target_idx: int | None = None
-    route_target_kind: str | None = None
-    route_end_step: int | None = None
-    route_exit_reason: str | None = None
-    route_cooldown_until = 0
-    route_activations = 0
-    route_steps_total = 0
-    route_last_activation_step: int | None = None
-    route_last_target_idx: int | None = None
-    recover_active_until = -1
-    recover_cooldown_until = 0
     success_hold_count = 0
+    goal_activation_step: int | None = None
     oracle_goal_reached = False
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
-    recent_cmd_mag = deque(maxlen=max(1, args.stuck_window_steps))
-    recent_odom_disp = deque(maxlen=max(1, args.stuck_window_steps))
-    recent_latent_disp = deque(maxlen=max(1, args.stuck_window_steps))
 
     try:
         import genesis as gs
@@ -1868,16 +1726,12 @@ def main():
             args.third_person_res, args.third_person_fov, 0.01,
         )
 
-        z_breadcrumb = None
         z_breadcrumb_proj_ref = None
         if target_beacon is not None:
             z_breadcrumb_raw, z_breadcrumb_proj = encode_breadcrumb(
                 world_model, ego_scene, ego_robot, ego_act_dofs, ego_cam,
                 target_beacon, args.breadcrumb_view_dist,
                 planning_device, q0, gs, torch,
-            )
-            z_breadcrumb = select_score_latent(
-                z_breadcrumb_raw, z_breadcrumb_proj, args.score_space,
             )
             z_breadcrumb_proj_ref = z_breadcrumb_proj.detach().clone()
             print(
@@ -1898,12 +1752,6 @@ def main():
             init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
-            score_space=args.score_space,
-            frontier_weight=args.novelty_weight,
-            frontier_knn=args.frontier_knn,
-            goal_progress_weight=args.goal_progress_weight,
-            route_progress_weight=args.route_progress_weight,
-            displacement_weight=args.recover_displacement_weight,
             action_penalty_weight=args.action_penalty_weight,
         )
 
@@ -1912,7 +1760,7 @@ def main():
         plan_seq: torch.Tensor | None = None
         plan_step_idx = 0
         plan_metrics_last: dict[str, float] = {}
-        step_dt_s = 0.01 * float(sim_cfg.decimation) * float(max(1, args.macro_action_repeat))
+        goal_seek_active_prev = False
 
         obs = observe(
             physics_robot, physics_act_dofs,
@@ -1930,55 +1778,10 @@ def main():
         )
         tp_frames_hwc.append(tp_frame)
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
-        odom_xy = spawn_xy.astype(np.float32).copy()
-        path_xy.append([float(odom_xy[0]), float(odom_xy[1])])
-        oracle_path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+        start_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
+        path_xy.append(start_xy)
+        oracle_path_xy.append(start_xy.copy())
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
-        score_latent_now = select_score_latent(
-            obs["z_raw"], obs["z_proj"], args.score_space,
-        ).squeeze(0)
-        prev_score_latent = score_latent_now.detach().cpu().float().clone()
-        prev_odom_xy = odom_xy.copy()
-        
-        bank_update = update_prototype_bank(
-            visited_bank,
-            visited_bank_hits,
-            score_latent_now,
-            visited_seen,
-            args.visited_bank_size,
-            args.prototype_sim_threshold,
-        )
-        visited_seen = bank_update.n_seen
-        apply_prototype_update_steps(
-            visited_bank_last_seen_steps,
-            visited_bank_insert_steps,
-            bank_update,
-            0,
-        )
-        if bank_update.action == "inserted":
-            visited_insertions += 1
-            last_novel_prototype_step = 0
-        elif bank_update.action == "replaced":
-            visited_replacements += 1
-            last_novel_prototype_step = 0
-            if visited_bank_replacement_step is None:
-                visited_bank_replacement_step = 0
-        elif bank_update.action == "hit":
-            visited_hits_total += 1
-        if bank_update.filled_now:
-            visited_bank_fill_step = 0
-            print("Prototype bank full at initial observation; novel states will replace redundant prototypes")
-
-        current_keyframe_idx = add_keyframe_node(
-            keyframe_nodes,
-            keyframe_neighbors,
-            score_latent_now,
-            obs["z_proj"].squeeze(0),
-            odom_xy,
-            obs["yaw_rad"],
-            0,
-        )
-        prev_keyframe_idx = current_keyframe_idx
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1990,122 +1793,40 @@ def main():
 
         for step in range(args.steps):
             goal_sim_now = None
-            if z_breadcrumb is not None:
-                goal_sim_now = cosine_similarity_scalar(score_latent_now, z_breadcrumb)
-            pursue_active = (
-                z_breadcrumb is not None
-                and goal_sim_now is not None
-                and goal_sim_now >= args.goal_direct_sim_threshold
-            )
-
-            if route_active and pursue_active:
-                route_exit_reason = "goal_basin"
-
-            if route_active and (
-                route_exit_reason is not None
-                or (route_end_step is not None and step >= route_end_step)
-            ):
-                reason = route_exit_reason or "budget"
-                next_mode = "pursue" if reason == "goal_basin" else "search"
-                print(
-                    f"Step {step:03d} | return to {next_mode} "
-                    f"(reason={reason}, route_target={route_target_kind}:{route_target_idx})"
+            goal_seek_active = False
+            if z_breadcrumb_proj_ref is not None:
+                goal_sim_now = cosine_similarity_scalar(
+                    obs["z_proj"].squeeze(0),
+                    z_breadcrumb_proj_ref,
                 )
-                route_active = False
-                route_waypoints = []
-                route_target_idx = None
-                route_target_kind = None
-                route_end_step = None
-                route_exit_reason = None
-                route_cooldown_until = step + args.subgoal_cooldown_steps
+                goal_seek_active = goal_sim_now >= args.goal_direct_sim_threshold
+                if goal_seek_active and goal_activation_step is None:
+                    goal_activation_step = step
+
+            if goal_seek_active != goal_seek_active_prev:
                 planner.reset()
                 plan_seq = None
+                plan_step_idx = 0
+            goal_seek_active_prev = goal_seek_active
 
-            recent_goal_signal = (
-                float(plan_metrics_last.get("goal_progress", 0.0))
-                + float(plan_metrics_last.get("learned_progress", 0.0))
-            )
-            if (
-                not route_active
-                and step >= route_cooldown_until
-                and step >= recover_cooldown_until
-                and len(keyframe_nodes) >= 4
-                and current_keyframe_idx is not None
-                and (step - last_novel_prototype_step) >= args.stall_plateau_steps
-                and recent_goal_signal < 0.025
-                and not pursue_active
-            ):
-                route_selection = choose_keyframe_route_path(
-                    keyframe_nodes,
-                    keyframe_neighbors,
-                    current_keyframe_idx,
-                    step,
-                    args.subgoal_min_age_steps,
-                    args.subgoal_frontier_window_steps,
-                    args.route_min_hops,
-                    z_breadcrumb,
-                    args.goal_route_improve_margin,
-                )
-                if route_selection is not None:
-                    route_kind, target_idx, path_waypoints, target_goal_sim = route_selection
-                    route_active = True
-                    route_waypoints = path_waypoints
-                    route_target_idx = target_idx
-                    route_target_kind = route_kind
-                    route_end_step = step + args.subgoal_budget_steps
-                    route_exit_reason = None
-                    route_activations += 1
-                    route_last_activation_step = step
-                    route_last_target_idx = target_idx
-                    planner.reset()
-                    plan_seq = None
-                    first_hop = path_waypoints[0] if path_waypoints else None
-                    target_goal_str = "n/a" if target_goal_sim is None else f"{target_goal_sim:.3f}"
-                    print(
-                        f"Step {step:03d} | route -> {route_kind} "
-                        f"target={target_idx} hops={len(path_waypoints)} next={first_hop} "
-                        f"goal_sim={target_goal_str}"
-                    )
-
-            if step < recover_active_until:
-                mode = "recover"
-            elif route_active and route_waypoints:
-                mode = "route"
-            elif pursue_active:
-                mode = "pursue"
-            else:
-                mode = "search"
+            mode = "goal_seek" if goal_seek_active else "explore"
             mode_log.append(mode)
 
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
             if need_replan:
-                novelty_bank = None
-                if args.novelty_weight > 0.0 and visited_bank:
-                    novelty_bank = torch.stack(visited_bank).to(planning_device)
-                route_score = None
-                if route_active and route_waypoints:
-                    route_score = keyframe_nodes[route_waypoints[0]].score_latent.to(planning_device)
                 plan_seq, cost, plan_metrics_last = planner.plan(
                     obs["z_raw"],
-                    score_latent_now,
-                    obs["z_proj"].squeeze(0),
-                    visited_bank=novelty_bank,
-                    z_goal_score=z_breadcrumb,
                     z_goal_proj=z_breadcrumb_proj_ref,
-                    z_route_score=route_score,
-                    mode=mode,
+                    goal_active=goal_seek_active,
                     heads=planner_heads,
                 )
                 plan_step_idx = 0
-                costs_log.append(cost)
+                costs_log.append(float(cost))
 
             nominal_cmd = plan_seq[plan_step_idx]
             plan_step_idx += 1
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
-            cmd_mag = float(np.linalg.norm(np.asarray(cmd_vals, dtype=np.float32)))
             cmds_log.append(cmd_vals)
-            if route_active:
-                route_steps_total += 1
 
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
@@ -2122,122 +1843,33 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
-            score_latent_now = select_score_latent(
-                obs["z_raw"], obs["z_proj"], args.score_space,
-            ).squeeze(0)
             goal_sim_now = None
-            if z_breadcrumb is not None:
-                goal_sim_now = cosine_similarity_scalar(score_latent_now, z_breadcrumb)
+            if z_breadcrumb_proj_ref is not None:
+                goal_sim_now = cosine_similarity_scalar(
+                    obs["z_proj"].squeeze(0),
+                    z_breadcrumb_proj_ref,
+                )
 
-            odom_xy = estimate_dead_reckoning_step(
-                prev_odom_xy,
-                obs["yaw_rad"],
-                obs["proprio"],
-                step_dt_s,
-            )
-            cur_xy = [float(odom_xy[0]), float(odom_xy[1])]
+            cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
             prev_xy = path_xy[-1]
             path_xy.append(cur_xy)
             update_coverage_tracker(coverage_tracker, prev_xy, cur_xy)
-            oracle_cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
+            oracle_cur_xy = cur_xy.copy()
             oracle_path_xy.append(oracle_cur_xy)
 
             if obs["frame_substituted"]:
                 frame_substitution_count += 1
             else:
                 last_clean_frame = obs["frame_hwc"].copy()
-                bank_update = update_prototype_bank(
-                    visited_bank,
-                    visited_bank_hits,
-                    score_latent_now,
-                    visited_seen,
-                    args.visited_bank_size,
-                    args.prototype_sim_threshold,
-                )
-                visited_seen = bank_update.n_seen
-                apply_prototype_update_steps(
-                    visited_bank_last_seen_steps,
-                    visited_bank_insert_steps,
-                    bank_update,
-                    step,
-                )
-                if bank_update.action == "inserted":
-                    visited_insertions += 1
-                    last_novel_prototype_step = step
-                elif bank_update.action == "replaced":
-                    visited_replacements += 1
-                    last_novel_prototype_step = step
-                    if visited_bank_replacement_step is None:
-                        visited_bank_replacement_step = step
-                        print(
-                            f"Prototype bank replacement started at step {step:03d}; "
-                            "replacing redundant prototypes"
-                        )
-                elif bank_update.action == "hit":
-                    visited_hits_total += 1
-                if bank_update.filled_now and visited_bank_fill_step is None:
-                    visited_bank_fill_step = step
-                    print(
-                        f"Prototype bank full at step {step:03d}; "
-                        "novel states will replace redundant prototypes"
-                    )
-
-                matched_idx = match_keyframe_node(
-                    keyframe_nodes,
-                    score_latent_now,
-                    odom_xy,
-                    step,
-                    args.keyframe_sim_threshold,
-                    args.keyframe_match_radius_m,
-                    args.keyframe_min_step_gap,
-                )
-                if matched_idx is not None:
-                    current_keyframe_idx = matched_idx
-                    touch_keyframe_node(
-                        keyframe_nodes[current_keyframe_idx],
-                        odom_xy,
-                        obs["yaw_rad"],
-                        step,
-                    )
-                else:
-                    add_new_keyframe = (
-                        current_keyframe_idx is None
-                        or bank_update.action in {"inserted", "replaced"}
-                        or (step - keyframe_nodes[current_keyframe_idx].step) >= args.keyframe_add_interval
-                    )
-                    if add_new_keyframe:
-                        current_keyframe_idx = add_keyframe_node(
-                            keyframe_nodes,
-                            keyframe_neighbors,
-                            score_latent_now,
-                            obs["z_proj"].squeeze(0),
-                            odom_xy,
-                            obs["yaw_rad"],
-                            step,
-                        )
-                    elif current_keyframe_idx is not None:
-                        touch_keyframe_node(
-                            keyframe_nodes[current_keyframe_idx],
-                            odom_xy,
-                            obs["yaw_rad"],
-                            step,
-                        )
-
                 if (
-                    prev_keyframe_idx is not None
-                    and current_keyframe_idx is not None
-                    and prev_keyframe_idx != current_keyframe_idx
+                    args.rnd_online_lr > 0.0
+                    and planner_heads.exploration is not None
+                    and planner_heads.exploration_weight > 0.0
                 ):
-                    keyframe_neighbors[prev_keyframe_idx].add(current_keyframe_idx)
-                    keyframe_neighbors[current_keyframe_idx].add(prev_keyframe_idx)
-                prev_keyframe_idx = current_keyframe_idx
-
-                if route_active and route_waypoints and current_keyframe_idx == route_waypoints[0]:
-                    route_waypoints.pop(0)
-                    planner.reset()
-                    plan_seq = None
-                    if not route_waypoints:
-                        route_exit_reason = "route_complete"
+                    planner_heads.exploration.online_update(
+                        obs["z_proj"].to(planning_device),
+                        lr=args.rnd_online_lr,
+                    )
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
@@ -2259,41 +1891,6 @@ def main():
                 if first_collision_step is None:
                     first_collision_step = step
 
-            odom_step_disp = float(np.linalg.norm(odom_xy - prev_odom_xy))
-            latent_step_disp = latent_displacement(prev_score_latent, score_latent_now)
-            recent_cmd_mag.append(cmd_mag)
-            recent_odom_disp.append(odom_step_disp)
-            recent_latent_disp.append(latent_step_disp)
-            prev_odom_xy = odom_xy.copy()
-            prev_score_latent = score_latent_now.detach().cpu().float().clone()
-
-            stuck_now = (
-                len(recent_cmd_mag) == recent_cmd_mag.maxlen
-                and float(np.mean(recent_cmd_mag)) >= args.stuck_cmd_threshold
-                and float(np.mean(recent_odom_disp)) <= args.stuck_odom_threshold
-                and float(np.mean(recent_latent_disp)) <= args.stuck_latent_threshold
-            )
-            if stuck_now and step >= recover_cooldown_until and step >= recover_active_until:
-                runtime_stuck_events += 1
-                recover_active_until = step + args.recover_budget_steps
-                recover_cooldown_until = step + args.recover_cooldown_steps
-                planner.reset()
-                plan_seq = None
-                if route_active:
-                    route_active = False
-                    route_waypoints = []
-                    route_target_idx = None
-                    route_target_kind = None
-                    route_end_step = None
-                    route_exit_reason = None
-                    route_cooldown_until = step + args.subgoal_cooldown_steps
-                print(
-                    f"Step {step:03d} | recover trigger "
-                    f"(cmd={float(np.mean(recent_cmd_mag)):.2f}, "
-                    f"odom={float(np.mean(recent_odom_disp)):.3f}, "
-                    f"latent={float(np.mean(recent_latent_disp)):.3f})"
-                )
-
             if float(obs["proprio"][0, 0].item()) < sim_cfg.min_z:
                 terminate_reason = "fallen"
                 print(f"Step {step:03d} | fallen")
@@ -2304,6 +1901,7 @@ def main():
                 success_hold_count += 1
             else:
                 success_hold_count = 0
+            goal_similarity_log.append(None if goal_sim_now is None else float(goal_sim_now))
             if success_hold_count >= args.success_hold_steps:
                 reached = True
 
@@ -2330,24 +1928,19 @@ def main():
                 cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
                 cov_delta = cov_area - last_logged_coverage_area_m2
                 last_logged_coverage_area_m2 = cov_area
-                if args.visited_bank_size > 0:
-                    bank_status = f"{len(visited_bank)}/{args.visited_bank_size}"
-                else:
-                    bank_status = "off"
                 progress_str = (
-                    f"g={plan_metrics_last.get('goal_progress', 0.0):.3f} "
-                    f"lp={plan_metrics_last.get('learned_progress', 0.0):.3f} "
-                    f"r={plan_metrics_last.get('route_progress', 0.0):.3f} "
-                    f"f={plan_metrics_last.get('frontier_bonus', 0.0):.3f}"
+                    f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
+                    f"g={plan_metrics_last.get('goal_energy', plan_metrics_last.get('goal_cosine_cost', 0.0)):.3f} "
+                    f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f}"
                 )
                 goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
+                goal_sim_str = "n/a" if goal_sim_now is None else f"{goal_sim_now:.3f}"
                 print(
-                    f"Step {step:03d} | odom=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
+                    f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                     f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                    f"cost={costs_log[-1]:.3f} d_goal={goal_str} "
+                    f"cost={costs_log[-1]:.3f} goal_sim={goal_sim_str} d_goal={goal_str} "
                     f"cov={cov_area:.2f}m^2 cov+={cov_delta:+.2f} "
                     f"coll={collision_count} "
-                    f"proto={bank_status} keyframes={len(keyframe_nodes)} "
                     f"mode={mode} {progress_str}"
                 )
 
@@ -2387,8 +1980,7 @@ def main():
         soft_coverage_gain_per_m = soft_coverage_area_m2 / path_length_m
 
     summary = {
-        "approach": "pure_world_model_keyframe_exec",
-        "paper_section": "3.2",
+        "approach": "pure_world_model_perception_only",
         "seed": args.seed,
         "grid": f"{args.grid_rows}x{args.grid_cols}",
         "target": target_beacon.identity if target_beacon else None,
@@ -2397,7 +1989,6 @@ def main():
         "steps": len(cmds_log),
         "low_level_control_steps": len(cmds_log) * max(1, args.macro_action_repeat),
         "oracle_collisions": collision_count,
-        "runtime_stuck_events": runtime_stuck_events,
         "first_collision_step": first_collision_step,
         "frame_substitutions": frame_substitution_count,
         "min_goal_dist_m": min_goal_dist_out,
@@ -2412,55 +2003,28 @@ def main():
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
             "macro_action_repeat": args.macro_action_repeat,
-            "score_space": args.score_space,
-            "frontier_weight": args.novelty_weight,
-            "frontier_knn": args.frontier_knn,
-            "goal_progress_weight": args.goal_progress_weight,
-            "route_progress_weight": args.route_progress_weight,
-            "recover_displacement_weight": args.recover_displacement_weight,
+            "latent_space": "proj",
+            "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
             "action_penalty_weight": args.action_penalty_weight,
-            "memory_type": "prototype_bank_plus_keyframe_graph",
-            "visited_bank_size": args.visited_bank_size,
-            "prototype_sim_threshold": args.prototype_sim_threshold,
-            "keyframe_sim_threshold": args.keyframe_sim_threshold,
-            "keyframe_match_radius_m": args.keyframe_match_radius_m,
-            "keyframe_min_step_gap": args.keyframe_min_step_gap,
-            "keyframe_add_interval": args.keyframe_add_interval,
-            "stall_plateau_steps": args.stall_plateau_steps,
-            "route_budget_steps": args.subgoal_budget_steps,
-            "route_min_age_steps": args.subgoal_min_age_steps,
-            "route_frontier_window_steps": args.subgoal_frontier_window_steps,
-            "route_cooldown_steps": args.subgoal_cooldown_steps,
-            "route_min_hops": args.route_min_hops,
-            "goal_pursue_sim_threshold": args.goal_direct_sim_threshold,
-            "goal_route_improve_margin": args.goal_route_improve_margin,
+            "goal_seek_sim_threshold": args.goal_direct_sim_threshold,
             "success_goal_sim_threshold": args.success_goal_sim_threshold,
             "success_hold_steps": args.success_hold_steps,
-            "stuck_window_steps": args.stuck_window_steps,
-            "stuck_cmd_threshold": args.stuck_cmd_threshold,
-            "stuck_odom_threshold": args.stuck_odom_threshold,
-            "stuck_latent_threshold": args.stuck_latent_threshold,
-            "recover_budget_steps": args.recover_budget_steps,
-            "recover_cooldown_steps": args.recover_cooldown_steps,
+            "goal_activation_step": goal_activation_step,
+            "uses_safety_head": planner_heads.safety_head is not None,
+            "uses_goal_head": planner_heads.goal_head is not None,
+            "uses_exploration": planner_heads.exploration is not None,
+            "goal_weight": planner_heads.goal_weight,
+            "exploration_weight": planner_heads.exploration_weight,
+            "rnd_online_lr": args.rnd_online_lr,
+            "ignores_progress_head_ckpt": scorer_meta.get("has_progress_head_ckpt", False),
             "auto_scaled_defaults": getattr(args, "auto_scaled_defaults", {}),
-            "visited_samples_seen": visited_seen,
-            "visited_insertions": visited_insertions,
-            "visited_replacements": visited_replacements,
-            "visited_hits": visited_hits_total,
-            "visited_bank_fill_step": visited_bank_fill_step,
-            "visited_bank_replacement_step": visited_bank_replacement_step,
-            "graph_nodes": len(keyframe_nodes),
-            "graph_edges": int(sum(len(nbrs) for nbrs in keyframe_neighbors) // 2),
-            "route_activations": route_activations,
-            "route_steps_total": route_steps_total,
-            "route_last_activation_step": route_last_activation_step,
-            "route_last_target_idx": route_last_target_idx,
             "planner_heads": scorer_meta,
         },
         "coverage": coverage_metrics,
         "path_xy": path_xy,
         "oracle_path_xy": oracle_path_xy,
         "modes": mode_log,
+        "goal_similarity": goal_similarity_log,
         "commands": cmds_log,
         "costs": costs_log,
     }
@@ -2481,7 +2045,7 @@ def main():
 
     print("=" * 60)
     print(f"RESULT: {terminate_reason} | steps={len(cmds_log)} | "
-          f"oracle_collisions={collision_count} | stuck={runtime_stuck_events} | time={elapsed:.1f}s")
+          f"oracle_collisions={collision_count} | time={elapsed:.1f}s")
     print(f"Output: {out_dir}")
     print("=" * 60)
 
