@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Pure-perception maze inference with a minimal learned planner.
 
-The active control policy is intentionally simple:
+The active control policy is intentionally narrow:
   - Explore with learned safety + learned novelty.
-  - Switch to goal-seeking once the current view is sufficiently similar to the
-    beacon breadcrumb.
+  - Treat beacon similarity as an evaluation signal only, not a planner cost.
   - Keep simulator geometry for offline metrics only; never use it to steer.
 
 This file still contains some legacy helpers from earlier routing experiments,
 but the main loop no longer uses prototype banks, keyframe graphs, dead-reckoned
-route following, or learned progress shaping.
+route following, learned progress shaping, or goal-directed mode switching.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -19,7 +18,6 @@ python3 scripts/6_infer_pure_wm.py \
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import json
 import math
 import os
@@ -134,7 +132,7 @@ class PlannerHeads:
 # ---- Pure CEM planner ---------------------------------------------------- #
 
 class PureCEMPlanner:
-    """CEM planner over learned safety, novelty, and goal energy."""
+    """CEM planner over learned safety and novelty."""
 
     def __init__(
         self,
@@ -149,9 +147,6 @@ class PureCEMPlanner:
         min_std: torch.Tensor,
         device: torch.device,
         action_penalty_weight: float = 0.001,
-        revisit_penalty_weight: float = 0.35,
-        forward_bonus_weight: float = 0.30,
-        forward_bonus_safety_threshold: float = 0.12,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -164,9 +159,6 @@ class PureCEMPlanner:
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
         self.action_penalty_weight = action_penalty_weight
-        self.revisit_penalty_weight = revisit_penalty_weight
-        self.forward_bonus_weight = forward_bonus_weight
-        self.forward_bonus_safety_threshold = forward_bonus_safety_threshold
         self._warm_start: torch.Tensor | None = None
 
     def reset(self) -> None:
@@ -176,23 +168,12 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_proj: torch.Tensor | None = None,
-        goal_active: bool = False,
-        unsafe_now: bool = False,
-        recent_latents: torch.Tensor | None = None,
         heads: PlannerHeads | None = None,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
             raise ValueError(f"Expected z_start_raw shape (1, D), got {tuple(z0.shape)}")
         z0_batch = z0.expand(self.n_candidates, -1)
-        z_goal_proj_batch = None
-        if z_goal_proj is not None:
-            if z_goal_proj.ndim == 1:
-                z_goal_proj = z_goal_proj.unsqueeze(0)
-            z_goal_proj_batch = z_goal_proj.to(self.device, dtype=torch.float32).expand(
-                self.n_candidates, -1,
-            )
 
         if self._warm_start is not None:
             mean = self._warm_start.clone()
@@ -228,30 +209,7 @@ class PureCEMPlanner:
                 safety_cost = torch.zeros(self.n_candidates, device=self.device)
 
             if (
-                goal_active
-                and heads is not None
-                and heads.goal_head is not None
-                and z_goal_proj_batch is not None
-            ):
-                goal_energy = heads.goal_weight * heads.goal_head.score_trajectory(
-                    z_rollouts_proj, z_goal_proj_batch,
-                )
-                costs += goal_energy
-                metrics["goal_energy"] = goal_energy
-            elif goal_active and z_goal_proj_batch is not None:
-                z_terminal = z_rollouts_proj[:, -1, :]
-                goal_cosine_cost = 1.0 - F.cosine_similarity(
-                    F.normalize(z_terminal, p=2, dim=-1),
-                    F.normalize(z_goal_proj_batch, p=2, dim=-1),
-                    dim=-1,
-                )
-                costs += goal_cosine_cost
-                metrics["goal_cosine_cost"] = goal_cosine_cost
-
-            if (
-                not goal_active
-                and not unsafe_now
-                and heads is not None
+                heads is not None
                 and heads.exploration is not None
                 and heads.exploration_weight > 0.0
             ):
@@ -261,37 +219,6 @@ class PureCEMPlanner:
                 ).reshape(n_cand, horizon).sum(dim=-1)
                 costs -= heads.exploration_weight * bonus
                 metrics["exploration_bonus"] = bonus
-
-            if self.forward_bonus_weight > 0.0:
-                safety_mean = safety_cost / float(max(1, self.horizon))
-                safe_gate = torch.sigmoid(
-                    8.0 * (self.forward_bonus_safety_threshold - safety_mean.detach()),
-                )
-                forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1) * safe_gate
-                if goal_active or unsafe_now:
-                    # Keep goal-seek free to use turns or cautious stops near the
-                    # beacon. Also disable the forward prior entirely once the
-                    # current observation already looks unsafe.
-                    forward_bonus = torch.zeros_like(forward_bonus)
-                costs -= self.forward_bonus_weight * forward_bonus
-                metrics["forward_bonus"] = forward_bonus
-
-            if (
-                not goal_active
-                and not unsafe_now
-                and recent_latents is not None
-                and recent_latents.shape[0] > 0
-                and self.revisit_penalty_weight > 0.0
-            ):
-                ref = F.normalize(
-                    recent_latents.to(self.device, dtype=torch.float32),
-                    p=2, dim=-1,
-                )
-                rollout_norm = F.normalize(z_rollouts_proj, p=2, dim=-1)
-                sim = torch.einsum("bhd,kd->bhk", rollout_norm, ref)
-                revisit_penalty = sim.max(dim=-1).values.mean(dim=-1)
-                costs += self.revisit_penalty_weight * revisit_penalty
-                metrics["revisit_penalty"] = revisit_penalty
 
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
@@ -323,12 +250,12 @@ class PureCEMPlanner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pure-perception maze inference with learned safety, novelty, and goal energy.",
+        description="Pure-perception maze inference with learned safety and novelty.",
     )
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
     p.add_argument("--scorer_ckpt", type=str, default=None,
-                   help="Optional trajectory scorer checkpoint with safety / goal / exploration heads.")
+                   help="Optional trajectory scorer checkpoint with safety / exploration heads. Goal head is ignored by the active planner.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grid_rows", type=int, default=4)
     p.add_argument("--grid_cols", type=int, default=4)
@@ -366,17 +293,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rnd_online_lr", type=float, default=1e-3,
                    help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
     p.add_argument("--recent_latent_window", type=int, default=128,
-                   help="Number of recent projected observation latents kept for anti-revisit planning.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--revisit_penalty_weight", type=float, default=0.35,
-                   help="Penalty weight for predicted trajectories that stay too similar to recent observations.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--forward_bonus_weight", type=float, default=0.30,
-                   help="Explore-mode bonus for safe positive forward velocity commands.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--forward_bonus_safety_threshold", type=float, default=0.12,
-                   help="Per-step predicted safety-energy threshold below which the forward bonus becomes active.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--current_safety_brake_threshold", type=float, default=0.20,
-                   help="Current observed safety energy above which exploration bonuses are disabled and replanning becomes reactive.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--unsafe_macro_action_repeat", type=int, default=1,
-                   help="Temporary macro-action repeat used while the current observation looks unsafe.")
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--frontier_knn", type=int, default=8,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--goal_progress_weight", type=float, default=8.0,
@@ -411,9 +338,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--route_min_hops", type=int, default=3,
                    help="Minimum keyframe-graph distance required for a route target.")
     p.add_argument("--goal_direct_sim_threshold", type=float, default=0.72,
-                   help="Enter pursue mode once current observation similarity exceeds this value.")
+                   help="Legacy goal-mode flag. Ignored by the active planner.")
     p.add_argument("--goal_activation_hold_steps", type=int, default=3,
-                   help="Require this many consecutive high-similarity observations before entering goal-seek mode.")
+                   help="Legacy goal-mode flag. Ignored by the active planner.")
     p.add_argument("--goal_route_improve_margin", type=float, default=0.03,
                    help="Require a route target to improve breadcrumb similarity by at least this margin before treating it as goal-directed.")
     p.add_argument("--success_goal_sim_threshold", type=float, default=0.90,
@@ -1699,6 +1626,8 @@ def main():
             f"block={scorer_meta.get('action_block_size')}, "
             f"use_proprio={scorer_meta.get('use_proprio')})"
         )
+        if scorer_meta.get("has_goal_head", False):
+            print("Ignoring goal head in scorer checkpoint; the active planner optimizes safety + novelty only.")
     if args.score_space != "proj":
         print(
             f"Ignoring --score_space={args.score_space!r}; "
@@ -1749,12 +1678,9 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
-          f"Latent=proj, GoalAct={args.goal_direct_sim_threshold:.2f}, "
+          f"Latent=proj, Objective=safety+novelty, "
           f"GoalSucc={args.success_goal_sim_threshold:.2f}, "
-          f"GoalW={planner_heads.goal_weight:.3f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
-          f"RevisitW={args.revisit_penalty_weight:.3f}, "
-          f"ForwardW={args.forward_bonus_weight:.3f}, "
           f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
@@ -1774,14 +1700,11 @@ def main():
     frame_substitution_count = 0
     first_collision_step: int | None = None
     success_hold_count = 0
-    goal_activation_count = 0
-    unsafe_steps = 0
-    goal_activation_step: int | None = None
     oracle_goal_reached = False
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
-    recent_proj_latents = deque(maxlen=max(1, int(args.recent_latent_window)))
+    goal_activation_step: int | None = None
 
     try:
         import genesis as gs
@@ -1828,9 +1751,6 @@ def main():
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
             action_penalty_weight=args.action_penalty_weight,
-            revisit_penalty_weight=args.revisit_penalty_weight,
-            forward_bonus_weight=args.forward_bonus_weight,
-            forward_bonus_safety_threshold=args.forward_bonus_safety_threshold,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
@@ -1838,7 +1758,6 @@ def main():
         plan_seq: torch.Tensor | None = None
         plan_step_idx = 0
         plan_metrics_last: dict[str, float] = {}
-        goal_seek_active_prev = False
 
         obs = observe(
             physics_robot, physics_act_dofs,
@@ -1860,7 +1779,6 @@ def main():
         path_xy.append(start_xy)
         oracle_path_xy.append(start_xy.copy())
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
-        recent_proj_latents.append(obs["z_proj"].squeeze(0).detach().cpu().float())
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1871,53 +1789,13 @@ def main():
             )
 
         for step in range(args.steps):
-            goal_sim_now = None
-            goal_seek_active = False
-            current_safety_energy = estimate_current_safety_energy(obs["z_proj"], planner_heads)
-            unsafe_now = (
-                current_safety_energy is not None
-                and current_safety_energy >= args.current_safety_brake_threshold
-            )
-            if unsafe_now:
-                unsafe_steps += 1
-            if z_breadcrumb_proj_ref is not None:
-                goal_sim_now = cosine_similarity_scalar(
-                    obs["z_proj"].squeeze(0),
-                    z_breadcrumb_proj_ref,
-                )
-                if goal_sim_now >= args.goal_direct_sim_threshold:
-                    goal_activation_count += 1
-                else:
-                    goal_activation_count = 0
-                goal_seek_active = goal_activation_count >= max(1, int(args.goal_activation_hold_steps))
-                if goal_seek_active and goal_activation_step is None:
-                    goal_activation_step = step
-
-            if goal_seek_active != goal_seek_active_prev:
-                planner.reset()
-                plan_seq = None
-                plan_step_idx = 0
-            goal_seek_active_prev = goal_seek_active
-
-            mode = "goal_seek" if goal_seek_active else "explore"
+            mode = "explore"
             mode_log.append(mode)
 
-            if unsafe_now:
-                planner.reset()
-                plan_seq = None
-                plan_step_idx = 0
-
-            need_replan = unsafe_now or (plan_seq is None or plan_step_idx >= args.mpc_execute)
+            need_replan = plan_seq is None or plan_step_idx >= args.mpc_execute
             if need_replan:
-                recent_latents_t = None
-                if recent_proj_latents:
-                    recent_latents_t = torch.stack(list(recent_proj_latents), dim=0)
                 plan_seq, cost, plan_metrics_last = planner.plan(
                     obs["z_raw"],
-                    z_goal_proj=z_breadcrumb_proj_ref,
-                    goal_active=goal_seek_active,
-                    unsafe_now=unsafe_now,
-                    recent_latents=recent_latents_t,
                     heads=planner_heads,
                 )
                 plan_step_idx = 0
@@ -1932,10 +1810,7 @@ def main():
                 physics_scene, physics_robot, policy,
                 physics_act_dofs, q0, prev_action,
                 nominal_cmd.to(gs.device), sim_cfg, gs, torch,
-                macro_action_repeat=(
-                    args.unsafe_macro_action_repeat if unsafe_now
-                    else args.macro_action_repeat
-                ),
+                macro_action_repeat=args.macro_action_repeat,
             )
             prev_action = actions.detach().clone()
 
@@ -1964,7 +1839,6 @@ def main():
                 frame_substitution_count += 1
             else:
                 last_clean_frame = obs["frame_hwc"].copy()
-                recent_proj_latents.append(obs["z_proj"].squeeze(0).detach().cpu().float())
                 if (
                     args.rnd_online_lr > 0.0
                     and planner_heads.exploration is not None
@@ -2034,10 +1908,7 @@ def main():
                 last_logged_coverage_area_m2 = cov_area
                 progress_str = (
                     f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
-                    f"g={plan_metrics_last.get('goal_energy', plan_metrics_last.get('goal_cosine_cost', 0.0)):.3f} "
-                    f"fwd={plan_metrics_last.get('forward_bonus', 0.0):.3f} "
-                    f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f} "
-                    f"rv={plan_metrics_last.get('revisit_penalty', 0.0):.3f}"
+                    f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f}"
                 )
                 goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
                 goal_sim_str = "n/a" if goal_sim_now is None else f"{goal_sim_now:.3f}"
@@ -2110,23 +1981,27 @@ def main():
             "mpc_execute_k": args.mpc_execute,
             "macro_action_repeat": args.macro_action_repeat,
             "latent_space": "proj",
+            "objective": "safety_plus_novelty",
             "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
             "action_penalty_weight": args.action_penalty_weight,
-            "goal_seek_sim_threshold": args.goal_direct_sim_threshold,
-            "goal_activation_hold_steps": args.goal_activation_hold_steps,
             "success_goal_sim_threshold": args.success_goal_sim_threshold,
             "success_hold_steps": args.success_hold_steps,
             "goal_activation_step": goal_activation_step,
             "uses_safety_head": planner_heads.safety_head is not None,
-            "uses_goal_head": planner_heads.goal_head is not None,
+            "uses_goal_head": False,
+            "goal_head_present_ckpt": planner_heads.goal_head is not None,
             "uses_exploration": planner_heads.exploration is not None,
-            "goal_weight": planner_heads.goal_weight,
             "exploration_weight": planner_heads.exploration_weight,
-            "recent_latent_window": args.recent_latent_window,
-            "revisit_penalty_weight": args.revisit_penalty_weight,
-            "forward_bonus_weight": args.forward_bonus_weight,
-            "forward_bonus_safety_threshold": args.forward_bonus_safety_threshold,
             "rnd_online_lr": args.rnd_online_lr,
+            "ignored_goal_weight_ckpt": planner_heads.goal_weight,
+            "ignored_recent_latent_window": args.recent_latent_window,
+            "ignored_revisit_penalty_weight": args.revisit_penalty_weight,
+            "ignored_forward_bonus_weight": args.forward_bonus_weight,
+            "ignored_forward_bonus_safety_threshold": args.forward_bonus_safety_threshold,
+            "ignored_current_safety_brake_threshold": args.current_safety_brake_threshold,
+            "ignored_unsafe_macro_action_repeat": args.unsafe_macro_action_repeat,
+            "ignored_goal_seek_sim_threshold": args.goal_direct_sim_threshold,
+            "ignored_goal_activation_hold_steps": args.goal_activation_hold_steps,
             "ignores_progress_head_ckpt": scorer_meta.get("has_progress_head_ckpt", False),
             "auto_scaled_defaults": getattr(args, "auto_scaled_defaults", {}),
             "planner_heads": scorer_meta,
