@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=256,
                    help="Batch size for latent extraction.")
     p.add_argument("--seq_len", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=12,
+                   help="DataLoader worker count for streamed HDF5 batches.")
+    p.add_argument("--prefetch_factor", type=int, default=2,
+                   help="Number of batches prefetched per worker.")
     p.add_argument("--temporal_stride", type=int, default=1,
                    help="Raw-step spacing between model observations.")
     p.add_argument("--action_block_size", type=int, default=None,
@@ -232,7 +236,7 @@ def extract_latents(args, device) -> str:
     encoder = load_frozen_encoder(args, device)
     print(f"Loaded frozen encoder from {args.checkpoint}")
 
-    num_workers = 12
+    num_workers = max(1, int(args.num_workers))
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
@@ -253,7 +257,7 @@ def extract_latents(args, device) -> str:
 
     dataloader = DataLoader(
         dataset, batch_size=None, num_workers=num_workers,
-        pin_memory=True, prefetch_factor=2,
+        pin_memory=True, prefetch_factor=max(1, int(args.prefetch_factor)),
     )
 
     z_buf: list[torch.Tensor] = []
@@ -763,12 +767,12 @@ def train_progress_head(args, goal_pools, device):
         batch_size=args.progress_batch_size,
         require_no_done=False,
         require_no_collision=False,
-        num_workers=12,
+        num_workers=max(1, int(args.num_workers)),
         load_labels=True,
     )
     dataloader = DataLoader(
-        dataset, batch_size=None, num_workers=12,
-        pin_memory=True, prefetch_factor=2,
+        dataset, batch_size=None, num_workers=max(1, int(args.num_workers)),
+        pin_memory=True, prefetch_factor=max(1, int(args.prefetch_factor)),
     )
 
     head = ProgressEnergyHead(

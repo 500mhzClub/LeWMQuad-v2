@@ -213,25 +213,34 @@ class StreamingJEPADataset(IterableDataset):
                     if fpath not in open_files:
                         open_files[fpath] = h5py.File(fpath, "r")
                     h5f = open_files[fpath]
-                    obs_idx = t0 + np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
-                    vis[i] = h5f["vision"][e, obs_idx]
-                    prop[i] = h5f["proprio"][e, obs_idx]
+                    raw_end = t0 + self.raw_span
+                    obs_offsets = np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
 
-                    for step_idx, raw_start in enumerate(obs_idx.tolist()):
-                        raw_end = raw_start + self.action_block_size
-                        cmds[i, step_idx] = h5f["cmds"][e, raw_start:raw_end].mean(axis=0)
-                        if "dones" in h5f:
-                            dones[i, step_idx] = np.any(h5f["dones"][e, raw_start:raw_end])
-                        if "collisions" in h5f:
-                            collisions[i, step_idx] = np.any(
-                                h5f["collisions"][e, raw_start:raw_end]
-                            )
+                    vis_chunk = h5f["vision"][e, t0:raw_end]
+                    prop_chunk = h5f["proprio"][e, t0:raw_end]
+                    cmds_chunk = h5f["cmds"][e, t0:raw_end]
+                    dones_chunk = h5f["dones"][e, t0:raw_end] if "dones" in h5f else None
+                    collisions_chunk = (
+                        h5f["collisions"][e, t0:raw_end] if "collisions" in h5f else None
+                    )
+
+                    vis[i] = vis_chunk[obs_offsets]
+                    prop[i] = prop_chunk[obs_offsets]
+
+                    for step_idx, offset in enumerate(obs_offsets.tolist()):
+                        block = slice(offset, offset + self.action_block_size)
+                        cmds[i, step_idx] = cmds_chunk[block].mean(axis=0)
+                        if dones_chunk is not None:
+                            dones[i, step_idx] = np.any(dones_chunk[block])
+                        if collisions_chunk is not None:
+                            collisions[i, step_idx] = np.any(collisions_chunk[block])
 
                     # Load extended labels if available
                     if self.load_labels:
                         for field in self.LABEL_FIELDS:
                             if field in h5f:
-                                label_arrays[field][i] = h5f[field][e, obs_idx]
+                                label_chunk = h5f[field][e, t0:raw_end]
+                                label_arrays[field][i] = label_chunk[obs_offsets]
 
                 # Build label dict of tensors
                 labels = {}

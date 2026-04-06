@@ -56,6 +56,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window_stride", type=int, default=None,
                    help="Raw-step spacing between sequence starts. Defaults to seq_len * temporal_stride.")
     p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--num_workers", type=int, default=12,
+                   help="DataLoader worker count for streamed HDF5 batches.")
+    p.add_argument("--prefetch_factor", type=int, default=4,
+                   help="Number of batches prefetched per worker.")
     p.add_argument("--warmup_steps", type=int, default=1000,
                     help="Number of linear LR warmup steps before cosine decay.")
     p.add_argument("--weight_decay", type=float, default=1e-3)
@@ -164,7 +168,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # ---- Dataset / DataLoader ----------------------------------------
-    num_workers = 12
+    num_workers = max(1, int(args.num_workers))
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
@@ -202,7 +206,7 @@ def train(args: argparse.Namespace) -> None:
         batch_size=None,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=max(1, int(args.prefetch_factor)),
         persistent_workers=True,
     )
 
