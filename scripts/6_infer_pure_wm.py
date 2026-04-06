@@ -2346,6 +2346,7 @@ def main():
                     f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
                     f"cost={costs_log[-1]:.3f} d_goal={goal_str} "
                     f"cov={cov_area:.2f}m^2 cov+={cov_delta:+.2f} "
+                    f"coll={collision_count} "
                     f"proto={bank_status} keyframes={len(keyframe_nodes)} "
                     f"mode={mode} {progress_str}"
                 )
