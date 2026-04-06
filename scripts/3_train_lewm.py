@@ -99,6 +99,8 @@ def save_checkpoint(
     scheduler,
     epoch: int,
     global_step: int,
+    *,
+    epoch_completed: bool = False,
 ) -> None:
     torch.save(
         {
@@ -107,6 +109,7 @@ def save_checkpoint(
             "scheduler_state_dict": scheduler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
+            "epoch_completed": epoch_completed,
         },
         path,
     )
@@ -235,6 +238,13 @@ def train(args: argparse.Namespace) -> None:
         model.load_state_dict(cleaned_sd)
         start_epoch = ckpt.get("epoch", 0)
         global_step = ckpt.get("global_step", 0)
+        epoch_completed = ckpt.get("epoch_completed")
+        if epoch_completed is True:
+            start_epoch += 1
+        elif epoch_completed is None:
+            base = os.path.basename(args.resume_from)
+            if base.startswith("epoch_"):
+                start_epoch += 1
 
     model = torch.compile(model)
 
@@ -368,7 +378,15 @@ def train(args: argparse.Namespace) -> None:
                 # ---- Intra-epoch checkpoint ------------------------------
                 if global_step % args.save_every == 0:
                     ckpt_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
-                    save_checkpoint(ckpt_path, model, optimizer, scheduler, epoch, global_step)
+                    save_checkpoint(
+                        ckpt_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        global_step,
+                        epoch_completed=False,
+                    )
                     progress_write(f"  Checkpoint saved: {ckpt_path}", pbar)
                     import glob as _glob
                     step_ckpts = sorted(_glob.glob(os.path.join(args.out_dir, "step_*.pt")))
@@ -387,7 +405,15 @@ def train(args: argparse.Namespace) -> None:
         )
 
         epoch_ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch + 1}.pt")
-        save_checkpoint(epoch_ckpt_path, model, optimizer, scheduler, epoch, global_step)
+        save_checkpoint(
+            epoch_ckpt_path,
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            global_step,
+            epoch_completed=True,
+        )
         print(f"  Epoch checkpoint saved: {epoch_ckpt_path}")
 
     print("Training complete.")
