@@ -320,6 +320,8 @@ def parse_args() -> argparse.Namespace:
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--exploration_weight", type=float, default=None,
                    help="Override learned RND exploration weight from the scorer checkpoint.")
+    p.add_argument("--rnd_online_lr", type=float, default=1e-3,
+                   help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
     p.add_argument("--frontier_knn", type=int, default=8,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--goal_progress_weight", type=float, default=8.0,
