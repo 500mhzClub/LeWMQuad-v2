@@ -1771,6 +1771,12 @@ def main():
             if b.identity == args.target_beacon:
                 target_beacon = b
                 break
+        if target_beacon is None:
+            available = ", ".join(sorted(b.identity for b in beacon_layout.beacons)) or "<none>"
+            raise ValueError(
+                f"Requested --target_beacon={args.target_beacon!r}, but generated maze "
+                f"contains: {available}"
+            )
     if target_beacon is None and beacon_layout.beacons:
         target_beacon = sorted(beacon_layout.beacons, key=lambda b: b.identity)[0]
 
