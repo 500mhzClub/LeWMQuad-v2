@@ -34,36 +34,164 @@ when the robot inevitably approaches obstacles. Instead, we ensure the camera
 *correctly renders wall surfaces* during collisions, so the model learns
 "approaching wall → wall fills the view" — the correct signal for planning.
 
-## Pipeline
+## Current Training Approach
+
+The original `seq_len=4` contiguous setup was not paper-faithful in time. It
+trained on four adjacent low-level control steps, which is too short to encode
+meaningful maze progress. The paper's "4-step" setup is four observations over
+four **blocks of 5 actions**.
+
+The current recommended regime therefore keeps `seq_len=4`, but changes the
+timescale:
+
+- `temporal_stride=5`: sample observations every 5 raw control steps
+- `action_block_size=5`: aggregate each 5-step command block into one macro-action
+- `window_stride=5`: use overlapping macro-windows instead of only non-overlapping starts
+- `macro_action_repeat=5` at inference: hold each planner command for 5 low-level control cycles
+
+Why it changed:
+
+- It matches the paper's temporal abstraction much more closely than contiguous
+  4-step training.
+- It gives the predictor transitions that actually matter for maze navigation:
+  corridor progress, wall approach, turns, and local basin exits.
+- `window_stride=5` uses far more valid macro-trajectories than `window_stride=20`,
+  so the model sees many more distinct starts instead of repeating the same sparse
+  subset.
+- `--use_proprio` is now the recommended setting for navigation. Proprio is
+  runtime-valid on the robot and helps short-horizon progress, stuck detection,
+  and dead-reckoning.
+
+One implementation detail matters in practice: overlap training (`window_stride=5`)
+increases HDF5 pressure significantly, so the current stable settings are:
+
+- `--num_workers 4`
+- `--prefetch_factor 2`
+
+Those settings are baked into the commands below.
+
+## Recommended Pipeline
+
+### 1. Optional: collect fresh physics trajectories
 
 ```bash
-# 1. Collect physics trajectories
 python scripts/1_physics_rollout.py --ckpt <ppo_ckpt> --steps 1000 --chunks 5
+```
 
-# 2. Render egocentric RGB (with anti-clipping protections)
+### 2. Optional: render egocentric RGB with anti-clipping protections
+
+```bash
 python scripts/2_visual_renderer.py --raw_dir jepa_raw_data --out_dir jepa_final_dataset
+```
 
-# 3. Train LeWorldModel
+### 3. Train the base LeWorldModel
+
+Current recommended run:
+
+```bash
 python scripts/3_train_lewm.py \
-  --data_dir jepa_final_dataset \
+  --data_dir jepa_final_v3 \
+  --device cuda \
+  --epochs 30 \
+  --batch_size 128 \
   --seq_len 4 \
   --temporal_stride 5 \
   --action_block_size 5 \
-  --use_proprio \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
   --sigreg_lambda 0.09 \
-  --out_dir lewm_checkpoints_keyframe_exec_stride5 \
-  --log_dir lewm_logs_keyframe_exec_stride5
+  --use_proprio \
+  --out_dir lewm_checkpoints_keyframe_exec_stride5_overlap_v2 \
+  --log_dir lewm_logs_keyframe_exec_stride5_overlap_v2
+```
 
-# 4. Train energy head (optional, for planning)
+This is the main world-model run to build on. Older runs such as contiguous
+`seq_len=4` or stride-5 with `window_stride=20` should be treated as baselines,
+not the preferred checkpoint.
+
+### 4. Train the planning heads
+
+The planning stack uses four learned components on top of frozen LeWM latents:
+
+- `LatentEnergyHead`: safety / mobility consequence energy
+- `GoalEnergyHead`: beacon identity-conditioned attraction
+- `ProgressEnergyHead`: short-horizon improvement toward the correct goal
+- `ExplorationBonus`: RND-style novelty bonus
+
+All of them must be trained with the **same temporal abstraction** as the world
+model checkpoint they consume.
+
+Recommended command:
+
+```bash
 python scripts/4_train_energy_head.py \
-  --data_dir jepa_final_dataset \
-  --checkpoint lewm_checkpoints_keyframe_exec_stride5/latest.pt \
+  --data_dir jepa_final_v3 \
+  --checkpoint lewm_checkpoints_keyframe_exec_stride5_overlap_v2/epoch_30.pt \
+  --device cuda \
   --seq_len 4 \
   --temporal_stride 5 \
   --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
   --use_proprio \
-  --out_dir energy_head_checkpoints_keyframe_exec_stride5 \
-  --log_dir energy_head_logs_keyframe_exec_stride5
+  --out_dir energy_head_checkpoints_keyframe_exec_stride5_overlap_v2 \
+  --log_dir energy_head_logs_keyframe_exec_stride5_overlap_v2 \
+  --safety_mode consequence \
+  --epochs 10 \
+  --goal_epochs 10 \
+  --progress_epochs 5 \
+  --exploration_epochs 5 \
+  --goal_weight 1.0 \
+  --progress_weight 1.0 \
+  --exploration_weight 0.1
+```
+
+This writes a combined scorer checkpoint to:
+
+- `energy_head_checkpoints_keyframe_exec_stride5_overlap_v2/trajectory_scorer.pt`
+
+### 5. Run world-model inference
+
+Inference must use the same macro-timescale as training:
+
+- planner horizon in latent steps
+- `macro_action_repeat=5` so one planner step corresponds to 5 low-level control steps
+
+Recommended command:
+
+```bash
+python scripts/6_infer_pure_wm.py \
+  --ppo_ckpt models/ppo/ckpt_20000.pt \
+  --wm_ckpt lewm_checkpoints_keyframe_exec_stride5_overlap_v2/epoch_30.pt \
+  --scorer_ckpt energy_head_checkpoints_keyframe_exec_stride5_overlap_v2/trajectory_scorer.pt \
+  --target_beacon red \
+  --seed 42 \
+  --steps 800 \
+  --macro_action_repeat 5 \
+  --score_space mixed \
+  --out_dir inference_runs/keyframe_exec_stride5_overlap_v2_s42
+```
+
+`steps=800` is intentional: with `macro_action_repeat=5`, that corresponds to
+about `4000` low-level control steps.
+
+### 6. Multi-seed evaluation
+
+```bash
+for seed in 42 43 44; do
+  python scripts/6_infer_pure_wm.py \
+    --ppo_ckpt models/ppo/ckpt_20000.pt \
+    --wm_ckpt lewm_checkpoints_keyframe_exec_stride5_overlap_v2/epoch_30.pt \
+    --scorer_ckpt energy_head_checkpoints_keyframe_exec_stride5_overlap_v2/trajectory_scorer.pt \
+    --target_beacon red \
+    --seed "$seed" \
+    --steps 800 \
+    --macro_action_repeat 5 \
+    --score_space mixed \
+    --out_dir "inference_runs/keyframe_exec_stride5_overlap_v2_s${seed}"
+done
 ```
 
 ## Validation scripts
@@ -99,26 +227,36 @@ The likely reason is architectural:
   is not guaranteed to be a good planning metric even if it is good for the
   JEPA training objective.
 
-### Novelty failure mode
+### Why the planner changed
 
-The original novelty signal in `scripts/6_infer_pure_wm.py` used a sliding
-recent-history window and compared full `H`-step rollout windows after
-flattening them to a single vector. That caused three problems:
+The current inference stack is not a plain "goal cosine + novelty" controller.
+It is a short-horizon keyframe executive built to work with temporally-abstract
+LeWM rollouts.
 
-- The planner forgot older regions once the fixed recent-history buffer rolled
-  over.
-- Whole-window cosine similarity was too blunt; small pose and gait changes
-  could make a familiar corridor look novel enough.
-- The agent had no persistent notion of "already explored area", so it could
-  return to old regions with little or no penalty.
+What it does:
 
-The current novelty implementation fixes this without adding oracle geometry or
-handwritten maze heuristics:
+- keeps a persistent prototype bank for frontier density / novelty
+- builds an immutable keyframe graph from runtime-valid signals
+- scores short rollouts by:
+  - safety energy
+  - goal progress
+  - learned progress bonus
+  - frontier density
+  - route progress
+- repeats each planner command for 5 low-level control cycles
 
-- Visited states are stored in a persistent novelty bank using reservoir
-  sampling, so memory spans the full run instead of just the recent past.
-- Novelty is computed per predicted step against that bank, then averaged over
-  the rollout horizon. This is sharper than comparing a flattened `H*D` window.
+This is why training and inference must agree on macro-timescale. Training on
+stride-5 macro-transitions and then planning at raw 1-step control frequency
+would miscalibrate the predictor.
+
+### Novelty / frontier memory
+
+The current planner no longer depends on a tiny recent-history window.
+
+- Visited states are stored in a persistent prototype bank.
+- Frontier pressure comes from latent density against that bank.
+- Keyframe routing gives the executive a short-hop topological memory without
+  using simulator geometry in the control loop.
 
 ### Coverage diagnostics
 
