@@ -150,6 +150,8 @@ class PureCEMPlanner:
         device: torch.device,
         action_penalty_weight: float = 0.001,
         revisit_penalty_weight: float = 0.35,
+        forward_bonus_weight: float = 0.30,
+        forward_bonus_safety_threshold: float = 0.12,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -163,6 +165,8 @@ class PureCEMPlanner:
         self.device = device
         self.action_penalty_weight = action_penalty_weight
         self.revisit_penalty_weight = revisit_penalty_weight
+        self.forward_bonus_weight = forward_bonus_weight
+        self.forward_bonus_safety_threshold = forward_bonus_safety_threshold
         self._warm_start: torch.Tensor | None = None
 
     def reset(self) -> None:
@@ -219,6 +223,8 @@ class PureCEMPlanner:
                 safety_cost = heads.safety_weight * heads.safety_head.score_trajectory(z_rollouts_proj)
                 costs += safety_cost
                 metrics["safety_cost"] = safety_cost
+            else:
+                safety_cost = torch.zeros(self.n_candidates, device=self.device)
 
             if (
                 goal_active
@@ -253,6 +259,19 @@ class PureCEMPlanner:
                 ).reshape(n_cand, horizon).sum(dim=-1)
                 costs -= heads.exploration_weight * bonus
                 metrics["exploration_bonus"] = bonus
+
+            if self.forward_bonus_weight > 0.0:
+                safety_mean = safety_cost / float(max(1, self.horizon))
+                safe_gate = torch.sigmoid(
+                    8.0 * (self.forward_bonus_safety_threshold - safety_mean.detach()),
+                )
+                forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1) * safe_gate
+                if goal_active:
+                    # Keep goal-seek free to use turns or cautious stops near the
+                    # beacon. The forward prior is only for corridor exploration.
+                    forward_bonus = torch.zeros_like(forward_bonus)
+                costs -= self.forward_bonus_weight * forward_bonus
+                metrics["forward_bonus"] = forward_bonus
 
             if (
                 not goal_active
@@ -346,6 +365,10 @@ def parse_args() -> argparse.Namespace:
                    help="Number of recent projected observation latents kept for anti-revisit planning.")
     p.add_argument("--revisit_penalty_weight", type=float, default=0.35,
                    help="Penalty weight for predicted trajectories that stay too similar to recent observations.")
+    p.add_argument("--forward_bonus_weight", type=float, default=0.30,
+                   help="Explore-mode bonus for safe positive forward velocity commands.")
+    p.add_argument("--forward_bonus_safety_threshold", type=float, default=0.12,
+                   help="Per-step predicted safety-energy threshold below which the forward bonus becomes active.")
     p.add_argument("--frontier_knn", type=int, default=8,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--goal_progress_weight", type=float, default=8.0,
