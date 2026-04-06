@@ -19,6 +19,7 @@ python3 scripts/6_infer_pure_wm.py \
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import os
@@ -148,6 +149,7 @@ class PureCEMPlanner:
         min_std: torch.Tensor,
         device: torch.device,
         action_penalty_weight: float = 0.001,
+        revisit_penalty_weight: float = 0.35,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -160,6 +162,7 @@ class PureCEMPlanner:
         self.min_std = min_std.to(device=device, dtype=torch.float32)
         self.device = device
         self.action_penalty_weight = action_penalty_weight
+        self.revisit_penalty_weight = revisit_penalty_weight
         self._warm_start: torch.Tensor | None = None
 
     def reset(self) -> None:
@@ -171,6 +174,7 @@ class PureCEMPlanner:
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None = None,
         goal_active: bool = False,
+        recent_latents: torch.Tensor | None = None,
         heads: PlannerHeads | None = None,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
@@ -250,6 +254,22 @@ class PureCEMPlanner:
                 costs -= heads.exploration_weight * bonus
                 metrics["exploration_bonus"] = bonus
 
+            if (
+                not goal_active
+                and recent_latents is not None
+                and recent_latents.shape[0] > 0
+                and self.revisit_penalty_weight > 0.0
+            ):
+                ref = F.normalize(
+                    recent_latents.to(self.device, dtype=torch.float32),
+                    p=2, dim=-1,
+                )
+                rollout_norm = F.normalize(z_rollouts_proj, p=2, dim=-1)
+                sim = torch.einsum("bhd,kd->bhk", rollout_norm, ref)
+                revisit_penalty = sim.max(dim=-1).values.mean(dim=-1)
+                costs += self.revisit_penalty_weight * revisit_penalty
+                metrics["revisit_penalty"] = revisit_penalty
+
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -322,6 +342,10 @@ def parse_args() -> argparse.Namespace:
                    help="Override learned RND exploration weight from the scorer checkpoint.")
     p.add_argument("--rnd_online_lr", type=float, default=1e-3,
                    help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
+    p.add_argument("--recent_latent_window", type=int, default=128,
+                   help="Number of recent projected observation latents kept for anti-revisit planning.")
+    p.add_argument("--revisit_penalty_weight", type=float, default=0.35,
+                   help="Penalty weight for predicted trajectories that stay too similar to recent observations.")
     p.add_argument("--frontier_knn", type=int, default=8,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--goal_progress_weight", type=float, default=8.0,
@@ -1687,6 +1711,7 @@ def main():
           f"GoalSucc={args.success_goal_sim_threshold:.2f}, "
           f"GoalW={planner_heads.goal_weight:.3f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
+          f"RevisitW={args.revisit_penalty_weight:.3f}, "
           f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
@@ -1712,6 +1737,7 @@ def main():
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
+    recent_proj_latents = deque(maxlen=max(1, int(args.recent_latent_window)))
 
     try:
         import genesis as gs
@@ -1758,6 +1784,7 @@ def main():
             min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
             device=planning_device,
             action_penalty_weight=args.action_penalty_weight,
+            revisit_penalty_weight=args.revisit_penalty_weight,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
@@ -1787,6 +1814,7 @@ def main():
         path_xy.append(start_xy)
         oracle_path_xy.append(start_xy.copy())
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
+        recent_proj_latents.append(obs["z_proj"].squeeze(0).detach().cpu().float())
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1823,10 +1851,14 @@ def main():
 
             need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
             if need_replan:
+                recent_latents_t = None
+                if recent_proj_latents:
+                    recent_latents_t = torch.stack(list(recent_proj_latents), dim=0)
                 plan_seq, cost, plan_metrics_last = planner.plan(
                     obs["z_raw"],
                     z_goal_proj=z_breadcrumb_proj_ref,
                     goal_active=goal_seek_active,
+                    recent_latents=recent_latents_t,
                     heads=planner_heads,
                 )
                 plan_step_idx = 0
@@ -1870,6 +1902,7 @@ def main():
                 frame_substitution_count += 1
             else:
                 last_clean_frame = obs["frame_hwc"].copy()
+                recent_proj_latents.append(obs["z_proj"].squeeze(0).detach().cpu().float())
                 if (
                     args.rnd_online_lr > 0.0
                     and planner_heads.exploration is not None
@@ -1940,7 +1973,8 @@ def main():
                 progress_str = (
                     f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
                     f"g={plan_metrics_last.get('goal_energy', plan_metrics_last.get('goal_cosine_cost', 0.0)):.3f} "
-                    f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f}"
+                    f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f} "
+                    f"rv={plan_metrics_last.get('revisit_penalty', 0.0):.3f}"
                 )
                 goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
                 goal_sim_str = "n/a" if goal_sim_now is None else f"{goal_sim_now:.3f}"
@@ -2025,6 +2059,8 @@ def main():
             "uses_exploration": planner_heads.exploration is not None,
             "goal_weight": planner_heads.goal_weight,
             "exploration_weight": planner_heads.exploration_weight,
+            "recent_latent_window": args.recent_latent_window,
+            "revisit_penalty_weight": args.revisit_penalty_weight,
             "rnd_online_lr": args.rnd_online_lr,
             "ignores_progress_head_ckpt": scorer_meta.get("has_progress_head_ckpt", False),
             "auto_scaled_defaults": getattr(args, "auto_scaled_defaults", {}),
