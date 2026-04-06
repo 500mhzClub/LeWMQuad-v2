@@ -357,6 +357,8 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum keyframe-graph distance required for a route target.")
     p.add_argument("--goal_direct_sim_threshold", type=float, default=0.72,
                    help="Enter pursue mode once current observation similarity exceeds this value.")
+    p.add_argument("--goal_activation_hold_steps", type=int, default=3,
+                   help="Require this many consecutive high-similarity observations before entering goal-seek mode.")
     p.add_argument("--goal_route_improve_margin", type=float, default=0.03,
                    help="Require a route target to improve breadcrumb similarity by at least this margin before treating it as goal-directed.")
     p.add_argument("--success_goal_sim_threshold", type=float, default=0.90,
@@ -1704,6 +1706,7 @@ def main():
     frame_substitution_count = 0
     first_collision_step: int | None = None
     success_hold_count = 0
+    goal_activation_count = 0
     goal_activation_step: int | None = None
     oracle_goal_reached = False
     min_goal_dist_m = float("inf")
@@ -1801,7 +1804,11 @@ def main():
                     obs["z_proj"].squeeze(0),
                     z_breadcrumb_proj_ref,
                 )
-                goal_seek_active = goal_sim_now >= args.goal_direct_sim_threshold
+                if goal_sim_now >= args.goal_direct_sim_threshold:
+                    goal_activation_count += 1
+                else:
+                    goal_activation_count = 0
+                goal_seek_active = goal_activation_count >= max(1, int(args.goal_activation_hold_steps))
                 if goal_seek_active and goal_activation_step is None:
                     goal_activation_step = step
 
@@ -2009,6 +2016,7 @@ def main():
             "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
             "action_penalty_weight": args.action_penalty_weight,
             "goal_seek_sim_threshold": args.goal_direct_sim_threshold,
+            "goal_activation_hold_steps": args.goal_activation_hold_steps,
             "success_goal_sim_threshold": args.success_goal_sim_threshold,
             "success_hold_steps": args.success_hold_steps,
             "goal_activation_step": goal_activation_step,
