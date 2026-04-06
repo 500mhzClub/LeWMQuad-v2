@@ -70,6 +70,37 @@ increases HDF5 pressure significantly, so the current stable settings are:
 
 Those settings are baked into the commands below.
 
+### Known caveat: macro-action fidelity
+
+The current stride-5 training setup is a useful macro-action abstraction, but it
+is still an approximation.
+
+- The dataset loader aggregates each 5-step block into a single macro-action by
+  averaging the logged commands over that block.
+- The rollout logs store the nominal `scaled_cmds`, not the latency-buffered
+  `active_cmds` that the PPO policy actually consumed after the 2-step command
+  delay in the physics rollout.
+
+Implication:
+
+- The model is learning "what usually happens under the average command over
+  this 5-step block," not the exact executed low-level command sequence.
+- This is acceptable when commands are smooth or piecewise constant, which is
+  usually true in the current OU and structured-pattern data.
+- It is a real weakness if within-block commands vary rapidly, because different
+  executed sequences can collapse to similar averaged macro-actions.
+
+What this means for the current project:
+
+- The existing data is still good enough for the current training and first
+  inference evaluation.
+- If the stride-5 overlap model still fails in a way that suggests action-model
+  mismatch, the next fix is **not** to abandon the architecture. The next fix is
+  to improve command-block fidelity.
+- Doing that properly would require recollecting rollout data with the executed
+  `active_cmds` logged each step, so the dataset can aggregate the true command
+  block instead of the nominal one.
+
 ## Recommended Pipeline
 
 ### 1. Optional: collect fresh physics trajectories
