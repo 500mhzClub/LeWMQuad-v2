@@ -1735,6 +1735,7 @@ def main():
           f"GoalW={planner_heads.goal_weight:.3f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
           f"RevisitW={args.revisit_penalty_weight:.3f}, "
+          f"ForwardW={args.forward_bonus_weight:.3f}, "
           f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
@@ -1808,6 +1809,8 @@ def main():
             device=planning_device,
             action_penalty_weight=args.action_penalty_weight,
             revisit_penalty_weight=args.revisit_penalty_weight,
+            forward_bonus_weight=args.forward_bonus_weight,
+            forward_bonus_safety_threshold=args.forward_bonus_safety_threshold,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
@@ -1996,6 +1999,7 @@ def main():
                 progress_str = (
                     f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
                     f"g={plan_metrics_last.get('goal_energy', plan_metrics_last.get('goal_cosine_cost', 0.0)):.3f} "
+                    f"fwd={plan_metrics_last.get('forward_bonus', 0.0):.3f} "
                     f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f} "
                     f"rv={plan_metrics_last.get('revisit_penalty', 0.0):.3f}"
                 )
@@ -2084,6 +2088,8 @@ def main():
             "exploration_weight": planner_heads.exploration_weight,
             "recent_latent_window": args.recent_latent_window,
             "revisit_penalty_weight": args.revisit_penalty_weight,
+            "forward_bonus_weight": args.forward_bonus_weight,
+            "forward_bonus_safety_threshold": args.forward_bonus_safety_threshold,
             "rnd_online_lr": args.rnd_online_lr,
             "ignores_progress_head_ckpt": scorer_meta.get("has_progress_head_ckpt", False),
             "auto_scaled_defaults": getattr(args, "auto_scaled_defaults", {}),
