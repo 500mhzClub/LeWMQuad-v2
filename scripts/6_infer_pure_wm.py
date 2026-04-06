@@ -730,6 +730,40 @@ def collect_proprio(robot, act_dofs, q0, prev_action):
     proprio = torch.cat([pos[:, 2:3], quat, vel_b, ang_b, q_rel, dq, prev_action], dim=1)
     return proprio, to_numpy(pos[0]), to_numpy(quat[0])
 
+
+def canonical_breadcrumb_proprio(
+    q0: torch.Tensor,
+    device: torch.device,
+    torch_mod,
+) -> torch.Tensor:
+    """Return a neutral proprio token for externally provided goal images.
+
+    When the world model is trained with proprio enabled, breadcrumb / target
+    images still need a proprio input at encode time. For the intended
+    deployment setup ("here is a picture of the object, go find it"), there is
+    no meaningful robot state attached to that image, so we use a canonical
+    standing token:
+
+    - nominal spawn height
+    - identity orientation
+    - zero linear / angular velocity
+    - zero joint offsets / joint velocities
+    - zero previous action
+
+    This keeps target-image encoding runtime-valid without requiring simulator
+    oracle state.
+    """
+    dtype = q0.dtype
+    batch = 1
+    pos_z = torch_mod.full((batch, 1), ROBOT_SPAWN_Z, device=device, dtype=dtype)
+    quat = torch_mod.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype)
+    vel_b = torch_mod.zeros((batch, 3), device=device, dtype=dtype)
+    ang_b = torch_mod.zeros((batch, 3), device=device, dtype=dtype)
+    q_rel = torch_mod.zeros((batch, 12), device=device, dtype=dtype)
+    dq = torch_mod.zeros((batch, 12), device=device, dtype=dtype)
+    prev_action = torch_mod.zeros((batch, 12), device=device, dtype=dtype)
+    return torch_mod.cat([pos_z, quat, vel_b, ang_b, q_rel, dq, prev_action], dim=1)
+
 def sync_render_robot(src_robot, src_act_dofs, dst_robot, dst_act_dofs):
     pos = src_robot.get_pos()
     quat = src_robot.get_quat()
@@ -1332,8 +1366,12 @@ def encode_breadcrumb(
     rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
     rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
     vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
-    
-    z_raw, z_proj = world_model.encode(vis_t, None)
+
+    proprio_t = None
+    if world_model.encoder.use_proprio:
+        proprio_t = canonical_breadcrumb_proprio(q0, planning_device, torch_mod)
+
+    z_raw, z_proj = world_model.encode(vis_t, proprio_t)
     return z_raw.squeeze(0).detach(), z_proj.squeeze(0).detach()
 
 
