@@ -145,21 +145,84 @@ def parse_args() -> argparse.Namespace:
 # Encoder loading
 # --------------------------------------------------------------------- #
 
-def load_frozen_encoder(args, device):
-    """Load the LeWM encoder from a checkpoint and freeze it."""
+def cli_flag_provided(flag: str) -> bool:
+    for token in sys.argv[1:]:
+        if token == flag or token.startswith(f"{flag}="):
+            return True
+    return False
+
+
+def infer_encoder_meta_from_checkpoint(args, device):
+    """Infer the frozen encoder configuration directly from the LeWM checkpoint."""
     ckpt = torch.load(args.checkpoint, map_location=device)
     sd = clean_state_dict(ckpt["model_state_dict"])
 
-    image_size = args.image_size or 224
-    patch_size = args.patch_size or (14 if image_size == 224 else 4)
+    pos_embed = sd["encoder.vis_enc.pos_embed"]
+    patch_w = sd["encoder.vis_enc.patch_embed.weight"]
+    pred_pos = sd["predictor.pos_embed"]
+    latent_dim = int(pos_embed.shape[-1])
+    patch_size = int(patch_w.shape[-1])
+    n_tokens = int(pos_embed.shape[1] - 1)
+    grid = int(round(math.sqrt(n_tokens)))
+    image_size = grid * patch_size
+    max_seq_len = int(pred_pos.shape[1])
+    use_proprio = any(k.startswith("encoder.prop_enc.") for k in sd)
+
+    inferred = {
+        "latent_dim": latent_dim,
+        "image_size": image_size,
+        "patch_size": patch_size,
+        "max_seq_len": max_seq_len,
+        "use_proprio": use_proprio,
+    }
+    return sd, inferred
+
+
+def resolve_encoder_config(args, device):
+    """Resolve encoder config from checkpoint and fail on explicit mismatches."""
+    sd, inferred = infer_encoder_meta_from_checkpoint(args, device)
+
+    if cli_flag_provided("--image_size") and args.image_size is not None and args.image_size != inferred["image_size"]:
+        raise ValueError(
+            f"--image_size={args.image_size} does not match checkpoint image_size={inferred['image_size']}"
+        )
+    if cli_flag_provided("--patch_size") and args.patch_size is not None and args.patch_size != inferred["patch_size"]:
+        raise ValueError(
+            f"--patch_size={args.patch_size} does not match checkpoint patch_size={inferred['patch_size']}"
+        )
+    if cli_flag_provided("--latent_dim") and args.latent_dim != inferred["latent_dim"]:
+        raise ValueError(
+            f"--latent_dim={args.latent_dim} does not match checkpoint latent_dim={inferred['latent_dim']}"
+        )
+    if cli_flag_provided("--use_proprio") and bool(args.use_proprio) != bool(inferred["use_proprio"]):
+        raise ValueError(
+            f"--use_proprio={args.use_proprio} does not match checkpoint use_proprio={inferred['use_proprio']}"
+        )
+    if cli_flag_provided("--seq_len") and int(args.seq_len) != int(inferred["max_seq_len"]):
+        raise ValueError(
+            f"--seq_len={args.seq_len} does not match checkpoint max_seq_len={inferred['max_seq_len']}"
+        )
+
+    args.image_size = inferred["image_size"]
+    args.patch_size = inferred["patch_size"]
+    args.latent_dim = inferred["latent_dim"]
+    args.use_proprio = inferred["use_proprio"]
+    args.encoder_max_seq_len = inferred["max_seq_len"]
+    return sd, inferred
+
+
+def load_frozen_encoder(args, device):
+    """Load the LeWM encoder from a checkpoint and freeze it."""
+    sd, inferred = resolve_encoder_config(args, device)
 
     model = LeWorldModel(
-        latent_dim=args.latent_dim,
-        image_size=image_size,
-        patch_size=patch_size,
-        use_proprio=args.use_proprio,
+        latent_dim=inferred["latent_dim"],
+        image_size=inferred["image_size"],
+        patch_size=inferred["patch_size"],
+        max_seq_len=inferred["max_seq_len"],
+        use_proprio=inferred["use_proprio"],
     )
-    model.load_state_dict(sd, strict=False)
+    model.load_state_dict(sd, strict=True)
     model = model.to(device)
     model.eval()
     for p in model.parameters():
@@ -173,7 +236,7 @@ def load_frozen_encoder(args, device):
 # --------------------------------------------------------------------- #
 
 SHARD_SAMPLES = 1_000_000  # ~750 MB per shard at dim=192
-CACHE_VERSION = 4          # v4: temporal abstraction metadata (stride / action blocks)
+CACHE_VERSION = 5          # v5: temporal abstraction + encoder metadata validation
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -202,6 +265,7 @@ def progress_write(message: str, pbar=None) -> None:
 def extract_latents(args, device) -> str:
     """Encode the full dataset once and cache (z_proj, safety_target,
     beacon_identity, beacon_range) shards to disk."""
+    _, encoder_meta = resolve_encoder_config(args, device)
     action_block_size = (
         args.action_block_size if args.action_block_size is not None else args.temporal_stride
     )
@@ -225,7 +289,18 @@ def extract_latents(args, device) -> str:
             "action_block_size": int(action_block_size),
             "window_stride": int(window_stride),
         }
-        if info.get("version", 1) >= CACHE_VERSION and info.get("temporal_cfg") == expected_cfg:
+        expected_encoder_cfg = {
+            "latent_dim": int(encoder_meta["latent_dim"]),
+            "image_size": int(encoder_meta["image_size"]),
+            "patch_size": int(encoder_meta["patch_size"]),
+            "max_seq_len": int(encoder_meta["max_seq_len"]),
+            "use_proprio": bool(encoder_meta["use_proprio"]),
+        }
+        if (
+            info.get("version", 1) >= CACHE_VERSION
+            and info.get("temporal_cfg") == expected_cfg
+            and info.get("encoder_cfg") == expected_encoder_cfg
+        ):
             print(f"Latent cache found: {info['n_samples']:,} samples in "
                   f"{info['n_shards']} shards (v{info.get('version', 1)})")
             return cache_dir
@@ -250,10 +325,10 @@ def extract_latents(args, device) -> str:
         load_labels=True,
     )
     channels, height, width = dataset.vision_shape
-    if args.image_size is None:
-        args.image_size = height
-    if args.patch_size is None:
-        args.patch_size = 14 if height == 224 else 4
+    if int(height) != int(args.image_size):
+        raise ValueError(
+            f"Dataset image_size={height} does not match checkpoint image_size={args.image_size}"
+        )
 
     dataloader = DataLoader(
         dataset, batch_size=None, num_workers=num_workers,
@@ -363,6 +438,13 @@ def extract_latents(args, device) -> str:
         "n_shards": shard_idx,
         "latent_dim": args.latent_dim,
         "version": CACHE_VERSION,
+        "encoder_cfg": {
+            "latent_dim": int(encoder_meta["latent_dim"]),
+            "image_size": int(encoder_meta["image_size"]),
+            "patch_size": int(encoder_meta["patch_size"]),
+            "max_seq_len": int(encoder_meta["max_seq_len"]),
+            "use_proprio": bool(encoder_meta["use_proprio"]),
+        },
         "temporal_cfg": {
             "seq_len": int(args.seq_len),
             "temporal_stride": int(args.temporal_stride),
@@ -976,9 +1058,18 @@ def train(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
+    _, encoder_meta = resolve_encoder_config(args, device)
 
     print(f"Training planning heads on {device}")
     print(f"Safety mode: {args.safety_mode}")
+    print(
+        "Frozen encoder checkpoint: "
+        f"latent_dim={encoder_meta['latent_dim']} "
+        f"image_size={encoder_meta['image_size']} "
+        f"patch_size={encoder_meta['patch_size']} "
+        f"seq_len={encoder_meta['max_seq_len']} "
+        f"use_proprio={encoder_meta['use_proprio']}"
+    )
     action_block_size = (
         args.action_block_size if args.action_block_size is not None else args.temporal_stride
     )
@@ -1049,6 +1140,10 @@ def train(args):
         "temporal_stride": args.temporal_stride,
         "action_block_size": action_block_size,
         "window_stride": window_stride,
+        "image_size": int(encoder_meta["image_size"]),
+        "patch_size": int(encoder_meta["patch_size"]),
+        "use_proprio": bool(encoder_meta["use_proprio"]),
+        "max_seq_len": int(encoder_meta["max_seq_len"]),
     }
     torch.save(scorer_data, scorer_path)
     print(f"\nTrajectoryScorer checkpoint saved: {scorer_path}")

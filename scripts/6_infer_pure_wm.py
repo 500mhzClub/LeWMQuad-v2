@@ -472,6 +472,51 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.history_len is not None:
         args.visited_bank_size = args.history_len
+
+    def flag_provided(flag: str) -> bool:
+        for token in sys.argv[1:]:
+            if token == flag or token.startswith(f"{flag}="):
+                return True
+        return False
+
+    auto_scaled: dict[str, dict[str, float]] = {}
+    repeat = max(1, int(args.macro_action_repeat))
+    if repeat > 1:
+        sqrt_repeat = math.sqrt(float(repeat))
+
+        def maybe_scale_int(attr: str, flag: str, minimum: int = 1) -> None:
+            if flag_provided(flag):
+                return
+            old = int(getattr(args, attr))
+            new = max(minimum, int(math.ceil(old / float(repeat))))
+            if new != old:
+                setattr(args, attr, new)
+                auto_scaled[attr] = {"old": old, "new": new}
+
+        def maybe_scale_float(attr: str, flag: str, scale: float) -> None:
+            if flag_provided(flag):
+                return
+            old = float(getattr(args, attr))
+            new = old * scale
+            if not math.isclose(new, old, rel_tol=1e-9, abs_tol=1e-12):
+                setattr(args, attr, new)
+                auto_scaled[attr] = {"old": old, "new": new}
+
+        maybe_scale_int("keyframe_min_step_gap", "--keyframe_min_step_gap", minimum=2)
+        maybe_scale_int("keyframe_add_interval", "--keyframe_add_interval", minimum=4)
+        maybe_scale_int("stall_plateau_steps", "--stall_plateau_steps", minimum=40)
+        maybe_scale_int("subgoal_budget_steps", "--subgoal_budget_steps", minimum=20)
+        maybe_scale_int("subgoal_min_age_steps", "--subgoal_min_age_steps", minimum=20)
+        maybe_scale_int("subgoal_frontier_window_steps", "--subgoal_frontier_window_steps", minimum=80)
+        maybe_scale_int("subgoal_cooldown_steps", "--subgoal_cooldown_steps", minimum=20)
+        maybe_scale_int("success_hold_steps", "--success_hold_steps", minimum=2)
+        maybe_scale_int("stuck_window_steps", "--stuck_window_steps", minimum=4)
+        maybe_scale_int("recover_budget_steps", "--recover_budget_steps", minimum=6)
+        maybe_scale_int("recover_cooldown_steps", "--recover_cooldown_steps", minimum=6)
+        maybe_scale_float("stuck_odom_threshold", "--stuck_odom_threshold", sqrt_repeat)
+        maybe_scale_float("stuck_latent_threshold", "--stuck_latent_threshold", sqrt_repeat)
+
+    args.auto_scaled_defaults = auto_scaled
     return args
 
 
@@ -508,13 +553,15 @@ def load_world_model(ckpt_path: str, device: torch.device):
     return model, {
         "latent_dim": latent_dim, "image_size": image_size,
         "patch_size": patch_size, "use_proprio": use_proprio,
+        "max_seq_len": max_seq_len,
     }
 
 
 def load_planner_heads(
     ckpt_path: str | None,
     device: torch.device,
-    latent_dim: int,
+    wm_meta: dict[str, Any],
+    macro_action_repeat: int,
 ) -> tuple[PlannerHeads, dict[str, Any]]:
     heads = PlannerHeads()
     meta: dict[str, Any] = {}
@@ -524,8 +571,43 @@ def load_planner_heads(
         raise FileNotFoundError(f"scorer checkpoint not found: {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
+    if "latent_dim" in ckpt and int(ckpt["latent_dim"]) != int(wm_meta["latent_dim"]):
+        raise ValueError(
+            f"Scorer latent_dim={ckpt['latent_dim']} does not match world-model latent_dim={wm_meta['latent_dim']}"
+        )
+    if "image_size" in ckpt and int(ckpt["image_size"]) != int(wm_meta["image_size"]):
+        raise ValueError(
+            f"Scorer image_size={ckpt['image_size']} does not match world-model image_size={wm_meta['image_size']}"
+        )
+    if "patch_size" in ckpt and int(ckpt["patch_size"]) != int(wm_meta["patch_size"]):
+        raise ValueError(
+            f"Scorer patch_size={ckpt['patch_size']} does not match world-model patch_size={wm_meta['patch_size']}"
+        )
+    if "use_proprio" in ckpt and bool(ckpt["use_proprio"]) != bool(wm_meta["use_proprio"]):
+        raise ValueError(
+            f"Scorer use_proprio={ckpt['use_proprio']} does not match world-model use_proprio={wm_meta['use_proprio']}"
+        )
+    if "max_seq_len" in ckpt and int(ckpt["max_seq_len"]) != int(wm_meta["max_seq_len"]):
+        raise ValueError(
+            f"Scorer max_seq_len={ckpt['max_seq_len']} does not match world-model max_seq_len={wm_meta['max_seq_len']}"
+        )
+    if "seq_len" in ckpt and int(ckpt["seq_len"]) != int(wm_meta["max_seq_len"]):
+        raise ValueError(
+            f"Scorer seq_len={ckpt['seq_len']} does not match world-model max_seq_len={wm_meta['max_seq_len']}"
+        )
+    if "temporal_stride" in ckpt and int(ckpt["temporal_stride"]) != int(macro_action_repeat):
+        raise ValueError(
+            f"Scorer temporal_stride={ckpt['temporal_stride']} does not match "
+            f"--macro_action_repeat={macro_action_repeat}"
+        )
+    if "action_block_size" in ckpt and int(ckpt["action_block_size"]) != int(macro_action_repeat):
+        raise ValueError(
+            f"Scorer action_block_size={ckpt['action_block_size']} does not match "
+            f"--macro_action_repeat={macro_action_repeat}"
+        )
     hidden_dim = int(ckpt.get("hidden_dim", 512))
     dropout = float(ckpt.get("dropout", 0.0))
+    latent_dim = int(wm_meta["latent_dim"])
 
     if ckpt.get("safety_head") is not None:
         safety = LatentEnergyHead(latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
@@ -555,6 +637,11 @@ def load_planner_heads(
         "goal_weight": heads.goal_weight,
         "progress_weight": heads.progress_weight,
         "safety_mode": ckpt.get("safety_mode"),
+        "seq_len": ckpt.get("seq_len"),
+        "temporal_stride": ckpt.get("temporal_stride"),
+        "action_block_size": ckpt.get("action_block_size"),
+        "window_stride": ckpt.get("window_stride"),
+        "use_proprio": ckpt.get("use_proprio"),
     }
     return heads, meta
 
@@ -1596,7 +1683,7 @@ def main():
 
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
     planner_heads, scorer_meta = load_planner_heads(
-        args.scorer_ckpt, planning_device, wm_meta["latent_dim"],
+        args.scorer_ckpt, planning_device, wm_meta, args.macro_action_repeat,
     )
     camera_cfg = ego_camera_config_from_args(args)
 
@@ -1607,7 +1694,20 @@ def main():
             "Loaded planner heads: "
             f"safety={scorer_meta.get('has_safety_head', False)} "
             f"goal={scorer_meta.get('has_goal_head', False)} "
-            f"progress={scorer_meta.get('has_progress_head', False)}"
+            f"progress={scorer_meta.get('has_progress_head', False)} "
+            f"(seq={scorer_meta.get('seq_len')}, "
+            f"stride={scorer_meta.get('temporal_stride')}, "
+            f"block={scorer_meta.get('action_block_size')}, "
+            f"use_proprio={scorer_meta.get('use_proprio')})"
+        )
+    if getattr(args, "auto_scaled_defaults", None):
+        scaled_pairs = ", ".join(
+            f"{name}={spec['old']}->{spec['new']}"
+            for name, spec in sorted(args.auto_scaled_defaults.items())
+        )
+        print(
+            "Auto-scaled planner defaults for "
+            f"macro_action_repeat={args.macro_action_repeat}: {scaled_pairs}"
         )
 
     obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
@@ -2297,6 +2397,7 @@ def main():
             "stuck_latent_threshold": args.stuck_latent_threshold,
             "recover_budget_steps": args.recover_budget_steps,
             "recover_cooldown_steps": args.recover_cooldown_steps,
+            "auto_scaled_defaults": getattr(args, "auto_scaled_defaults", {}),
             "visited_samples_seen": visited_seen,
             "visited_insertions": visited_insertions,
             "visited_replacements": visited_replacements,

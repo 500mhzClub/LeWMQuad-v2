@@ -115,6 +115,27 @@ python scripts/1_physics_rollout.py --ckpt <ppo_ckpt> --steps 1000 --chunks 5
 python scripts/2_visual_renderer.py --raw_dir jepa_raw_data --out_dir jepa_final_dataset
 ```
 
+For the current navigation stack, there is one important label update:
+
+- beacon visibility / identity / range for the planning heads should be
+  obstacle-aware, not just FOV+range
+- `scripts/2_visual_renderer.py` now recomputes those geometry-derived labels by
+  default when building HDF5 from raw rollouts
+- if you already have a rendered HDF5 dataset, you can reuse its existing vision
+  and rewrite only the labels into a fresh output directory:
+
+```bash
+python scripts/2_visual_renderer.py \
+  --raw_dir jepa_raw_data_v3 \
+  --reuse_vision_from jepa_final_v3 \
+  --out_dir jepa_final_v3_los \
+  --workers 1
+```
+
+This does **not** require a new physics rollout. It uses the existing raw
+rollout state to recompute LOS-aware labels and copies the already-rendered
+vision from `jepa_final_v3`.
+
 ### 3. Train the base LeWorldModel
 
 Current recommended run:
@@ -153,11 +174,25 @@ The planning stack uses four learned components on top of frozen LeWM latents:
 All of them must be trained with the **same temporal abstraction** as the world
 model checkpoint they consume.
 
+The head-training script now auto-detects encoder config from the LeWM
+checkpoint and will fail fast on explicit mismatches. In particular:
+
+- `latent_dim`, `image_size`, `patch_size`, and `use_proprio` are resolved from
+  the checkpoint
+- scorer checkpoints now carry temporal / encoder metadata
+- inference validates that scorer metadata matches the loaded world model and
+  `macro_action_repeat`
+
+Important: the base world model does **not** use beacon labels, so it can still
+be trained on `jepa_final_v3`. The planning heads should use the LOS-corrected
+dataset (for example `jepa_final_v3_los`) so the goal/progress supervision does
+not reward through-wall visibility.
+
 Recommended command:
 
 ```bash
 python scripts/4_train_energy_head.py \
-  --data_dir jepa_final_v3 \
+  --data_dir jepa_final_v3_los \
   --checkpoint lewm_checkpoints_keyframe_exec_stride5_overlap_v2/epoch_30.pt \
   --device cuda \
   --seq_len 4 \
@@ -166,7 +201,6 @@ python scripts/4_train_energy_head.py \
   --window_stride 5 \
   --num_workers 4 \
   --prefetch_factor 2 \
-  --use_proprio \
   --out_dir energy_head_checkpoints_keyframe_exec_stride5_overlap_v2 \
   --log_dir energy_head_logs_keyframe_exec_stride5_overlap_v2 \
   --safety_mode consequence \

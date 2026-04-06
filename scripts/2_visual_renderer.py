@@ -47,6 +47,7 @@ from lewm.genesis_utils import to_numpy
 from lewm.texture_utils import generate_texture_set
 from lewm.obstacle_utils import ObstacleLayout
 from lewm.beacon_utils import BeaconLayout, beacon_like_wall_color
+from lewm.label_utils import compute_episode_labels
 from lewm.camera_utils import (
     add_egocentric_camera_args,
     camera_rotation_matrix,
@@ -480,6 +481,54 @@ LABEL_FIELDS = [
     "cmd_pattern",
 ]
 
+RECOMPUTED_LABEL_FIELDS = [
+    "clearance",
+    "near_miss",
+    "traversability",
+    "beacon_visible",
+    "beacon_identity",
+    "beacon_bearing",
+    "beacon_range",
+]
+
+
+def recompute_chunk_labels(data: dict, obstacle_json: str, beacon_json: str) -> dict[str, np.ndarray]:
+    """Recompute geometry-derived labels from recorded base state."""
+    base_pos = np.asarray(data["base_pos"])
+    base_quat = np.asarray(data["base_quat"])
+    n_envs, steps = int(base_pos.shape[0]), int(base_pos.shape[1])
+
+    w = base_quat[..., 0]
+    x = base_quat[..., 1]
+    y = base_quat[..., 2]
+    z = base_quat[..., 3]
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)).astype(np.float32)
+
+    obstacle_layout = ObstacleLayout.from_json(obstacle_json)
+    beacon_layout = BeaconLayout.from_json(beacon_json)
+    beacon_layout_or_none = beacon_layout if len(beacon_layout.beacons) > 0 else None
+
+    labels_out: dict[str, np.ndarray] = {
+        "clearance": np.zeros((n_envs, steps), dtype=np.float32),
+        "near_miss": np.zeros((n_envs, steps), dtype=bool),
+        "traversability": np.zeros((n_envs, steps), dtype=np.int32),
+        "beacon_visible": np.zeros((n_envs, steps), dtype=bool),
+        "beacon_identity": np.full((n_envs, steps), -1, dtype=np.int32),
+        "beacon_bearing": np.zeros((n_envs, steps), dtype=np.float32),
+        "beacon_range": np.full((n_envs, steps), float("inf"), dtype=np.float32),
+    }
+
+    for env_i in range(n_envs):
+        labels = compute_episode_labels(
+            robot_xy=base_pos[env_i, :, :2].astype(np.float32),
+            robot_yaw=yaw[env_i],
+            obstacle_layout=obstacle_layout,
+            beacon_layout=beacon_layout_or_none,
+        )
+        for field in RECOMPUTED_LABEL_FIELDS:
+            labels_out[field][env_i] = labels[field]
+    return labels_out
+
 
 def stitch_hdf5(
     out_path: str,
@@ -490,6 +539,7 @@ def stitch_hdf5(
     T: int,
     img_res: int,
     vision_compression: str | None,
+    vision_source_path: str | None = None,
 ) -> None:
     """Merge per-worker HDF5 shards and raw data into one final HDF5 file."""
     tmp_out = out_path + ".stitching"
@@ -518,16 +568,25 @@ def stitch_hdf5(
             if "beacon_layout" in data:
                 raw = data["beacon_layout"]
                 h5f.attrs["beacon_layout"] = str(raw.item() if hasattr(raw, "item") else raw)
+            h5f.attrs["label_visibility_mode"] = "fov_range_front_los"
 
-            # Copy rendered vision
-            for tmp_file, task in zip(tmp_files, tasks):
-                start, end = task[2], task[3]
+            # Copy vision from either temporary render shards or an existing HDF5.
+            if vision_source_path is not None:
                 try:
-                    with h5py.File(tmp_file, "r") as tmp_in:
-                        h5_vision[start:end] = tmp_in["vision"][:]
+                    with h5py.File(vision_source_path, "r") as src_h5:
+                        h5_vision[:] = src_h5["vision"][:]
                 except Exception as e:
-                    print(f"[stitch] Failed to merge {tmp_file}: {e}")
+                    print(f"[stitch] Failed to copy vision from {vision_source_path}: {e}")
                     raise
+            else:
+                for tmp_file, task in zip(tmp_files, tasks):
+                    start, end = task[2], task[3]
+                    try:
+                        with h5py.File(tmp_file, "r") as tmp_in:
+                            h5_vision[start:end] = tmp_in["vision"][:]
+                    except Exception as e:
+                        print(f"[stitch] Failed to merge {tmp_file}: {e}")
+                        raise
 
         os.replace(tmp_out, out_path)
 
@@ -587,6 +646,17 @@ def main():
         action="store_true",
         help="Replay recorded poses without advancing Genesis physics; force camera refresh on render.",
     )
+    parser.add_argument(
+        "--reuse_vision_from",
+        type=str,
+        default=None,
+        help="Existing rendered HDF5 directory to copy vision from while recomputing labels.",
+    )
+    parser.add_argument(
+        "--skip_label_recompute",
+        action="store_true",
+        help="Preserve label arrays from the raw rollout instead of recomputing geometry-derived labels.",
+    )
     add_egocentric_camera_args(parser, include_jitter=True)
     args = parser.parse_args()
 
@@ -636,8 +706,11 @@ def main():
         f"near={camera_cfg.near_plane:.3f}m "
         f"safe_clearance={camera_cfg.safe_clearance:.3f}m"
     )
-    tqdm.write(f"Generating ground texture set ({args.texture_count} textures) ...")
-    generate_texture_set(texture_dir, count=args.texture_count)
+    if args.reuse_vision_from is None:
+        tqdm.write(f"Generating ground texture set ({args.texture_count} textures) ...")
+        generate_texture_set(texture_dir, count=args.texture_count)
+    else:
+        tqdm.write(f"Reusing vision from {args.reuse_vision_from}; skipping texture generation and rendering.")
 
     n_chunks = len(raw_files)
 
@@ -700,7 +773,8 @@ def main():
             chunk_label = f"{chunk_name}  [{chunk_idx + 1}/{len(pending)}]"
             pbar.set_description(chunk_label)
 
-            data = np.load(file_path, allow_pickle=True)
+            raw_npz = np.load(file_path, allow_pickle=True)
+            data = {key: np.asarray(raw_npz[key]) for key in raw_npz.files}
 
             # Extract obstacle layout JSON
             if "obstacle_layout" in data:
@@ -716,60 +790,71 @@ def main():
             else:
                 beacon_json = '{"beacons": [], "distractors": []}'
 
-            # Split environments across workers
-            envs_per_worker = math.ceil(N / effective_workers)
+            if not args.skip_label_recompute:
+                data.update(recompute_chunk_labels(data, obstacle_json, beacon_json))
+
             tasks = []
             tmp_files = []
-            for i in range(effective_workers):
-                start = i * envs_per_worker
-                end = min(start + envs_per_worker, N)
-                if start >= end:
-                    break
-                tmp = os.path.join(args.out_dir, f"{chunk_name}_tmp_{i}.h5")
-                tmp_files.append(tmp)
-                tasks.append((
-                    i, file_path, start, end, tmp,
-                    args.sim_backend, texture_dir, obstacle_json, beacon_json,
-                    args.texture_count, effective_texture_variants,
-                    args.beacon_confuse_prob, args.img_res, tmp_vision_compression,
-                    args.skip_physics_step, camera_cfg,
-                ))
-
-            progress_queue = mp.Queue()
-            tasks_with_q = [(*t, progress_queue) for t in tasks]
-
-            processes = [mp.Process(target=render_worker, args=(t,)) for t in tasks_with_q]
-            for p in processes:
-                p.start()
-
-            envs_received = 0
-            while envs_received < N:
-                try:
-                    progress_queue.get(timeout=5)
-                    pbar.update(1)
-                    envs_received += 1
-                except queue.Empty:
-                    if not any(p.is_alive() for p in processes):
+            source_vision_path = None
+            if args.reuse_vision_from is None:
+                envs_per_worker = math.ceil(N / effective_workers)
+                for i in range(effective_workers):
+                    start = i * envs_per_worker
+                    end = min(start + envs_per_worker, N)
+                    if start >= end:
                         break
+                    tmp = os.path.join(args.out_dir, f"{chunk_name}_tmp_{i}.h5")
+                    tmp_files.append(tmp)
+                    tasks.append((
+                        i, file_path, start, end, tmp,
+                        args.sim_backend, texture_dir, obstacle_json, beacon_json,
+                        args.texture_count, effective_texture_variants,
+                        args.beacon_confuse_prob, args.img_res, tmp_vision_compression,
+                        args.skip_physics_step, camera_cfg,
+                    ))
 
-            for p in processes:
-                p.join()
+                progress_queue = mp.Queue()
+                tasks_with_q = [(*t, progress_queue) for t in tasks]
 
-            failed = [p.pid for p in processes if p.exitcode not in (0, None)]
-            missing_tmp = [tmp for tmp in tmp_files if not os.path.exists(tmp)]
-            if failed or missing_tmp:
-                for tmp in tmp_files:
+                processes = [mp.Process(target=render_worker, args=(t,)) for t in tasks_with_q]
+                for p in processes:
+                    p.start()
+
+                envs_received = 0
+                while envs_received < N:
                     try:
-                        if os.path.exists(tmp):
-                            os.remove(tmp)
-                    except Exception:
-                        pass
-                raise RuntimeError(
-                    "Render worker failure before stitching. "
-                    f"backend={args.sim_backend}, workers={effective_workers}, img_res={args.img_res}, "
-                    f"failed_pids={failed}, missing_tmp_files={len(missing_tmp)}. "
-                    "On AMD/ROCm, rerun with --workers 1 or use --sim_backend vulkan/cpu."
-                )
+                        progress_queue.get(timeout=5)
+                        pbar.update(1)
+                        envs_received += 1
+                    except queue.Empty:
+                        if not any(p.is_alive() for p in processes):
+                            break
+
+                for p in processes:
+                    p.join()
+
+                failed = [p.pid for p in processes if p.exitcode not in (0, None)]
+                missing_tmp = [tmp for tmp in tmp_files if not os.path.exists(tmp)]
+                if failed or missing_tmp:
+                    for tmp in tmp_files:
+                        try:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+                        except Exception:
+                            pass
+                    raise RuntimeError(
+                        "Render worker failure before stitching. "
+                        f"backend={args.sim_backend}, workers={effective_workers}, img_res={args.img_res}, "
+                        f"failed_pids={failed}, missing_tmp_files={len(missing_tmp)}. "
+                        "On AMD/ROCm, rerun with --workers 1 or use --sim_backend vulkan/cpu."
+                    )
+            else:
+                source_vision_path = os.path.join(args.reuse_vision_from, f"{chunk_name}_rgb.h5")
+                if not os.path.isfile(source_vision_path):
+                    raise FileNotFoundError(
+                        f"Missing source vision file for {chunk_name}: {source_vision_path}"
+                    )
+                pbar.update(N)
 
             pbar.set_description(f"{chunk_label}  stitching...")
             stitch_hdf5(
@@ -781,6 +866,7 @@ def main():
                 T,
                 args.img_res,
                 final_vision_compression,
+                vision_source_path=source_vision_path,
             )
             tqdm.write(f"  {chunk_name} done  ({N} envs, {T} steps)  ->  {out_path}")
 
