@@ -157,6 +157,18 @@ class PureCEMPlanner:
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
+        if self.cmd_low.ndim != 1:
+            raise ValueError(f"cmd_low must be 1D, got shape {tuple(self.cmd_low.shape)}")
+        self.cmd_dim = int(self.cmd_low.numel())
+        for name, tensor in (
+            ("cmd_high", self.cmd_high),
+            ("init_std", self.init_std),
+            ("min_std", self.min_std),
+        ):
+            if tensor.shape != self.cmd_low.shape:
+                raise ValueError(
+                    f"{name} shape {tuple(tensor.shape)} does not match cmd_low {tuple(self.cmd_low.shape)}"
+                )
         self.device = device
         self.action_penalty_weight = action_penalty_weight
         self._warm_start: torch.Tensor | None = None
@@ -188,12 +200,12 @@ class PureCEMPlanner:
 
         for _ in range(self.cem_iters):
             noise = torch.randn(
-                self.n_candidates, self.horizon, 3, device=self.device,
+                self.n_candidates, self.horizon, self.cmd_dim, device=self.device,
             )
             samples = mean.unsqueeze(0) + std.unsqueeze(0) * noise
             samples = samples.clamp(
-                self.cmd_low.view(1, 1, 3),
-                self.cmd_high.view(1, 1, 3),
+                self.cmd_low.view(1, 1, -1),
+                self.cmd_high.view(1, 1, -1),
             )
             samples[0] = mean
 
@@ -270,6 +282,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--sim_backend", type=str, default="auto")
     p.add_argument("--show_viewer", action="store_true")
+    p.add_argument("--allow_mixed_latent_wm", action="store_true",
+                   help="Override the pure-perception guard and allow a world-model checkpoint that uses proprio.")
     
     p.add_argument("--plan_horizon", type=int, default=5)
     p.add_argument("--n_candidates", type=int, default=300)
@@ -397,16 +411,38 @@ def load_world_model(ckpt_path: str, device: torch.device):
     pos_embed = state["encoder.vis_enc.pos_embed"]
     patch_w = state["encoder.vis_enc.patch_embed.weight"]
     pred_pos = state["predictor.pos_embed"]
+    cmd_w = state["predictor.action_embed.patch_embed.weight"]
     latent_dim = int(pos_embed.shape[-1])
     patch_size = int(patch_w.shape[-1])
     n_tokens = int(pos_embed.shape[1] - 1)
     grid = int(round(math.sqrt(n_tokens)))
     image_size = grid * patch_size
     max_seq_len = int(pred_pos.shape[1])
+    cmd_dim = int(cmd_w.shape[1])
     use_proprio = any(k.startswith("encoder.prop_enc.") for k in state)
+    command_representation = ckpt.get(
+        "command_representation",
+        "mean_scaled" if cmd_dim == 3 else "active_block",
+    )
+    command_latency = int(ckpt.get("command_latency", 2))
+    if command_representation == "active_block":
+        if cmd_dim % 3 != 0:
+            raise ValueError(
+                f"Active-block checkpoint has cmd_dim={cmd_dim}, which is not divisible by 3."
+            )
+        command_block_size = int(ckpt.get("action_block_size", cmd_dim // 3))
+        inferred_block_size = cmd_dim // 3
+        if int(command_block_size) != int(inferred_block_size):
+            raise ValueError(
+                f"Checkpoint action_block_size={command_block_size} does not match "
+                f"inferred block size {inferred_block_size} from cmd_dim={cmd_dim}."
+            )
+    else:
+        command_block_size = int(ckpt.get("action_block_size", 1))
 
     model = LeWorldModel(
         latent_dim=latent_dim,
+        cmd_dim=cmd_dim,
         image_size=image_size,
         patch_size=patch_size,
         max_seq_len=max_seq_len,
@@ -418,7 +454,60 @@ def load_world_model(ckpt_path: str, device: torch.device):
         "latent_dim": latent_dim, "image_size": image_size,
         "patch_size": patch_size, "use_proprio": use_proprio,
         "max_seq_len": max_seq_len,
+        "cmd_dim": cmd_dim,
+        "command_representation": command_representation,
+        "command_latency": command_latency,
+        "command_block_size": command_block_size,
     }
+
+
+def build_command_sampling_config(
+    args: argparse.Namespace,
+    wm_meta: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cmd_low = torch.tensor(args.cmd_low, dtype=torch.float32)
+    cmd_high = torch.tensor(args.cmd_high, dtype=torch.float32)
+    init_std = torch.tensor(args.cem_init_std, dtype=torch.float32)
+    min_std = torch.tensor(args.cem_min_std, dtype=torch.float32)
+    cmd_repr = wm_meta.get("command_representation", "mean_scaled")
+    cmd_dim = int(wm_meta.get("cmd_dim", 3))
+
+    if cmd_repr != "active_block":
+        if cmd_dim != 3:
+            raise ValueError(f"Expected cmd_dim=3 for {cmd_repr}, got {cmd_dim}.")
+        return cmd_low, cmd_high, init_std, min_std
+
+    block_size = int(wm_meta.get("command_block_size", 0))
+    if block_size <= 0:
+        raise ValueError(f"Invalid command_block_size={block_size} for active_block model.")
+    if cmd_dim != block_size * 3:
+        raise ValueError(
+            f"Active-block model has cmd_dim={cmd_dim}, expected {block_size * 3}."
+        )
+    return (
+        cmd_low.repeat(block_size),
+        cmd_high.repeat(block_size),
+        init_std.repeat(block_size),
+        min_std.repeat(block_size),
+    )
+
+
+def format_command_for_log(
+    cmd_values: list[float],
+    wm_meta: dict[str, Any],
+) -> str:
+    if wm_meta.get("command_representation") != "active_block":
+        return f"[{cmd_values[0]:+.2f}, {cmd_values[1]:+.2f}, {cmd_values[2]:+.2f}]"
+
+    block = np.asarray(cmd_values, dtype=np.float32).reshape(-1, 3)
+    mean_cmd = block.mean(axis=0)
+    first_cmd = block[0]
+    last_cmd = block[-1]
+    return (
+        f"mean=[{mean_cmd[0]:+.2f}, {mean_cmd[1]:+.2f}, {mean_cmd[2]:+.2f}] "
+        f"first=[{first_cmd[0]:+.2f}, {first_cmd[1]:+.2f}, {first_cmd[2]:+.2f}] "
+        f"last=[{last_cmd[0]:+.2f}, {last_cmd[1]:+.2f}, {last_cmd[2]:+.2f}]"
+    )
 
 
 def load_planner_heads(
@@ -1261,11 +1350,25 @@ def encode_breadcrumb(
 def execute_command(
     scene, robot, policy, act_dofs, q0, prev_action,
     nominal_cmd, sim_cfg, gs, torch_mod, macro_action_repeat=1,
+    command_representation: str = "mean_scaled",
+    command_block_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    cmd = nominal_cmd.to(device=gs.device, dtype=torch_mod.float32).view(1, 3)
+    nominal_cmd = nominal_cmd.to(device=gs.device, dtype=torch_mod.float32).flatten()
     last_action = prev_action.detach().clone()
-    repeats = max(1, int(macro_action_repeat))
-    for _ in range(repeats):
+    if command_representation == "active_block":
+        block_size = int(command_block_size if command_block_size is not None else max(1, int(macro_action_repeat)))
+        if nominal_cmd.numel() != block_size * 3:
+            raise ValueError(
+                f"Expected active_block command with {block_size * 3} values, got {nominal_cmd.numel()}"
+            )
+        cmd_seq = nominal_cmd.view(block_size, 3)
+    else:
+        cmd = nominal_cmd.view(1, 3)
+        repeats = max(1, int(macro_action_repeat))
+        cmd_seq = cmd.expand(repeats, -1)
+
+    for step_cmd in cmd_seq:
+        cmd = step_cmd.view(1, 3)
         proprio, _, _ = collect_proprio(robot, act_dofs, q0, last_action)
         obs_tensor = torch.cat([proprio, cmd], dim=1)
         actions = policy.act_deterministic(obs_tensor)
@@ -1280,7 +1383,7 @@ def execute_command(
             scene.step()
         last_action = actions.detach().clone()
 
-    return cmd.detach().clone(), last_action
+    return nominal_cmd.detach().clone(), last_action
 
 
 # ---- Visualization ------------------------------------------------------- #
@@ -1607,14 +1710,31 @@ def main():
         planner_heads.exploration_weight = float(args.exploration_weight)
     camera_cfg = ego_camera_config_from_args(args)
 
-    print(f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
-          f"image_size={wm_meta['image_size']}")
+    print(
+        f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
+        f"image_size={wm_meta['image_size']} "
+        f"cmd_dim={wm_meta['cmd_dim']} "
+        f"cmd_repr={wm_meta['command_representation']}"
+    )
     if wm_meta["use_proprio"]:
+        if not args.allow_mixed_latent_wm:
+            raise ValueError(
+                "scripts/6_infer_pure_wm.py requires a pure-vision world-model checkpoint, "
+                "but the supplied checkpoint was trained with proprio enabled. "
+                "Retrain LeWM without --use_proprio, or pass --allow_mixed_latent_wm "
+                "only for legacy debugging."
+            )
         print(
-            "World-model checkpoint still uses proprio tokens. "
-            "The planner is perception-only at the control-logic level, but a fully "
-            "vision-only forward pass still requires a pure-vision checkpoint."
+            "Warning: allowing a mixed latent world model in pure-perception inference. "
+            "Exploration and safety will be evaluated in a vision+proprio latent, not "
+            "pure perception."
         )
+    if wm_meta["command_representation"] == "active_block":
+        if int(args.macro_action_repeat) != int(wm_meta["command_block_size"]):
+            raise ValueError(
+                f"Active-block checkpoint expects --macro_action_repeat={wm_meta['command_block_size']}, "
+                f"got {args.macro_action_repeat}."
+            )
     if args.scorer_ckpt is not None:
         print(
             "Loaded planner heads: "
@@ -1678,6 +1798,7 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
+          f"Cmd={wm_meta['command_representation']}:{wm_meta['cmd_dim']}, "
           f"Latent=proj, Objective=safety+novelty, "
           f"GoalSucc={args.success_goal_sim_threshold:.2f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
@@ -1738,6 +1859,7 @@ def main():
             )
 
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
+        cmd_low_t, cmd_high_t, init_std_t, min_std_t = build_command_sampling_config(args, wm_meta)
 
         planner = PureCEMPlanner(
             world_model=world_model,
@@ -1745,10 +1867,10 @@ def main():
             n_candidates=args.n_candidates,
             cem_iters=args.cem_iters,
             elite_frac=args.elite_frac,
-            cmd_low=torch.tensor(args.cmd_low, dtype=torch.float32),
-            cmd_high=torch.tensor(args.cmd_high, dtype=torch.float32),
-            init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
-            min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
+            cmd_low=cmd_low_t,
+            cmd_high=cmd_high_t,
+            init_std=init_std_t,
+            min_std=min_std_t,
             device=planning_device,
             action_penalty_weight=args.action_penalty_weight,
         )
@@ -1804,6 +1926,7 @@ def main():
             nominal_cmd = plan_seq[plan_step_idx]
             plan_step_idx += 1
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
+            cmd_display = format_command_for_log(cmd_vals, wm_meta)
             cmds_log.append(cmd_vals)
 
             _, actions = execute_command(
@@ -1811,6 +1934,8 @@ def main():
                 physics_act_dofs, q0, prev_action,
                 nominal_cmd.to(gs.device), sim_cfg, gs, torch,
                 macro_action_repeat=args.macro_action_repeat,
+                command_representation=str(wm_meta["command_representation"]),
+                command_block_size=int(wm_meta["command_block_size"]),
             )
             prev_action = actions.detach().clone()
 
@@ -1914,7 +2039,7 @@ def main():
                 goal_sim_str = "n/a" if goal_sim_now is None else f"{goal_sim_now:.3f}"
                 print(
                     f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
-                    f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
+                    f"cmd={cmd_display} "
                     f"cost={costs_log[-1]:.3f} goal_sim={goal_sim_str} d_goal={goal_str} "
                     f"cov={cov_area:.2f}m^2 cov+={cov_delta:+.2f} "
                     f"coll={collision_count} "
@@ -1964,7 +2089,11 @@ def main():
         "result": terminate_reason,
         "oracle_goal_reached": oracle_goal_reached,
         "steps": len(cmds_log),
-        "low_level_control_steps": len(cmds_log) * max(1, args.macro_action_repeat),
+        "low_level_control_steps": len(cmds_log) * (
+            int(wm_meta["command_block_size"])
+            if wm_meta["command_representation"] == "active_block"
+            else max(1, args.macro_action_repeat)
+        ),
         "oracle_collisions": collision_count,
         "first_collision_step": first_collision_step,
         "frame_substitutions": frame_substitution_count,
@@ -1983,6 +2112,10 @@ def main():
             "latent_space": "proj",
             "objective": "safety_plus_novelty",
             "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
+            "world_model_cmd_dim": int(wm_meta["cmd_dim"]),
+            "world_model_command_representation": str(wm_meta["command_representation"]),
+            "world_model_command_block_size": int(wm_meta["command_block_size"]),
+            "world_model_command_latency": int(wm_meta["command_latency"]),
             "action_penalty_weight": args.action_penalty_weight,
             "success_goal_sim_threshold": args.success_goal_sim_threshold,
             "success_hold_steps": args.success_hold_steps,

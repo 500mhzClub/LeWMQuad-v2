@@ -169,19 +169,29 @@ def infer_encoder_meta_from_checkpoint(args, device):
     pos_embed = sd["encoder.vis_enc.pos_embed"]
     patch_w = sd["encoder.vis_enc.patch_embed.weight"]
     pred_pos = sd["predictor.pos_embed"]
+    cmd_w = sd["predictor.action_embed.patch_embed.weight"]
     latent_dim = int(pos_embed.shape[-1])
     patch_size = int(patch_w.shape[-1])
     n_tokens = int(pos_embed.shape[1] - 1)
     grid = int(round(math.sqrt(n_tokens)))
     image_size = grid * patch_size
     max_seq_len = int(pred_pos.shape[1])
+    cmd_dim = int(cmd_w.shape[1])
     use_proprio = any(k.startswith("encoder.prop_enc.") for k in sd)
+    command_representation = ckpt.get(
+        "command_representation",
+        "mean_scaled" if cmd_dim == 3 else "active_block",
+    )
+    command_latency = int(ckpt.get("command_latency", 2))
 
     inferred = {
         "latent_dim": latent_dim,
         "image_size": image_size,
         "patch_size": patch_size,
         "max_seq_len": max_seq_len,
+        "cmd_dim": cmd_dim,
+        "command_representation": command_representation,
+        "command_latency": command_latency,
         "use_proprio": use_proprio,
     }
     return sd, inferred
@@ -226,6 +236,7 @@ def load_frozen_encoder(args, device):
 
     model = LeWorldModel(
         latent_dim=inferred["latent_dim"],
+        cmd_dim=inferred["cmd_dim"],
         image_size=inferred["image_size"],
         patch_size=inferred["patch_size"],
         max_seq_len=inferred["max_seq_len"],
@@ -303,6 +314,9 @@ def extract_latents(args, device) -> str:
             "image_size": int(encoder_meta["image_size"]),
             "patch_size": int(encoder_meta["patch_size"]),
             "max_seq_len": int(encoder_meta["max_seq_len"]),
+            "cmd_dim": int(encoder_meta["cmd_dim"]),
+            "command_representation": str(encoder_meta["command_representation"]),
+            "command_latency": int(encoder_meta["command_latency"]),
             "use_proprio": bool(encoder_meta["use_proprio"]),
         }
         if (
@@ -452,6 +466,9 @@ def extract_latents(args, device) -> str:
             "image_size": int(encoder_meta["image_size"]),
             "patch_size": int(encoder_meta["patch_size"]),
             "max_seq_len": int(encoder_meta["max_seq_len"]),
+            "cmd_dim": int(encoder_meta["cmd_dim"]),
+            "command_representation": str(encoder_meta["command_representation"]),
+            "command_latency": int(encoder_meta["command_latency"]),
             "use_proprio": bool(encoder_meta["use_proprio"]),
         },
         "temporal_cfg": {
@@ -1077,6 +1094,8 @@ def train(args):
         f"image_size={encoder_meta['image_size']} "
         f"patch_size={encoder_meta['patch_size']} "
         f"seq_len={encoder_meta['max_seq_len']} "
+        f"cmd_dim={encoder_meta['cmd_dim']} "
+        f"cmd_repr={encoder_meta['command_representation']} "
         f"use_proprio={encoder_meta['use_proprio']}"
     )
     action_block_size = (
@@ -1151,6 +1170,9 @@ def train(args):
         "window_stride": window_stride,
         "image_size": int(encoder_meta["image_size"]),
         "patch_size": int(encoder_meta["patch_size"]),
+        "cmd_dim": int(encoder_meta["cmd_dim"]),
+        "command_representation": str(encoder_meta["command_representation"]),
+        "command_latency": int(encoder_meta["command_latency"]),
         "use_proprio": bool(encoder_meta["use_proprio"]),
         "max_seq_len": int(encoder_meta["max_seq_len"]),
     }

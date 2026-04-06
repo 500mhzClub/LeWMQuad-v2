@@ -58,9 +58,10 @@ Why it changed:
 - `window_stride=5` uses far more valid macro-trajectories than `window_stride=20`,
   so the model sees many more distinct starts instead of repeating the same sparse
   subset.
-- `--use_proprio` is now the recommended setting for navigation. Proprio is
-  runtime-valid on the robot and helps short-horizon progress, stuck detection,
-  and dead-reckoning.
+- `--use_proprio` is only recommended for mixed-state navigation experiments.
+  Do not use it for pure-perception exploration: the latent will encode body
+  state as well as vision, so turning or circling can appear "novel" even when
+  the scene has barely changed.
 
 One implementation detail matters in practice: overlap training (`window_stride=5`)
 increases HDF5 pressure significantly, so the current stable settings are:
@@ -121,11 +122,14 @@ This can be done with the data already on disk.
    drop-in improvement.
    This keeps the predictor interface unchanged (`cmd_dim=3`) while making the
    macro-action summary match what PPO actually consumed.
+   The repo now exposes this as `--command_representation mean_active`.
 3. If that is still not enough, move from a summarized macro-action to an
    explicit 5-step action block.
    The cleanest version is to flatten the block to `5 x 3 = 15` dimensions or
    add a small action-block encoder, then feed that representation into the
    predictor instead of a single averaged command.
+   The repo now exposes the flattened-block path as
+   `--command_representation active_block`.
 4. Retrain the base world model and planning heads with the improved action
    representation.
    This does **not** require new raw rollouts or new rendered vision. Existing
@@ -230,6 +234,7 @@ python scripts/3_train_lewm.py \
   --num_workers 4 \
   --prefetch_factor 2 \
   --sigreg_lambda 0.09 \
+  --command_representation mean_active \
   --use_proprio \
   --out_dir lewm_checkpoints_keyframe_exec_stride5_active_mean \
   --log_dir lewm_logs_keyframe_exec_stride5_active_mean
@@ -293,6 +298,7 @@ python scripts/3_train_lewm.py \
   --num_workers 4 \
   --prefetch_factor 2 \
   --sigreg_lambda 0.09 \
+  --command_representation active_block \
   --use_proprio \
   --out_dir lewm_checkpoints_keyframe_exec_stride5_block15 \
   --log_dir lewm_logs_keyframe_exec_stride5_block15

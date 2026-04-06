@@ -30,6 +30,12 @@ class StreamingJEPADataset(IterableDataset):
         temporal_stride: spacing in raw timesteps between returned observations.
         action_block_size: raw timesteps aggregated into each returned command.
             Defaults to ``temporal_stride`` so each model step spans one stride.
+        command_representation: how each action block is represented.
+            ``mean_scaled`` returns the legacy mean over logged commands.
+            ``mean_active`` returns the mean over reconstructed executed commands.
+            ``active_block`` returns the full reconstructed executed block, flattened.
+        command_latency: deterministic delay used to reconstruct executed commands
+            from the stored nominal command stream.
         window_stride: spacing in raw timesteps between sequence starts.
             Defaults to ``seq_len * temporal_stride`` for non-overlapping windows.
         batch_size: worker-side micro-batch size.
@@ -56,6 +62,8 @@ class StreamingJEPADataset(IterableDataset):
         seq_len: int = 4,
         temporal_stride: int = 1,
         action_block_size: int | None = None,
+        command_representation: str = "mean_scaled",
+        command_latency: int = 2,
         window_stride: int | None = None,
         batch_size: int = 256,
         require_no_done: bool = True,
@@ -73,6 +81,18 @@ class StreamingJEPADataset(IterableDataset):
             1,
             int(action_block_size if action_block_size is not None else self.temporal_stride),
         )
+        self.command_representation = str(command_representation)
+        if self.command_representation not in {"mean_scaled", "mean_active", "active_block"}:
+            raise ValueError(
+                "command_representation must be one of "
+                "{'mean_scaled', 'mean_active', 'active_block'}"
+            )
+        self.command_latency = max(0, int(command_latency))
+        self.cmd_dim = (
+            3 * self.action_block_size
+            if self.command_representation == "active_block"
+            else 3
+        )
         default_window_stride = self.seq_len * self.temporal_stride
         self.window_stride = max(
             1,
@@ -89,6 +109,34 @@ class StreamingJEPADataset(IterableDataset):
         # Pre-build index table: list of (file_path, env_idx, t0)
         # Scans dones/collisions at init (small arrays, ~10 MB total).
         self._all_indices: List[Tuple[str, int, int]] = self._precompute_indices()
+
+    def _reconstruct_active_commands(
+        self,
+        cmd_source: np.ndarray,
+        prefix_start: int,
+        t0: int,
+        raw_end: int,
+    ) -> np.ndarray:
+        """Reconstruct executed commands from the stored nominal stream.
+
+        The physics rollout applies a deterministic zero-initialized latency
+        buffer and stores the nominal commands. This helper recovers the
+        latency-buffered commands that the PPO policy actually consumed.
+        """
+        active = np.zeros((raw_end - t0, 3), dtype=np.float32)
+        if self.command_latency <= 0:
+            active[:] = cmd_source[(t0 - prefix_start):(raw_end - prefix_start)]
+            return active
+
+        src_idx = (
+            np.arange(t0, raw_end, dtype=np.int64)
+            - self.command_latency
+            - prefix_start
+        )
+        valid = src_idx >= 0
+        if np.any(valid):
+            active[valid] = cmd_source[src_idx[valid]]
+        return active
 
     @staticmethod
     def _discover_files(data_dir: str) -> List[str]:
@@ -198,7 +246,7 @@ class StreamingJEPADataset(IterableDataset):
 
                 vis = np.empty((B, self.seq_len, *self.vision_shape), dtype=np.uint8)
                 prop = np.empty((B, self.seq_len, self.proprio_dim), dtype=np.float32)
-                cmds = np.empty((B, self.seq_len, 3), dtype=np.float32)
+                cmds = np.empty((B, self.seq_len, self.cmd_dim), dtype=np.float32)
                 dones = np.zeros((B, self.seq_len), dtype=np.bool_)
                 collisions = np.zeros((B, self.seq_len), dtype=np.bool_)
 
@@ -223,13 +271,25 @@ class StreamingJEPADataset(IterableDataset):
                     collisions_chunk = (
                         h5f["collisions"][e, t0:raw_end] if "collisions" in h5f else None
                     )
+                    active_cmds_chunk = None
+                    if self.command_representation != "mean_scaled":
+                        prefix_start = max(0, t0 - self.command_latency)
+                        cmd_source = h5f["cmds"][e, prefix_start:raw_end]
+                        active_cmds_chunk = self._reconstruct_active_commands(
+                            cmd_source, prefix_start, t0, raw_end,
+                        )
 
                     vis[i] = vis_chunk[obs_offsets]
                     prop[i] = prop_chunk[obs_offsets]
 
                     for step_idx, offset in enumerate(obs_offsets.tolist()):
                         block = slice(offset, offset + self.action_block_size)
-                        cmds[i, step_idx] = cmds_chunk[block].mean(axis=0)
+                        if self.command_representation == "mean_scaled":
+                            cmds[i, step_idx] = cmds_chunk[block].mean(axis=0)
+                        elif self.command_representation == "mean_active":
+                            cmds[i, step_idx] = active_cmds_chunk[block].mean(axis=0)
+                        else:
+                            cmds[i, step_idx] = active_cmds_chunk[block].reshape(-1)
                         if dones_chunk is not None:
                             dones[i, step_idx] = np.any(dones_chunk[block])
                         if collisions_chunk is not None:

@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
                    help="Raw-step spacing between model observations.")
     p.add_argument("--action_block_size", type=int, default=None,
                    help="Raw-step action-block size per model step. Defaults to --temporal_stride.")
+    p.add_argument("--command_representation", type=str, default="mean_scaled",
+                   choices=["mean_scaled", "mean_active", "active_block"],
+                   help="How each action block is represented for the predictor.")
+    p.add_argument("--command_latency", type=int, default=2,
+                   help="Deterministic command delay used to reconstruct executed commands.")
     p.add_argument("--window_stride", type=int, default=None,
                    help="Raw-step spacing between sequence starts. Defaults to seq_len * temporal_stride.")
     p.add_argument("--lr", type=float, default=5e-5)
@@ -105,18 +110,19 @@ def save_checkpoint(
     global_step: int,
     *,
     epoch_completed: bool = False,
+    metadata: dict | None = None,
 ) -> None:
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-            "epoch_completed": epoch_completed,
-        },
-        path,
-    )
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "epoch_completed": epoch_completed,
+    }
+    if metadata:
+        payload.update(metadata)
+    torch.save(payload, path)
     latest = os.path.join(os.path.dirname(path), "latest.pt")
     if os.path.islink(latest):
         os.remove(latest)
@@ -166,6 +172,11 @@ def train(args: argparse.Namespace) -> None:
         f"seq_len={args.seq_len}, stride={args.temporal_stride}, "
         f"action_block={action_block_size}, window_stride={window_stride}"
     )
+    cmd_dim = 3 * action_block_size if args.command_representation == "active_block" else 3
+    print(
+        "Command representation: "
+        f"{args.command_representation} (latency={int(args.command_latency)}, cmd_dim={cmd_dim})"
+    )
 
     # ---- Dataset / DataLoader ----------------------------------------
     num_workers = max(1, int(args.num_workers))
@@ -174,6 +185,8 @@ def train(args: argparse.Namespace) -> None:
         seq_len=args.seq_len,
         temporal_stride=args.temporal_stride,
         action_block_size=args.action_block_size,
+        command_representation=args.command_representation,
+        command_latency=args.command_latency,
         window_stride=args.window_stride,
         batch_size=args.batch_size,
         require_no_done=False,
@@ -213,7 +226,7 @@ def train(args: argparse.Namespace) -> None:
     # ---- Model -------------------------------------------------------
     model = LeWorldModel(
         latent_dim=args.latent_dim,
-        cmd_dim=3,
+        cmd_dim=cmd_dim,
         pred_layers=args.pred_layers,
         pred_heads=args.pred_heads,
         pred_dim_head=args.pred_dim_head,
@@ -227,6 +240,18 @@ def train(args: argparse.Namespace) -> None:
         patch_size=patch_size,
         use_proprio=args.use_proprio,
     ).to(device)
+    checkpoint_meta = {
+        "cmd_dim": int(cmd_dim),
+        "command_representation": args.command_representation,
+        "command_latency": int(args.command_latency),
+        "temporal_stride": int(args.temporal_stride),
+        "action_block_size": int(action_block_size),
+        "window_stride": int(window_stride),
+        "image_size": int(image_size),
+        "patch_size": int(patch_size),
+        "use_proprio": bool(args.use_proprio),
+        "max_seq_len": int(args.seq_len),
+    }
 
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -390,6 +415,7 @@ def train(args: argparse.Namespace) -> None:
                         epoch,
                         global_step,
                         epoch_completed=False,
+                        metadata=checkpoint_meta,
                     )
                     progress_write(f"  Checkpoint saved: {ckpt_path}", pbar)
                     import glob as _glob
@@ -417,6 +443,7 @@ def train(args: argparse.Namespace) -> None:
             epoch,
             global_step,
             epoch_completed=True,
+            metadata=checkpoint_meta,
         )
         print(f"  Epoch checkpoint saved: {epoch_ckpt_path}")
 
