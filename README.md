@@ -97,9 +97,47 @@ What this means for the current project:
 - If the stride-5 overlap model still fails in a way that suggests action-model
   mismatch, the next fix is **not** to abandon the architecture. The next fix is
   to improve command-block fidelity.
-- Doing that properly would require recollecting rollout data with the executed
-  `active_cmds` logged each step, so the dataset can aggregate the true command
-  block instead of the nominal one.
+
+Important correction:
+
+- New rollout collection is **not required** just to recover the executed command
+  stream.
+- The physics rollout applies a deterministic 2-step latency buffer to the saved
+  `scaled_cmds`, so `active_cmds` can be reconstructed offline from the existing
+  trajectories.
+- The real current limitation is the predictor interface: one model step still
+  expects a single `3D` command vector, so the 5-step action block must be
+  summarized somehow unless the model is extended.
+
+### Recommended upgrade path for action-block fidelity
+
+This can be done with the data already on disk.
+
+1. Reconstruct executed `active_cmds` offline from the saved `scaled_cmds`.
+   The latency buffer is deterministic and zero-initialized, so each
+   environment's executed command sequence can be replayed exactly from the
+   saved command stream.
+2. Replace `mean(scaled_cmd_block)` with `mean(active_cmd_block)` as the first
+   drop-in improvement.
+   This keeps the predictor interface unchanged (`cmd_dim=3`) while making the
+   macro-action summary match what PPO actually consumed.
+3. If that is still not enough, move from a summarized macro-action to an
+   explicit 5-step action block.
+   The cleanest version is to flatten the block to `5 x 3 = 15` dimensions or
+   add a small action-block encoder, then feed that representation into the
+   predictor instead of a single averaged command.
+4. Retrain the base world model and planning heads with the improved action
+   representation.
+   This does **not** require new raw rollouts or new rendered vision. Existing
+   rollout/HDF5 data is sufficient.
+
+Practical recommendation:
+
+- First complete the current stride-5 overlap run and evaluate it.
+- If inference still looks limited by action abstraction, implement step 2
+  first.
+- Only then escalate to step 3, which is a real model-interface change rather
+  than a dataset fix.
 
 ## Recommended Pipeline
 
