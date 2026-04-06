@@ -178,6 +178,7 @@ class PureCEMPlanner:
         z_start_raw: torch.Tensor,
         z_goal_proj: torch.Tensor | None = None,
         goal_active: bool = False,
+        unsafe_now: bool = False,
         recent_latents: torch.Tensor | None = None,
         heads: PlannerHeads | None = None,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
@@ -249,6 +250,7 @@ class PureCEMPlanner:
 
             if (
                 not goal_active
+                and not unsafe_now
                 and heads is not None
                 and heads.exploration is not None
                 and heads.exploration_weight > 0.0
@@ -266,15 +268,17 @@ class PureCEMPlanner:
                     8.0 * (self.forward_bonus_safety_threshold - safety_mean.detach()),
                 )
                 forward_bonus = samples[:, :, 0].clamp_min(0.0).sum(dim=-1) * safe_gate
-                if goal_active:
+                if goal_active or unsafe_now:
                     # Keep goal-seek free to use turns or cautious stops near the
-                    # beacon. The forward prior is only for corridor exploration.
+                    # beacon. Also disable the forward prior entirely once the
+                    # current observation already looks unsafe.
                     forward_bonus = torch.zeros_like(forward_bonus)
                 costs -= self.forward_bonus_weight * forward_bonus
                 metrics["forward_bonus"] = forward_bonus
 
             if (
                 not goal_active
+                and not unsafe_now
                 and recent_latents is not None
                 and recent_latents.shape[0] > 0
                 and self.revisit_penalty_weight > 0.0
@@ -369,6 +373,10 @@ def parse_args() -> argparse.Namespace:
                    help="Explore-mode bonus for safe positive forward velocity commands.")
     p.add_argument("--forward_bonus_safety_threshold", type=float, default=0.12,
                    help="Per-step predicted safety-energy threshold below which the forward bonus becomes active.")
+    p.add_argument("--current_safety_brake_threshold", type=float, default=0.20,
+                   help="Current observed safety energy above which exploration bonuses are disabled and replanning becomes reactive.")
+    p.add_argument("--unsafe_macro_action_repeat", type=int, default=1,
+                   help="Temporary macro-action repeat used while the current observation looks unsafe.")
     p.add_argument("--frontier_knn", type=int, default=8,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--goal_progress_weight", type=float, default=8.0,
@@ -820,6 +828,17 @@ def select_score_latent(
     if score_space == "proj":
         return z_proj
     return z_raw
+
+
+@torch.no_grad()
+def estimate_current_safety_energy(
+    z_proj: torch.Tensor,
+    heads: PlannerHeads,
+) -> float | None:
+    if heads.safety_head is None:
+        return None
+    value = heads.safety_head(z_proj.to(next(heads.safety_head.parameters()).device))
+    return float(value.reshape(-1)[0].item())
 
 
 def choose_redundant_prototype(
@@ -1756,6 +1775,7 @@ def main():
     first_collision_step: int | None = None
     success_hold_count = 0
     goal_activation_count = 0
+    unsafe_steps = 0
     goal_activation_step: int | None = None
     oracle_goal_reached = False
     min_goal_dist_m = float("inf")
@@ -1853,6 +1873,13 @@ def main():
         for step in range(args.steps):
             goal_sim_now = None
             goal_seek_active = False
+            current_safety_energy = estimate_current_safety_energy(obs["z_proj"], planner_heads)
+            unsafe_now = (
+                current_safety_energy is not None
+                and current_safety_energy >= args.current_safety_brake_threshold
+            )
+            if unsafe_now:
+                unsafe_steps += 1
             if z_breadcrumb_proj_ref is not None:
                 goal_sim_now = cosine_similarity_scalar(
                     obs["z_proj"].squeeze(0),
@@ -1875,7 +1902,12 @@ def main():
             mode = "goal_seek" if goal_seek_active else "explore"
             mode_log.append(mode)
 
-            need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
+            if unsafe_now:
+                planner.reset()
+                plan_seq = None
+                plan_step_idx = 0
+
+            need_replan = unsafe_now or (plan_seq is None or plan_step_idx >= args.mpc_execute)
             if need_replan:
                 recent_latents_t = None
                 if recent_proj_latents:
@@ -1884,6 +1916,7 @@ def main():
                     obs["z_raw"],
                     z_goal_proj=z_breadcrumb_proj_ref,
                     goal_active=goal_seek_active,
+                    unsafe_now=unsafe_now,
                     recent_latents=recent_latents_t,
                     heads=planner_heads,
                 )
@@ -1899,7 +1932,10 @@ def main():
                 physics_scene, physics_robot, policy,
                 physics_act_dofs, q0, prev_action,
                 nominal_cmd.to(gs.device), sim_cfg, gs, torch,
-                macro_action_repeat=args.macro_action_repeat,
+                macro_action_repeat=(
+                    args.unsafe_macro_action_repeat if unsafe_now
+                    else args.macro_action_repeat
+                ),
             )
             prev_action = actions.detach().clone()
 
