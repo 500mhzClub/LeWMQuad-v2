@@ -139,6 +139,174 @@ Practical recommendation:
 - Only then escalate to step 3, which is a real model-interface change rather
   than a dataset fix.
 
+### Deferred patch plan: full action-block fidelity
+
+This is the concrete follow-up if the current `mean(command_block)` run still
+looks action-abstraction-limited. It is intentionally deferred until the
+current overlap model has been evaluated.
+
+Goal:
+
+- keep the current stride-5 temporal abstraction
+- stop collapsing each 5-step block to a single averaged command
+- feed the predictor a representation of the full executed action block instead
+
+Why this is the next patch:
+
+- the paper's planning stack uses `action_block=5` and optimizes full action
+  blocks rather than a single averaged command
+- our current setup already matches the paper in temporal spacing
+- the main remaining mismatch is command-block representation
+
+Implementation plan:
+
+1. Reconstruct `active_cmds` offline from the saved `scaled_cmds`.
+   Do this inside the dataset/label extraction path so the exact executed
+   command stream is available without recollecting rollouts.
+   Files to change:
+   - `lewm/data/streaming_dataset.py`
+   - optionally `scripts/2_visual_renderer.py` if you want to cache the
+     reconstructed blocks into HDF5
+
+2. Add a drop-in improved baseline: `mean(active_cmd_block)`.
+   Keep the predictor interface unchanged and simply replace
+   `mean(scaled_cmd_block)` with `mean(active_cmd_block)`.
+   This is the lowest-risk correction and should be tried before changing model
+   dimensions.
+   Files to change:
+   - `lewm/data/streaming_dataset.py`
+   - `scripts/4_train_energy_head.py` if any head datasets assume the old block
+     summary
+
+3. Add explicit full-block inputs to the predictor.
+   Replace one `3D` macro-action per model step with either:
+   - a flattened `15D` block (`5 x 3`), or
+   - a small action-block encoder that maps `(5, 3) -> D_action`
+   The action-block encoder is cleaner if you expect to change block size
+   later; the flattened `15D` version is simpler to patch first.
+   Files to change:
+   - `lewm/models/predictor.py`
+   - `lewm/models/lewm.py`
+   - `scripts/3_train_lewm.py`
+   - `scripts/4_train_energy_head.py`
+   - `scripts/6_infer_pure_wm.py`
+
+4. Update inference to plan over full action blocks.
+   The planner should sample one action block per model step and execute it as
+   five low-level commands, rather than sampling one command and repeating it.
+   This is the inference-side match to step 3.
+   Files to change:
+   - `scripts/6_infer_pure_wm.py`
+
+5. Retrain the stack in order.
+   Required order:
+   - retrain base LeWM
+   - retrain planning heads
+   - rerun inference
+
+Suggested rollout of the patch:
+
+- Phase A: implement only `mean(active_cmd_block)` and rerun training
+- Phase B: if still needed, implement explicit `5 x 3` block inputs
+- Phase C: only after that consider recollecting data, and only if you want to
+  cache executed actions directly rather than reconstruct them
+
+Concrete run sequence for Phase A:
+
+1. Patch the dataset to reconstruct `active_cmds` and replace
+   `mean(scaled_cmd_block)` with `mean(active_cmd_block)`.
+2. Retrain LeWM into fresh dirs:
+
+```bash
+python scripts/3_train_lewm.py \
+  --data_dir jepa_final_v3 \
+  --device cuda \
+  --epochs 30 \
+  --batch_size 128 \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --sigreg_lambda 0.09 \
+  --use_proprio \
+  --out_dir lewm_checkpoints_keyframe_exec_stride5_active_mean \
+  --log_dir lewm_logs_keyframe_exec_stride5_active_mean
+```
+
+3. Retrain heads into fresh dirs:
+
+```bash
+python scripts/4_train_energy_head.py \
+  --data_dir jepa_final_v3_los \
+  --checkpoint lewm_checkpoints_keyframe_exec_stride5_active_mean/epoch_30.pt \
+  --device cuda \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --out_dir energy_head_checkpoints_keyframe_exec_stride5_active_mean \
+  --log_dir energy_head_logs_keyframe_exec_stride5_active_mean \
+  --safety_mode consequence \
+  --epochs 10 \
+  --goal_epochs 10 \
+  --progress_epochs 5 \
+  --exploration_epochs 5 \
+  --goal_weight 1.0 \
+  --progress_weight 1.0 \
+  --exploration_weight 0.1
+```
+
+4. Evaluate:
+
+```bash
+python scripts/6_infer_pure_wm.py \
+  --ppo_ckpt models/ppo/ckpt_20000.pt \
+  --wm_ckpt lewm_checkpoints_keyframe_exec_stride5_active_mean/epoch_30.pt \
+  --scorer_ckpt energy_head_checkpoints_keyframe_exec_stride5_active_mean/trajectory_scorer.pt \
+  --target_beacon red \
+  --seed 42 \
+  --steps 800 \
+  --macro_action_repeat 5 \
+  --score_space mixed \
+  --out_dir inference_runs/keyframe_exec_stride5_active_mean_s42
+```
+
+Concrete run sequence for Phase B:
+
+1. Patch the predictor to accept a full `5 x 3` action block per model step.
+2. Retrain LeWM in fresh dirs, for example:
+
+```bash
+python scripts/3_train_lewm.py \
+  --data_dir jepa_final_v3 \
+  --device cuda \
+  --epochs 30 \
+  --batch_size 128 \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --sigreg_lambda 0.09 \
+  --use_proprio \
+  --out_dir lewm_checkpoints_keyframe_exec_stride5_block15 \
+  --log_dir lewm_logs_keyframe_exec_stride5_block15
+```
+
+3. Retrain heads and rerun inference in matching fresh dirs.
+
+Decision rule:
+
+- If the current averaged-block model solves the maze reliably enough, keep it.
+- If it fails in a way that looks like wrong within-block action semantics,
+  apply Phase A first.
+- Only move to Phase B if Phase A still leaves a clear action-fidelity gap.
+
 ## Recommended Pipeline
 
 ### 1. Optional: collect fresh physics trajectories
