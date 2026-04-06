@@ -96,22 +96,63 @@ def _angle_diff(a: float, b: float) -> float:
     return (d + math.pi) % (2 * math.pi) - math.pi
 
 
+def _has_line_of_sight(
+    a_xy: np.ndarray,
+    b_xy: np.ndarray,
+    layout: ObstacleLayout,
+    step_size: float = 0.03,
+    margin: float = 0.01,
+) -> bool:
+    """Approximate 2-D line of sight against obstacle AABBs.
+
+    The segment is sampled densely enough for the short indoor mazes used by the
+    project. Obstacles are expanded by ``margin`` to avoid labeling grazing rays
+    as visible.
+    """
+    diff = b_xy - a_xy
+    dist = float(np.linalg.norm(diff))
+    if dist < 1e-6:
+        return True
+
+    n_steps = max(1, int(math.ceil(dist / step_size)))
+    ts = np.linspace(0.0, 1.0, num=n_steps + 1, dtype=np.float32)[1:]
+    pts = a_xy[None, :] + ts[:, None] * diff[None, :]
+
+    for obs in layout.obstacles:
+        cx, cy = float(obs.pos[0]), float(obs.pos[1])
+        hx = 0.5 * float(obs.size[0]) + margin
+        hy = 0.5 * float(obs.size[1]) + margin
+        inside_x = np.abs(pts[:, 0] - cx) <= hx
+        inside_y = np.abs(pts[:, 1] - cy) <= hy
+        if np.any(inside_x & inside_y):
+            return False
+    return True
+
+
 def compute_beacon_labels(
     robot_xy: np.ndarray,
     robot_yaw: np.ndarray,
     beacon_layout: BeaconLayout,
+    obstacle_layout: ObstacleLayout | None = None,
     fov_deg: float = 58.0,
     max_range: float = 5.0,
+    los_step_size: float = 0.03,
+    los_margin: float = 0.01,
 ) -> dict:
     """Compute per-timestep beacon observation labels.
 
-    For each timestep, finds the closest *visible* beacon (within FOV and
-    range) and records its identity, bearing, and range.
+    For each timestep, finds the closest *visible* beacon and records its
+    identity, bearing, and range. Visibility requires:
+    - within horizontal FOV
+    - within range
+    - robot is in front of the beacon face
+    - obstacle-aware line of sight when ``obstacle_layout`` is provided
 
     Args:
         robot_xy: (N, 2) robot XY positions.
         robot_yaw: (N,) robot heading in radians.
         beacon_layout: layout containing beacon placements.
+        obstacle_layout: obstacle layout used for occlusion checks.
         fov_deg: camera horizontal field of view in degrees.
         max_range: maximum beacon detection range (metres).
 
@@ -135,6 +176,8 @@ def compute_beacon_labels(
     for beacon in beacon_layout.beacons:
         bx, by = beacon.pos[0], beacon.pos[1]
         bid = identity_names.index(beacon.identity) if beacon.identity in identity_names else -1
+        normal_xy = np.asarray(beacon.normal[:2], dtype=np.float32)
+        beacon_xy = np.asarray([bx, by], dtype=np.float32)
 
         dx = bx - robot_xy[:, 0]
         dy = by - robot_xy[:, 1]
@@ -149,7 +192,26 @@ def compute_beacon_labels(
         # Visibility: within FOV and within range
         in_fov = np.abs(rel_bearing) < half_fov
         in_range = dist < max_range
-        is_visible = in_fov & in_range
+        frontness = np.einsum(
+            "nd,d->n",
+            robot_xy.astype(np.float32) - beacon_xy[None, :],
+            normal_xy,
+        )
+        in_front = frontness > 0.0
+        is_visible = in_fov & in_range & in_front
+
+        if obstacle_layout is not None and np.any(is_visible):
+            los_visible = np.zeros(N, dtype=bool)
+            visible_idx = np.flatnonzero(is_visible)
+            for idx in visible_idx.tolist():
+                los_visible[idx] = _has_line_of_sight(
+                    robot_xy[idx].astype(np.float32),
+                    beacon_xy,
+                    obstacle_layout,
+                    step_size=los_step_size,
+                    margin=los_margin,
+                )
+            is_visible &= los_visible
 
         # Update closest visible beacon
         closer = is_visible & (dist < brange)
@@ -254,7 +316,11 @@ def compute_episode_labels(
     # Beacon labels
     if beacon_layout is not None and len(beacon_layout.beacons) > 0:
         beacon_labels = compute_beacon_labels(
-            robot_xy, robot_yaw, beacon_layout, fov_deg=fov_deg,
+            robot_xy,
+            robot_yaw,
+            beacon_layout,
+            obstacle_layout=obstacle_layout,
+            fov_deg=fov_deg,
         )
         labels.update(beacon_labels)
     else:

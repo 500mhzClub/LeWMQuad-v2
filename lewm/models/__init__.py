@@ -4,6 +4,7 @@ from .lewm import LeWorldModel
 from .sigreg import sigreg, sigreg_stepwise
 from .energy_head import (
     GoalEnergyHead,
+    ProgressEnergyHead,
     LatentEnergyHead,
     ExplorationBonus,
     TrajectoryScorer,

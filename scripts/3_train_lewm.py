@@ -49,15 +49,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--seq_len", type=int, default=4)
+    p.add_argument("--temporal_stride", type=int, default=1,
+                   help="Raw-step spacing between model observations.")
+    p.add_argument("--action_block_size", type=int, default=None,
+                   help="Raw-step action-block size per model step. Defaults to --temporal_stride.")
+    p.add_argument("--command_representation", type=str, default="mean_scaled",
+                   choices=["mean_scaled", "mean_active", "active_block"],
+                   help="How each action block is represented for the predictor.")
+    p.add_argument("--command_latency", type=int, default=2,
+                   help="Deterministic command delay used to reconstruct executed commands.")
+    p.add_argument("--window_stride", type=int, default=None,
+                   help="Raw-step spacing between sequence starts. Defaults to seq_len * temporal_stride.")
     p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--num_workers", type=int, default=12,
+                   help="DataLoader worker count for streamed HDF5 batches.")
+    p.add_argument("--prefetch_factor", type=int, default=4,
+                   help="Number of batches prefetched per worker.")
     p.add_argument("--warmup_steps", type=int, default=1000,
                     help="Number of linear LR warmup steps before cosine decay.")
     p.add_argument("--weight_decay", type=float, default=1e-3)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--resume_from", type=str, default=None)
-    p.add_argument("--out_dir", type=str, default="lewm_checkpoints")
-    p.add_argument("--log_dir", type=str, default="lewm_logs")
+    p.add_argument("--out_dir", type=str, default="lewm_checkpoints_keyframe_exec")
+    p.add_argument("--log_dir", type=str, default="lewm_logs_keyframe_exec")
     # LeWM-specific hypers
     p.add_argument("--sigreg_lambda", type=float, default=0.09,
                     help="Weight λ for SIGReg regularisation (only tunable hyper).")
@@ -93,17 +108,21 @@ def save_checkpoint(
     scheduler,
     epoch: int,
     global_step: int,
+    *,
+    epoch_completed: bool = False,
+    metadata: dict | None = None,
 ) -> None:
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-        },
-        path,
-    )
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "epoch_completed": epoch_completed,
+    }
+    if metadata:
+        payload.update(metadata)
+    torch.save(payload, path)
     latest = os.path.join(os.path.dirname(path), "latest.pt")
     if os.path.islink(latest):
         os.remove(latest)
@@ -140,12 +159,35 @@ def progress_write(message: str, pbar=None) -> None:
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Initialising LeWorldModel training on {device}")
+    action_block_size = (
+        args.action_block_size if args.action_block_size is not None else args.temporal_stride
+    )
+    window_stride = (
+        args.window_stride
+        if args.window_stride is not None
+        else args.seq_len * args.temporal_stride
+    )
+    print(
+        "Temporal abstraction: "
+        f"seq_len={args.seq_len}, stride={args.temporal_stride}, "
+        f"action_block={action_block_size}, window_stride={window_stride}"
+    )
+    cmd_dim = 3 * action_block_size if args.command_representation == "active_block" else 3
+    print(
+        "Command representation: "
+        f"{args.command_representation} (latency={int(args.command_latency)}, cmd_dim={cmd_dim})"
+    )
 
     # ---- Dataset / DataLoader ----------------------------------------
-    num_workers = 12
+    num_workers = max(1, int(args.num_workers))
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
+        temporal_stride=args.temporal_stride,
+        action_block_size=args.action_block_size,
+        command_representation=args.command_representation,
+        command_latency=args.command_latency,
+        window_stride=args.window_stride,
         batch_size=args.batch_size,
         require_no_done=False,
         require_no_collision=False,
@@ -177,14 +219,14 @@ def train(args: argparse.Namespace) -> None:
         batch_size=None,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=max(1, int(args.prefetch_factor)),
         persistent_workers=True,
     )
 
     # ---- Model -------------------------------------------------------
     model = LeWorldModel(
         latent_dim=args.latent_dim,
-        cmd_dim=3,
+        cmd_dim=cmd_dim,
         pred_layers=args.pred_layers,
         pred_heads=args.pred_heads,
         pred_dim_head=args.pred_dim_head,
@@ -198,6 +240,18 @@ def train(args: argparse.Namespace) -> None:
         patch_size=patch_size,
         use_proprio=args.use_proprio,
     ).to(device)
+    checkpoint_meta = {
+        "cmd_dim": int(cmd_dim),
+        "command_representation": args.command_representation,
+        "command_latency": int(args.command_latency),
+        "temporal_stride": int(args.temporal_stride),
+        "action_block_size": int(action_block_size),
+        "window_stride": int(window_stride),
+        "image_size": int(image_size),
+        "patch_size": int(patch_size),
+        "use_proprio": bool(args.use_proprio),
+        "max_seq_len": int(args.seq_len),
+    }
 
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -213,6 +267,13 @@ def train(args: argparse.Namespace) -> None:
         model.load_state_dict(cleaned_sd)
         start_epoch = ckpt.get("epoch", 0)
         global_step = ckpt.get("global_step", 0)
+        epoch_completed = ckpt.get("epoch_completed")
+        if epoch_completed is True:
+            start_epoch += 1
+        elif epoch_completed is None:
+            base = os.path.basename(args.resume_from)
+            if base.startswith("epoch_"):
+                start_epoch += 1
 
     model = torch.compile(model)
 
@@ -346,7 +407,16 @@ def train(args: argparse.Namespace) -> None:
                 # ---- Intra-epoch checkpoint ------------------------------
                 if global_step % args.save_every == 0:
                     ckpt_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
-                    save_checkpoint(ckpt_path, model, optimizer, scheduler, epoch, global_step)
+                    save_checkpoint(
+                        ckpt_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        global_step,
+                        epoch_completed=False,
+                        metadata=checkpoint_meta,
+                    )
                     progress_write(f"  Checkpoint saved: {ckpt_path}", pbar)
                     import glob as _glob
                     step_ckpts = sorted(_glob.glob(os.path.join(args.out_dir, "step_*.pt")))
@@ -365,7 +435,16 @@ def train(args: argparse.Namespace) -> None:
         )
 
         epoch_ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch + 1}.pt")
-        save_checkpoint(epoch_ckpt_path, model, optimizer, scheduler, epoch, global_step)
+        save_checkpoint(
+            epoch_ckpt_path,
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            global_step,
+            epoch_completed=True,
+            metadata=checkpoint_meta,
+        )
         print(f"  Epoch checkpoint saved: {epoch_ckpt_path}")
 
     print("Training complete.")

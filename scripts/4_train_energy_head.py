@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Train the full planning stack on frozen LeWM encoder latents.
+"""Train planning heads on frozen LeWM encoder latents.
 
-Three heads are trained on the same cached latent bank:
+The canonical runtime stack is:
+  - unconditional safety energy
+  - identity-conditioned goal energy
+  - optional RND exploration bonus for pure-perception search
+
+An additional progress head can still be trained as an auxiliary probe, but it
+is not required by the default inference script.
+
+The learned components are trained on the same cached latent bank:
 
   Phase 1 — Extract:  run frozen encoder once, cache (z_proj, labels) to disk.
   Phase 2 — Safety:   LatentEnergyHead on composite safety+mobility target.
   Phase 3 — Goal:     GoalEnergyHead on identity-conditioned beacon pairs.
-  Phase 4 — Explore:  ExplorationBonus (RND) on the full latent set.
+  Phase 4 — Progress: optional ProgressEnergyHead auxiliary probe.
+  Phase 5 — Explore:  ExplorationBonus (RND) on the full latent set.
 
-All three are combined at planning time by TrajectoryScorer:
+The default inference-time scorer is:
 
     cost = safety + α·goal − β·exploration
 
@@ -42,6 +51,7 @@ from lewm.models import (
     LeWorldModel,
     LatentEnergyHead,
     GoalEnergyHead,
+    ProgressEnergyHead,
     ExplorationBonus,
     TrajectoryScorer,
     composite_safety_target,
@@ -65,14 +75,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=256,
                    help="Batch size for latent extraction.")
     p.add_argument("--seq_len", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=12,
+                   help="DataLoader worker count for streamed HDF5 batches.")
+    p.add_argument("--prefetch_factor", type=int, default=2,
+                   help="Number of batches prefetched per worker.")
+    p.add_argument("--temporal_stride", type=int, default=1,
+                   help="Raw-step spacing between model observations.")
+    p.add_argument("--action_block_size", type=int, default=None,
+                   help="Raw-step action-block size per model step. Defaults to --temporal_stride.")
+    p.add_argument("--window_stride", type=int, default=None,
+                   help="Raw-step spacing between extraction sequence starts. Defaults to seq_len * temporal_stride.")
     p.add_argument("--image_size", type=int, default=None)
     p.add_argument("--patch_size", type=int, default=None)
     p.add_argument("--use_proprio", action="store_true")
     # Shared
-    p.add_argument("--out_dir", type=str, default="energy_head_checkpoints")
-    p.add_argument("--log_dir", type=str, default="energy_head_logs")
+    p.add_argument("--out_dir", type=str, default="energy_head_checkpoints_keyframe_exec")
+    p.add_argument("--log_dir", type=str, default="energy_head_logs_keyframe_exec")
     p.add_argument("--cache_dir", type=str, default=None,
-                   help="Directory for cached latents. Defaults to <out_dir>/latent_cache_v2.")
+                   help="Directory for cached latents. Defaults to a stride/block-specific cache under <out_dir>.")
     p.add_argument("--extract_only", action="store_true",
                    help="Only extract latents, skip training.")
     # Model dims (must match encoder checkpoint)
@@ -104,6 +124,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--goal_lr", type=float, default=3e-4)
     p.add_argument("--goal_batch_size", type=int, default=4096)
     p.add_argument("--beacon_clip", type=float, default=5.0)
+    # Progress head
+    p.add_argument("--skip_progress", action="store_true",
+                   help="Skip ProgressEnergyHead training.")
+    p.add_argument("--progress_epochs", type=int, default=5)
+    p.add_argument("--progress_lr", type=float, default=3e-4)
+    p.add_argument("--progress_batch_size", type=int, default=256,
+                   help="Sequence micro-batch size for progress training.")
+    p.add_argument("--progress_seq_len", type=int, default=4,
+                   help="Sequence length for progress-head training.")
+    p.add_argument("--progress_visible_bonus", type=float, default=0.35,
+                   help="Target progress bonus when the target beacon becomes newly visible.")
     # Exploration bonus
     p.add_argument("--skip_exploration", action="store_true",
                    help="Skip ExplorationBonus (RND) training.")
@@ -112,6 +143,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exploration_feature_dim", type=int, default=128)
     # TrajectoryScorer weights
     p.add_argument("--goal_weight", type=float, default=1.0)
+    p.add_argument("--progress_weight", type=float, default=1.0)
     p.add_argument("--exploration_weight", type=float, default=0.1)
     p.add_argument("--no_progress", action="store_true",
                    help="Disable animated tqdm progress bars and emit plain logs only.")
@@ -122,21 +154,95 @@ def parse_args() -> argparse.Namespace:
 # Encoder loading
 # --------------------------------------------------------------------- #
 
-def load_frozen_encoder(args, device):
-    """Load the LeWM encoder from a checkpoint and freeze it."""
+def cli_flag_provided(flag: str) -> bool:
+    for token in sys.argv[1:]:
+        if token == flag or token.startswith(f"{flag}="):
+            return True
+    return False
+
+
+def infer_encoder_meta_from_checkpoint(args, device):
+    """Infer the frozen encoder configuration directly from the LeWM checkpoint."""
     ckpt = torch.load(args.checkpoint, map_location=device)
     sd = clean_state_dict(ckpt["model_state_dict"])
 
-    image_size = args.image_size or 224
-    patch_size = args.patch_size or (14 if image_size == 224 else 4)
+    pos_embed = sd["encoder.vis_enc.pos_embed"]
+    patch_w = sd["encoder.vis_enc.patch_embed.weight"]
+    pred_pos = sd["predictor.pos_embed"]
+    cmd_w = sd["predictor.action_embed.patch_embed.weight"]
+    latent_dim = int(pos_embed.shape[-1])
+    patch_size = int(patch_w.shape[-1])
+    n_tokens = int(pos_embed.shape[1] - 1)
+    grid = int(round(math.sqrt(n_tokens)))
+    image_size = grid * patch_size
+    max_seq_len = int(pred_pos.shape[1])
+    cmd_dim = int(cmd_w.shape[1])
+    use_proprio = any(k.startswith("encoder.prop_enc.") for k in sd)
+    command_representation = ckpt.get(
+        "command_representation",
+        "mean_scaled" if cmd_dim == 3 else "active_block",
+    )
+    command_latency = int(ckpt.get("command_latency", 2))
+
+    inferred = {
+        "latent_dim": latent_dim,
+        "image_size": image_size,
+        "patch_size": patch_size,
+        "max_seq_len": max_seq_len,
+        "cmd_dim": cmd_dim,
+        "command_representation": command_representation,
+        "command_latency": command_latency,
+        "use_proprio": use_proprio,
+    }
+    return sd, inferred
+
+
+def resolve_encoder_config(args, device):
+    """Resolve encoder config from checkpoint and fail on explicit mismatches."""
+    sd, inferred = infer_encoder_meta_from_checkpoint(args, device)
+
+    if cli_flag_provided("--image_size") and args.image_size is not None and args.image_size != inferred["image_size"]:
+        raise ValueError(
+            f"--image_size={args.image_size} does not match checkpoint image_size={inferred['image_size']}"
+        )
+    if cli_flag_provided("--patch_size") and args.patch_size is not None and args.patch_size != inferred["patch_size"]:
+        raise ValueError(
+            f"--patch_size={args.patch_size} does not match checkpoint patch_size={inferred['patch_size']}"
+        )
+    if cli_flag_provided("--latent_dim") and args.latent_dim != inferred["latent_dim"]:
+        raise ValueError(
+            f"--latent_dim={args.latent_dim} does not match checkpoint latent_dim={inferred['latent_dim']}"
+        )
+    if cli_flag_provided("--use_proprio") and bool(args.use_proprio) != bool(inferred["use_proprio"]):
+        raise ValueError(
+            f"--use_proprio={args.use_proprio} does not match checkpoint use_proprio={inferred['use_proprio']}"
+        )
+    if cli_flag_provided("--seq_len") and int(args.seq_len) != int(inferred["max_seq_len"]):
+        raise ValueError(
+            f"--seq_len={args.seq_len} does not match checkpoint max_seq_len={inferred['max_seq_len']}"
+        )
+
+    args.image_size = inferred["image_size"]
+    args.patch_size = inferred["patch_size"]
+    args.latent_dim = inferred["latent_dim"]
+    args.use_proprio = inferred["use_proprio"]
+    args.encoder_max_seq_len = inferred["max_seq_len"]
+    return sd, inferred
+
+
+def load_frozen_encoder(args, device):
+    """Load the LeWM encoder from a checkpoint and freeze it."""
+    sd, inferred = resolve_encoder_config(args, device)
 
     model = LeWorldModel(
-        latent_dim=args.latent_dim,
-        image_size=image_size,
-        patch_size=patch_size,
-        use_proprio=args.use_proprio,
+        latent_dim=inferred["latent_dim"],
+        cmd_dim=inferred["cmd_dim"],
+        image_size=inferred["image_size"],
+        patch_size=inferred["patch_size"],
+        max_seq_len=inferred["max_seq_len"],
+        use_proprio=inferred["use_proprio"],
     )
-    model.load_state_dict(sd, strict=False)
+    model.load_state_dict(sd, strict=True)
     model = model.to(device)
     model.eval()
     for p in model.parameters():
@@ -150,7 +256,7 @@ def load_frozen_encoder(args, device):
 # --------------------------------------------------------------------- #
 
 SHARD_SAMPLES = 1_000_000  # ~750 MB per shard at dim=192
-CACHE_VERSION = 3          # v3: adds collisions to shards for consequence target
+CACHE_VERSION = 5          # v5: temporal abstraction + encoder metadata validation
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -179,26 +285,62 @@ def progress_write(message: str, pbar=None) -> None:
 def extract_latents(args, device) -> str:
     """Encode the full dataset once and cache (z_proj, safety_target,
     beacon_identity, beacon_range) shards to disk."""
-    cache_dir = args.cache_dir or os.path.join(args.out_dir, "latent_cache_v2")
+    _, encoder_meta = resolve_encoder_config(args, device)
+    action_block_size = (
+        args.action_block_size if args.action_block_size is not None else args.temporal_stride
+    )
+    window_stride = (
+        args.window_stride
+        if args.window_stride is not None
+        else args.seq_len * args.temporal_stride
+    )
+    cache_name = (
+        f"latent_cache_seq{args.seq_len}_stride{args.temporal_stride}"
+        f"_block{action_block_size}_window{window_stride}"
+    )
+    cache_dir = args.cache_dir or os.path.join(args.out_dir, cache_name)
     manifest_path = os.path.join(cache_dir, "manifest.pt")
 
     if os.path.exists(manifest_path):
         info = torch.load(manifest_path, map_location="cpu")
-        if info.get("version", 1) >= CACHE_VERSION:
+        expected_cfg = {
+            "seq_len": int(args.seq_len),
+            "temporal_stride": int(args.temporal_stride),
+            "action_block_size": int(action_block_size),
+            "window_stride": int(window_stride),
+        }
+        expected_encoder_cfg = {
+            "latent_dim": int(encoder_meta["latent_dim"]),
+            "image_size": int(encoder_meta["image_size"]),
+            "patch_size": int(encoder_meta["patch_size"]),
+            "max_seq_len": int(encoder_meta["max_seq_len"]),
+            "cmd_dim": int(encoder_meta["cmd_dim"]),
+            "command_representation": str(encoder_meta["command_representation"]),
+            "command_latency": int(encoder_meta["command_latency"]),
+            "use_proprio": bool(encoder_meta["use_proprio"]),
+        }
+        if (
+            info.get("version", 1) >= CACHE_VERSION
+            and info.get("temporal_cfg") == expected_cfg
+            and info.get("encoder_cfg") == expected_encoder_cfg
+        ):
             print(f"Latent cache found: {info['n_samples']:,} samples in "
                   f"{info['n_shards']} shards (v{info.get('version', 1)})")
             return cache_dir
-        print("Cache version mismatch — re-extracting.")
+        print("Cache version/config mismatch — re-extracting.")
 
     os.makedirs(cache_dir, exist_ok=True)
 
     encoder = load_frozen_encoder(args, device)
     print(f"Loaded frozen encoder from {args.checkpoint}")
 
-    num_workers = 12
+    num_workers = max(1, int(args.num_workers))
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
+        temporal_stride=args.temporal_stride,
+        action_block_size=args.action_block_size,
+        window_stride=args.window_stride,
         batch_size=args.batch_size,
         require_no_done=False,
         require_no_collision=False,
@@ -206,14 +348,14 @@ def extract_latents(args, device) -> str:
         load_labels=True,
     )
     channels, height, width = dataset.vision_shape
-    if args.image_size is None:
-        args.image_size = height
-    if args.patch_size is None:
-        args.patch_size = 14 if height == 224 else 4
+    if int(height) != int(args.image_size):
+        raise ValueError(
+            f"Dataset image_size={height} does not match checkpoint image_size={args.image_size}"
+        )
 
     dataloader = DataLoader(
         dataset, batch_size=None, num_workers=num_workers,
-        pin_memory=True, prefetch_factor=2,
+        pin_memory=True, prefetch_factor=max(1, int(args.prefetch_factor)),
     )
 
     z_buf: list[torch.Tensor] = []
@@ -319,6 +461,22 @@ def extract_latents(args, device) -> str:
         "n_shards": shard_idx,
         "latent_dim": args.latent_dim,
         "version": CACHE_VERSION,
+        "encoder_cfg": {
+            "latent_dim": int(encoder_meta["latent_dim"]),
+            "image_size": int(encoder_meta["image_size"]),
+            "patch_size": int(encoder_meta["patch_size"]),
+            "max_seq_len": int(encoder_meta["max_seq_len"]),
+            "cmd_dim": int(encoder_meta["cmd_dim"]),
+            "command_representation": str(encoder_meta["command_representation"]),
+            "command_latency": int(encoder_meta["command_latency"]),
+            "use_proprio": bool(encoder_meta["use_proprio"]),
+        },
+        "temporal_cfg": {
+            "seq_len": int(args.seq_len),
+            "temporal_stride": int(args.temporal_stride),
+            "action_block_size": int(action_block_size),
+            "window_stride": int(window_stride),
+        },
     }, manifest_path)
     print(f"Extraction complete: {total_samples:,} samples, "
           f"{shard_idx} shards, {elapsed:.0f}s")
@@ -348,6 +506,95 @@ def load_cached_latents(cache_dir: str):
     n_contact = (st > 0.9).sum().item()
     print(f"  High-energy samples (>0.9): {n_contact:,} ({100*n_contact/len(st):.1f}%)")
     return z, st, bid, br
+
+
+def build_goal_latent_pools(
+    z_all: torch.Tensor,
+    beacon_identity: torch.Tensor,
+    beacon_range: torch.Tensor,
+    beacon_clip: float,
+) -> dict[int, torch.Tensor]:
+    """Collect close-range goal examples for each beacon identity."""
+    pools: dict[int, list[int]] = {}
+    close_thresh = max(0.75, 0.35 * float(beacon_clip))
+    for idx in range(len(z_all)):
+        bid = int(beacon_identity[idx].item())
+        br = float(beacon_range[idx].item())
+        if bid < 0 or br >= close_thresh:
+            continue
+        pools.setdefault(bid, []).append(idx)
+
+    if not pools:
+        for idx in range(len(z_all)):
+            bid = int(beacon_identity[idx].item())
+            br = float(beacon_range[idx].item())
+            if bid < 0 or br >= float(beacon_clip) * 2.0:
+                continue
+            pools.setdefault(bid, []).append(idx)
+
+    goal_pools = {
+        bid: z_all[torch.tensor(indices, dtype=torch.long)]
+        for bid, indices in pools.items()
+        if indices
+    }
+    return goal_pools
+
+
+def sample_progress_batch(
+    z_now: torch.Tensor,
+    z_future: torch.Tensor,
+    bid_now: torch.Tensor,
+    br_now: torch.Tensor,
+    bid_future: torch.Tensor,
+    br_future: torch.Tensor,
+    goal_pools: dict[int, torch.Tensor],
+    beacon_clip: float,
+    visible_bonus: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Construct goal latents and scalar progress targets for one minibatch."""
+    valid_ids = list(goal_pools.keys())
+    if not valid_ids:
+        raise ValueError("No goal pools available for progress training.")
+
+    n_pairs = z_now.shape[0]
+    device = z_now.device
+    dtype = z_now.dtype
+    z_goal = torch.empty_like(z_now)
+    targets = torch.zeros(n_pairs, device=device, dtype=dtype)
+
+    for idx in range(n_pairs):
+        cur_bid = int(bid_now[idx].item())
+        nxt_bid = int(bid_future[idx].item())
+        cur_visible = cur_bid >= 0 and float(br_now[idx].item()) < beacon_clip * 2.0
+        nxt_visible = nxt_bid >= 0 and float(br_future[idx].item()) < beacon_clip * 2.0
+
+        positive_ids: list[int] = []
+        if cur_visible:
+            positive_ids.append(cur_bid)
+        if nxt_visible and nxt_bid not in positive_ids:
+            positive_ids.append(nxt_bid)
+
+        choose_positive = positive_ids and torch.rand((), device=device).item() < 0.6
+        if choose_positive:
+            goal_id = positive_ids[int(torch.randint(len(positive_ids), (1,), device=device).item())]
+        else:
+            goal_id = valid_ids[int(torch.randint(len(valid_ids), (1,), device=device).item())]
+
+        pool = goal_pools[goal_id]
+        pool_idx = int(torch.randint(len(pool), (1,), device=device).item())
+        z_goal[idx] = pool[pool_idx].to(device=device, dtype=dtype)
+
+        progress = 0.0
+        cur_match = cur_visible and cur_bid == goal_id
+        nxt_match = nxt_visible and nxt_bid == goal_id
+        if cur_match and nxt_match:
+            delta = (float(br_now[idx].item()) - float(br_future[idx].item())) / max(1e-6, beacon_clip)
+            progress = max(0.0, min(1.0, delta))
+        elif (not cur_match) and nxt_match:
+            progress = float(visible_bonus)
+        targets[idx] = progress
+
+    return z_goal, targets
 
 
 # --------------------------------------------------------------------- #
@@ -606,12 +853,157 @@ def train_goal_head(args, z_all, beacon_identity, beacon_range, device):
 
 
 # --------------------------------------------------------------------- #
-# Phase 4: Train ExplorationBonus (RND)
+# Phase 4: Train ProgressEnergyHead
+# --------------------------------------------------------------------- #
+
+def train_progress_head(args, goal_pools, device):
+    print("\n" + "=" * 60)
+    print("Phase 4: Training ProgressEnergyHead (short-horizon goal progress)")
+    print("=" * 60)
+
+    if not goal_pools:
+        print("  Skipping: no goal pools with visible beacons were found.")
+        return None
+
+    encoder = load_frozen_encoder(args, device)
+    dataset = StreamingJEPADataset(
+        data_dir=args.data_dir,
+        seq_len=max(2, args.progress_seq_len),
+        temporal_stride=args.temporal_stride,
+        action_block_size=args.action_block_size,
+        window_stride=args.window_stride,
+        batch_size=args.progress_batch_size,
+        require_no_done=False,
+        require_no_collision=False,
+        num_workers=max(1, int(args.num_workers)),
+        load_labels=True,
+    )
+    dataloader = DataLoader(
+        dataset, batch_size=None, num_workers=max(1, int(args.num_workers)),
+        pin_memory=True, prefetch_factor=max(1, int(args.prefetch_factor)),
+    )
+
+    head = ProgressEnergyHead(
+        latent_dim=args.latent_dim,
+        dropout=args.dropout,
+    ).to(device)
+    head = torch.compile(head)
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(
+        head.parameters(), lr=args.progress_lr, weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.progress_epochs)
+
+    csv_path = os.path.join(args.log_dir, "progress_head_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow(["step", "epoch", "loss", "mean_bonus", "mean_target", "lr"])
+
+    global_step = 0
+    for epoch in range(args.progress_epochs):
+        head.train()
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+
+        with make_progress(args, dataloader, desc=f"  Progress {epoch + 1}/{args.progress_epochs}") as pbar:
+            for batch in pbar:
+                vision, proprio, _cmds, _dones, _collisions, labels = batch
+                if "beacon_identity" not in labels or "beacon_range" not in labels:
+                    continue
+
+                vision = vision.to(device, non_blocking=True).float().div_(255.0)
+                proprio = proprio.to(device, non_blocking=True)
+                beacon_identity = labels["beacon_identity"].to(device, non_blocking=True).long()
+                beacon_range = labels["beacon_range"].to(device, non_blocking=True).float()
+
+                with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
+                    _, z_proj = encoder.encode_seq(vision, proprio)
+                z_proj = z_proj.float()
+
+                z_now = z_proj[:, :-1, :].reshape(-1, z_proj.shape[-1])
+                z_future = z_proj[:, 1:, :].reshape(-1, z_proj.shape[-1])
+                bid_now = beacon_identity[:, :-1].reshape(-1)
+                bid_future = beacon_identity[:, 1:].reshape(-1)
+                br_now = beacon_range[:, :-1].reshape(-1)
+                br_future = beacon_range[:, 1:].reshape(-1)
+
+                try:
+                    z_goal, target = sample_progress_batch(
+                        z_now,
+                        z_future,
+                        bid_now,
+                        br_now,
+                        bid_future,
+                        br_future,
+                        goal_pools,
+                        beacon_clip=args.beacon_clip,
+                        visible_bonus=args.progress_visible_bonus,
+                    )
+                except ValueError:
+                    continue
+
+                optimizer.zero_grad(set_to_none=True)
+                pred = head(z_now, z_future, z_goal)
+                loss = nn.functional.mse_loss(pred, target)
+                loss.backward()
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    head.parameters(), max_norm=args.grad_clip,
+                ).item()
+                if not torch.isfinite(loss) or not math.isfinite(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                optimizer.step()
+                global_step += 1
+                loss_val = loss.item()
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step, epoch + 1, f"{loss_val:.6f}",
+                        f"{pred.detach().mean().item():.4f}",
+                        f"{target.detach().mean().item():.4f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        bonus=f"{pred.detach().mean().item():.3f}",
+                        target=f"{target.detach().mean().item():.3f}",
+                    )
+
+                if global_step % args.save_every == 0:
+                    ckpt_path = os.path.join(args.out_dir, f"progress_step_{global_step}.pt")
+                    torch.save({"head_state_dict": head.state_dict(), "step": global_step}, ckpt_path)
+                    progress_write(f"    Saved: {ckpt_path}", pbar)
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.4f} | time={time.time() - t0:.0f}s")
+
+        torch.save(
+            {"head_state_dict": head.state_dict(), "step": global_step, "epoch": epoch},
+            os.path.join(args.out_dir, f"progress_epoch_{epoch + 1}.pt"),
+        )
+
+    print("  Progress head training complete.")
+    del encoder
+    torch.cuda.empty_cache()
+    return head
+
+
+# --------------------------------------------------------------------- #
+# Phase 5: Train ExplorationBonus (RND)
 # --------------------------------------------------------------------- #
 
 def train_exploration(args, z_all, device):
     print("\n" + "=" * 60)
-    print("Phase 4: Training ExplorationBonus (RND)")
+    print("Phase 5: Training ExplorationBonus (RND)")
     print("=" * 60)
 
     dataset = TensorDataset(z_all)
@@ -692,15 +1084,42 @@ def train(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
+    _, encoder_meta = resolve_encoder_config(args, device)
 
     print(f"Training planning heads on {device}")
     print(f"Safety mode: {args.safety_mode}")
+    print(
+        "Frozen encoder checkpoint: "
+        f"latent_dim={encoder_meta['latent_dim']} "
+        f"image_size={encoder_meta['image_size']} "
+        f"patch_size={encoder_meta['patch_size']} "
+        f"seq_len={encoder_meta['max_seq_len']} "
+        f"cmd_dim={encoder_meta['cmd_dim']} "
+        f"cmd_repr={encoder_meta['command_representation']} "
+        f"use_proprio={encoder_meta['use_proprio']}"
+    )
+    action_block_size = (
+        args.action_block_size if args.action_block_size is not None else args.temporal_stride
+    )
+    window_stride = (
+        args.window_stride
+        if args.window_stride is not None
+        else args.seq_len * args.temporal_stride
+    )
+    print(
+        "Temporal abstraction: "
+        f"seq_len={args.seq_len}, stride={args.temporal_stride}, "
+        f"action_block={action_block_size}, window_stride={window_stride}"
+    )
     if args.safety_mode == "consequence":
         print(f"  w_contact={args.w_contact}, w_mobility={args.w_mobility}, "
               f"contact_clearance={args.contact_clearance}m")
     else:
         print(f"  w_safety={args.w_safety}, w_mobility={args.w_mobility}")
-    print(f"Goal weight: {args.goal_weight}, Exploration weight: {args.exploration_weight}")
+    print(
+        f"Goal weight: {args.goal_weight}, Progress weight: {args.progress_weight}, "
+        f"Exploration weight: {args.exploration_weight}"
+    )
 
     # Phase 1: extract (or reuse cache)
     cache_dir = extract_latents(args, device)
@@ -719,7 +1138,13 @@ def train(args):
     if not args.skip_goal:
         goal_head = train_goal_head(args, z_all, beacon_id, beacon_range, device)
 
-    # Phase 4: exploration bonus
+    # Phase 4: progress head
+    progress_head = None
+    if not args.skip_progress:
+        goal_pools = build_goal_latent_pools(z_all, beacon_id, beacon_range, args.beacon_clip)
+        progress_head = train_progress_head(args, goal_pools, device)
+
+    # Phase 5: exploration bonus
     exploration = None
     if not args.skip_exploration:
         exploration = train_exploration(args, z_all, device)
@@ -729,14 +1154,27 @@ def train(args):
     scorer_data = {
         "safety_head": safety_head.state_dict(),
         "goal_head": goal_head.state_dict() if goal_head is not None else None,
+        "progress_head": progress_head.state_dict() if progress_head is not None else None,
         "exploration": exploration.state_dict() if exploration is not None else None,
         "goal_weight": args.goal_weight,
+        "progress_weight": args.progress_weight,
         "exploration_weight": args.exploration_weight,
         "latent_dim": args.latent_dim,
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
         "exploration_feature_dim": args.exploration_feature_dim,
         "safety_mode": args.safety_mode,
+        "seq_len": args.seq_len,
+        "temporal_stride": args.temporal_stride,
+        "action_block_size": action_block_size,
+        "window_stride": window_stride,
+        "image_size": int(encoder_meta["image_size"]),
+        "patch_size": int(encoder_meta["patch_size"]),
+        "cmd_dim": int(encoder_meta["cmd_dim"]),
+        "command_representation": str(encoder_meta["command_representation"]),
+        "command_latency": int(encoder_meta["command_latency"]),
+        "use_proprio": bool(encoder_meta["use_proprio"]),
+        "max_seq_len": int(encoder_meta["max_seq_len"]),
     }
     torch.save(scorer_data, scorer_path)
     print(f"\nTrajectoryScorer checkpoint saved: {scorer_path}")

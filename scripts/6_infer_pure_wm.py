@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Pure world-model maze inference — score-space ablation + prototype novelty.
+"""Pure-perception maze inference with a minimal learned planner.
 
-Implements the planning approach from Section 3.2 of the LeWM paper, utilizing
-the world model directly without hand-cranked safety heuristics. The planner can
-score trajectories in three spaces:
-  - ``mixed``: current baseline, raw observation/goal history vs projected rollout
-  - ``raw``: raw observation/goal history vs raw rollout
-  - ``proj``: projected observation/goal history vs projected rollout
-Exploration is driven by per-step novelty against a diversity-preserving latent
-prototype bank, balanced by an L2 Action Penalty.
+The active control policy is intentionally narrow:
+  - Explore with learned safety + learned novelty.
+  - Treat beacon similarity as an evaluation signal only, not a planner cost.
+  - Keep simulator geometry for offline metrics only; never use it to steer.
+
+This file still contains some legacy helpers from earlier routing experiments,
+but the main loop no longer uses prototype banks, keyframe graphs, dead-reckoned
+route following, learned progress shaping, or goal-directed mode switching.
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -52,7 +52,13 @@ from lewm.checkpoint_utils import clean_state_dict, load_ppo_checkpoint
 from lewm.genesis_utils import init_genesis_once, to_numpy
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import generate_enclosed_maze
-from lewm.models import ActorCritic, LeWorldModel
+from lewm.models import (
+    ActorCritic,
+    ExplorationBonus,
+    GoalEnergyHead,
+    LatentEnergyHead,
+    LeWorldModel,
+)
 from lewm.obstacle_utils import add_obstacles_to_scene, detect_collisions
 
 torch.backends.cudnn.benchmark = True
@@ -101,10 +107,32 @@ class PrototypeBankUpdate:
     prototype_idx: int | None = None
 
 
-# ---- Pure CEM planner (Aligned Latents + Action Smoothness) -------------- #
+@dataclass
+class KeyframeNode:
+    idx: int
+    score_latent: torch.Tensor
+    proj_latent: torch.Tensor
+    step: int
+    last_seen_step: int
+    visit_count: int
+    odom_xy: tuple[float, float]
+    yaw_rad: float
+
+
+@dataclass
+class PlannerHeads:
+    safety_head: LatentEnergyHead | None = None
+    goal_head: GoalEnergyHead | None = None
+    exploration: ExplorationBonus | None = None
+    goal_weight: float = 0.0
+    exploration_weight: float = 0.0
+    safety_weight: float = 1.0
+
+
+# ---- Pure CEM planner ---------------------------------------------------- #
 
 class PureCEMPlanner:
-    """CEM planner with configurable rollout / scoring representation."""
+    """CEM planner over learned safety and novelty."""
 
     def __init__(
         self,
@@ -118,8 +146,6 @@ class PureCEMPlanner:
         init_std: torch.Tensor,
         min_std: torch.Tensor,
         device: torch.device,
-        score_space: str = "mixed",
-        novelty_weight: float = 10.0,
         action_penalty_weight: float = 0.001,
     ):
         self.world_model = world_model
@@ -131,9 +157,19 @@ class PureCEMPlanner:
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
         self.min_std = min_std.to(device=device, dtype=torch.float32)
+        if self.cmd_low.ndim != 1:
+            raise ValueError(f"cmd_low must be 1D, got shape {tuple(self.cmd_low.shape)}")
+        self.cmd_dim = int(self.cmd_low.numel())
+        for name, tensor in (
+            ("cmd_high", self.cmd_high),
+            ("init_std", self.init_std),
+            ("min_std", self.min_std),
+        ):
+            if tensor.shape != self.cmd_low.shape:
+                raise ValueError(
+                    f"{name} shape {tuple(tensor.shape)} does not match cmd_low {tuple(self.cmd_low.shape)}"
+                )
         self.device = device
-        self.score_space = score_space
-        self.novelty_weight = novelty_weight
         self.action_penalty_weight = action_penalty_weight
         self._warm_start: torch.Tensor | None = None
 
@@ -144,19 +180,12 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
-        z_goal_score: torch.Tensor | None = None,
-        visited_bank: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, float]:
+        heads: PlannerHeads | None = None,
+    ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
+        if z0.ndim != 2 or z0.shape[0] != 1:
+            raise ValueError(f"Expected z_start_raw shape (1, D), got {tuple(z0.shape)}")
         z0_batch = z0.expand(self.n_candidates, -1)
-        
-        z_goal_batch = None
-        if z_goal_score is not None:
-            if z_goal_score.ndim == 1:
-                z_goal_score = z_goal_score.unsqueeze(0)
-            z_goal_batch = z_goal_score.to(self.device, dtype=torch.float32).expand(
-                self.n_candidates, -1,
-            )
 
         if self._warm_start is not None:
             mean = self._warm_start.clone()
@@ -167,54 +196,55 @@ class PureCEMPlanner:
 
         best_seq = mean.clone()
         best_cost = float("inf")
+        best_metrics: dict[str, float] = {}
 
         for _ in range(self.cem_iters):
             noise = torch.randn(
-                self.n_candidates, self.horizon, 3, device=self.device,
+                self.n_candidates, self.horizon, self.cmd_dim, device=self.device,
             )
             samples = mean.unsqueeze(0) + std.unsqueeze(0) * noise
             samples = samples.clamp(
-                self.cmd_low.view(1, 1, 3),
-                self.cmd_high.view(1, 1, 3),
+                self.cmd_low.view(1, 1, -1),
+                self.cmd_high.view(1, 1, -1),
             )
             samples[0] = mean
 
-            if self.score_space == "raw":
-                z_rollouts = self.world_model.plan_rollout_raw(z0_batch, samples)
-            else:
-                z_rollouts = self.world_model.plan_rollout(z0_batch, samples)
+            z_rollouts_proj = self.world_model.plan_rollout(z0_batch, samples)
             costs = torch.zeros(self.n_candidates, device=self.device)
+            metrics: dict[str, torch.Tensor] = {}
 
-            # 1. Terminal goal cost in the configured score space.
-            if z_goal_batch is not None:
-                z_terminal = z_rollouts[:, -1, :]
-                cos_sim = F.cosine_similarity(z_terminal, z_goal_batch, dim=-1)
-                costs += (1.0 - cos_sim)
+            if heads is not None and heads.safety_head is not None:
+                safety_cost = heads.safety_weight * heads.safety_head.score_trajectory(z_rollouts_proj)
+                costs += safety_cost
+                metrics["safety_cost"] = safety_cost
+            else:
+                safety_cost = torch.zeros(self.n_candidates, device=self.device)
 
-            # 2. Per-step novelty against a persistent visited-state bank.
-            if visited_bank is not None and self.novelty_weight > 0.0:
-                M = visited_bank.shape[0]
-                if M > 0:
-                    z_norm = F.normalize(z_rollouts, p=2, dim=-1)
-                    bank_norm = F.normalize(
-                        visited_bank.to(self.device, dtype=torch.float32),
-                        p=2, dim=-1,
-                    )
-                    sim_matrix = torch.einsum("bhd,md->bhm", z_norm, bank_norm)
-                    max_sim = sim_matrix.max(dim=-1).values
-                    step_novelty = 1.0 - max_sim
-                    traj_novelty = step_novelty.mean(dim=-1)
-                    costs -= self.novelty_weight * traj_novelty
+            if (
+                heads is not None
+                and heads.exploration is not None
+                and heads.exploration_weight > 0.0
+            ):
+                n_cand, horizon, latent_dim = z_rollouts_proj.shape
+                bonus = heads.exploration(
+                    z_rollouts_proj.reshape(n_cand * horizon, latent_dim),
+                ).reshape(n_cand, horizon).sum(dim=-1)
+                costs -= heads.exploration_weight * bonus
+                metrics["exploration_bonus"] = bonus
 
-            # 3. Action Smoothness Penalty (L2)
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
+                metrics["action_penalty"] = act_penalty
 
             min_cost, min_idx = costs.min(dim=0)
             if min_cost.item() < best_cost:
                 best_cost = min_cost.item()
                 best_seq = samples[min_idx.item()].detach().clone()
+                best_metrics = {
+                    name: float(values[min_idx.item()].item())
+                    for name, values in metrics.items()
+                }
 
             elite_idx = torch.topk(costs, k=self.n_elite, largest=False).indices
             elite = samples[elite_idx]
@@ -225,17 +255,19 @@ class PureCEMPlanner:
             [best_seq[1:], best_seq[-1:].clone()], dim=0,
         ).detach()
 
-        return best_seq, best_cost
+        return best_seq, best_cost, best_metrics
 
 
 # ---- Argument parsing ---------------------------------------------------- #
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pure world-model maze inference (Aligned z_raw latents).",
+        description="Pure-perception maze inference with learned safety and novelty.",
     )
     p.add_argument("--ppo_ckpt", type=str, required=True)
     p.add_argument("--wm_ckpt", type=str, required=True)
+    p.add_argument("--scorer_ckpt", type=str, default=None,
+                   help="Optional trajectory scorer checkpoint with safety / exploration heads. Goal head is ignored by the active planner.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grid_rows", type=int, default=4)
     p.add_argument("--grid_cols", type=int, default=4)
@@ -245,39 +277,102 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_distractors", type=int, default=0)
     p.add_argument("--target_beacon", type=str, default=None)
     
-    p.add_argument("--steps", type=int, default=480)
+    p.add_argument("--steps", type=int, default=480,
+                   help="Number of planner steps (each may repeat the low-level controller).")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--sim_backend", type=str, default="auto")
     p.add_argument("--show_viewer", action="store_true")
+    p.add_argument("--allow_mixed_latent_wm", action="store_true",
+                   help="Override the pure-perception guard and allow a world-model checkpoint that uses proprio.")
     
     p.add_argument("--plan_horizon", type=int, default=5)
     p.add_argument("--n_candidates", type=int, default=300)
     p.add_argument("--cem_iters", type=int, default=30)
     p.add_argument("--elite_frac", type=float, default=0.10)
     p.add_argument("--mpc_execute", type=int, default=1)
+    p.add_argument("--macro_action_repeat", type=int, default=1,
+                   help="Low-level control repeats per world-model planner step.")
     p.add_argument("--score_space", type=str, default="mixed",
-                   choices=["mixed", "raw", "proj"])
+                   choices=["mixed", "raw", "proj"],
+                   help="Deprecated legacy flag. Planner now always scores in projected latent space.")
     p.add_argument("--cmd_low", type=float, nargs=3, default=[-0.4, -0.3, -1.0])
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
     
-    p.add_argument("--novelty_weight", type=float, default=10.0)
+    p.add_argument("--novelty_weight", type=float, default=10.0,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--exploration_weight", type=float, default=None,
+                   help="Override learned RND exploration weight from the scorer checkpoint.")
+    p.add_argument("--rnd_online_lr", type=float, default=1e-3,
+                   help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
+    p.add_argument("--recent_latent_window", type=int, default=128,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--revisit_penalty_weight", type=float, default=0.35,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--forward_bonus_weight", type=float, default=0.30,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--forward_bonus_safety_threshold", type=float, default=0.12,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--current_safety_brake_threshold", type=float, default=0.20,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--unsafe_macro_action_repeat", type=int, default=1,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--frontier_knn", type=int, default=8,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--goal_progress_weight", type=float, default=8.0,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--route_progress_weight", type=float, default=7.0,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--recover_displacement_weight", type=float, default=2.5,
+                   help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--visited_bank_size", type=int, default=512,
                    help="Prototype-bank capacity for novelty memory.")
     p.add_argument("--prototype_sim_threshold", type=float, default=0.995,
                    help="Add a new prototype only when cosine similarity to the nearest stored prototype is below this threshold.")
+    p.add_argument("--keyframe_sim_threshold", type=float, default=0.985,
+                   help="Match the current observation to an existing keyframe node above this similarity.")
+    p.add_argument("--keyframe_match_radius_m", type=float, default=1.5,
+                   help="Maximum dead-reckoned distance allowed for keyframe reuse.")
+    p.add_argument("--keyframe_min_step_gap", type=int, default=8,
+                   help="Minimum temporal separation before matching the current node back onto an older keyframe.")
+    p.add_argument("--keyframe_add_interval", type=int, default=24,
+                   help="Add a fresh keyframe if this many steps pass without a new node.")
     p.add_argument("--stall_plateau_steps", type=int, default=200,
-                   help="Trigger a temporary frontier subgoal after this many steps without a novel prototype.")
+                   help="Trigger routing after this many steps without a novel prototype or route/goal progress.")
     p.add_argument("--subgoal_budget_steps", type=int, default=120,
-                   help="Maximum number of control steps to spend on a temporary frontier subgoal.")
+                   help="Maximum number of planner steps to spend following graph waypoints during a route episode.")
     p.add_argument("--subgoal_min_age_steps", type=int, default=120,
-                   help="A prototype must not have been visited for at least this many steps to qualify as a subgoal.")
+                   help="A keyframe must not have been visited for at least this many steps to qualify as a route target.")
     p.add_argument("--subgoal_frontier_window_steps", type=int, default=800,
-                   help="Only consider prototypes inserted within this many steps of the latest novel prototype when choosing a frontier subgoal.")
+                   help="Prefer keyframes inserted within this recent window when choosing a frontier route target.")
     p.add_argument("--subgoal_cooldown_steps", type=int, default=120,
-                   help="Minimum wait before another plateau-triggered subgoal can activate.")
+                   help="Minimum wait before another plateau-triggered route can activate.")
+    p.add_argument("--route_min_hops", type=int, default=3,
+                   help="Minimum keyframe-graph distance required for a route target.")
+    p.add_argument("--goal_direct_sim_threshold", type=float, default=0.72,
+                   help="Legacy goal-mode flag. Ignored by the active planner.")
+    p.add_argument("--goal_activation_hold_steps", type=int, default=3,
+                   help="Legacy goal-mode flag. Ignored by the active planner.")
+    p.add_argument("--goal_route_improve_margin", type=float, default=0.03,
+                   help="Require a route target to improve breadcrumb similarity by at least this margin before treating it as goal-directed.")
+    p.add_argument("--success_goal_sim_threshold", type=float, default=0.90,
+                   help="Perception-only success threshold on current breadcrumb similarity.")
+    p.add_argument("--success_hold_steps", type=int, default=6,
+                   help="Require this many consecutive high-similarity frames before declaring success.")
+    p.add_argument("--stuck_window_steps", type=int, default=12,
+                   help="Window for stuck detection using odometry and latent displacement.")
+    p.add_argument("--stuck_cmd_threshold", type=float, default=0.25,
+                   help="Minimum commanded magnitude for a step to count toward stuck detection.")
+    p.add_argument("--stuck_odom_threshold", type=float, default=0.015,
+                   help="Maximum mean dead-reckoned XY motion per step while still considered stuck.")
+    p.add_argument("--stuck_latent_threshold", type=float, default=0.010,
+                   help="Maximum mean latent displacement per step while still considered stuck.")
+    p.add_argument("--recover_budget_steps", type=int, default=28,
+                   help="Duration of recover mode after a stuck event.")
+    p.add_argument("--recover_cooldown_steps", type=int, default=24,
+                   help="Minimum wait before another recover episode can trigger.")
     p.add_argument("--history_len", type=int, default=None,
                    help="Deprecated alias for --visited_bank_size.")
     p.add_argument("--success_range", type=float, default=0.4)
@@ -299,6 +394,7 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.history_len is not None:
         args.visited_bank_size = args.history_len
+    args.auto_scaled_defaults = {}
     return args
 
 
@@ -315,16 +411,38 @@ def load_world_model(ckpt_path: str, device: torch.device):
     pos_embed = state["encoder.vis_enc.pos_embed"]
     patch_w = state["encoder.vis_enc.patch_embed.weight"]
     pred_pos = state["predictor.pos_embed"]
+    cmd_w = state["predictor.action_embed.patch_embed.weight"]
     latent_dim = int(pos_embed.shape[-1])
     patch_size = int(patch_w.shape[-1])
     n_tokens = int(pos_embed.shape[1] - 1)
     grid = int(round(math.sqrt(n_tokens)))
     image_size = grid * patch_size
     max_seq_len = int(pred_pos.shape[1])
+    cmd_dim = int(cmd_w.shape[1])
     use_proprio = any(k.startswith("encoder.prop_enc.") for k in state)
+    command_representation = ckpt.get(
+        "command_representation",
+        "mean_scaled" if cmd_dim == 3 else "active_block",
+    )
+    command_latency = int(ckpt.get("command_latency", 2))
+    if command_representation == "active_block":
+        if cmd_dim % 3 != 0:
+            raise ValueError(
+                f"Active-block checkpoint has cmd_dim={cmd_dim}, which is not divisible by 3."
+            )
+        command_block_size = int(ckpt.get("action_block_size", cmd_dim // 3))
+        inferred_block_size = cmd_dim // 3
+        if int(command_block_size) != int(inferred_block_size):
+            raise ValueError(
+                f"Checkpoint action_block_size={command_block_size} does not match "
+                f"inferred block size {inferred_block_size} from cmd_dim={cmd_dim}."
+            )
+    else:
+        command_block_size = int(ckpt.get("action_block_size", 1))
 
     model = LeWorldModel(
         latent_dim=latent_dim,
+        cmd_dim=cmd_dim,
         image_size=image_size,
         patch_size=patch_size,
         max_seq_len=max_seq_len,
@@ -335,7 +453,155 @@ def load_world_model(ckpt_path: str, device: torch.device):
     return model, {
         "latent_dim": latent_dim, "image_size": image_size,
         "patch_size": patch_size, "use_proprio": use_proprio,
+        "max_seq_len": max_seq_len,
+        "cmd_dim": cmd_dim,
+        "command_representation": command_representation,
+        "command_latency": command_latency,
+        "command_block_size": command_block_size,
     }
+
+
+def build_command_sampling_config(
+    args: argparse.Namespace,
+    wm_meta: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cmd_low = torch.tensor(args.cmd_low, dtype=torch.float32)
+    cmd_high = torch.tensor(args.cmd_high, dtype=torch.float32)
+    init_std = torch.tensor(args.cem_init_std, dtype=torch.float32)
+    min_std = torch.tensor(args.cem_min_std, dtype=torch.float32)
+    cmd_repr = wm_meta.get("command_representation", "mean_scaled")
+    cmd_dim = int(wm_meta.get("cmd_dim", 3))
+
+    if cmd_repr != "active_block":
+        if cmd_dim != 3:
+            raise ValueError(f"Expected cmd_dim=3 for {cmd_repr}, got {cmd_dim}.")
+        return cmd_low, cmd_high, init_std, min_std
+
+    block_size = int(wm_meta.get("command_block_size", 0))
+    if block_size <= 0:
+        raise ValueError(f"Invalid command_block_size={block_size} for active_block model.")
+    if cmd_dim != block_size * 3:
+        raise ValueError(
+            f"Active-block model has cmd_dim={cmd_dim}, expected {block_size * 3}."
+        )
+    return (
+        cmd_low.repeat(block_size),
+        cmd_high.repeat(block_size),
+        init_std.repeat(block_size),
+        min_std.repeat(block_size),
+    )
+
+
+def format_command_for_log(
+    cmd_values: list[float],
+    wm_meta: dict[str, Any],
+) -> str:
+    if wm_meta.get("command_representation") != "active_block":
+        return f"[{cmd_values[0]:+.2f}, {cmd_values[1]:+.2f}, {cmd_values[2]:+.2f}]"
+
+    block = np.asarray(cmd_values, dtype=np.float32).reshape(-1, 3)
+    mean_cmd = block.mean(axis=0)
+    first_cmd = block[0]
+    last_cmd = block[-1]
+    return (
+        f"mean=[{mean_cmd[0]:+.2f}, {mean_cmd[1]:+.2f}, {mean_cmd[2]:+.2f}] "
+        f"first=[{first_cmd[0]:+.2f}, {first_cmd[1]:+.2f}, {first_cmd[2]:+.2f}] "
+        f"last=[{last_cmd[0]:+.2f}, {last_cmd[1]:+.2f}, {last_cmd[2]:+.2f}]"
+    )
+
+
+def load_planner_heads(
+    ckpt_path: str | None,
+    device: torch.device,
+    wm_meta: dict[str, Any],
+    macro_action_repeat: int,
+) -> tuple[PlannerHeads, dict[str, Any]]:
+    heads = PlannerHeads()
+    meta: dict[str, Any] = {}
+    if ckpt_path is None:
+        return heads, meta
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"scorer checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    if "latent_dim" in ckpt and int(ckpt["latent_dim"]) != int(wm_meta["latent_dim"]):
+        raise ValueError(
+            f"Scorer latent_dim={ckpt['latent_dim']} does not match world-model latent_dim={wm_meta['latent_dim']}"
+        )
+    if "image_size" in ckpt and int(ckpt["image_size"]) != int(wm_meta["image_size"]):
+        raise ValueError(
+            f"Scorer image_size={ckpt['image_size']} does not match world-model image_size={wm_meta['image_size']}"
+        )
+    if "patch_size" in ckpt and int(ckpt["patch_size"]) != int(wm_meta["patch_size"]):
+        raise ValueError(
+            f"Scorer patch_size={ckpt['patch_size']} does not match world-model patch_size={wm_meta['patch_size']}"
+        )
+    if "use_proprio" in ckpt and bool(ckpt["use_proprio"]) != bool(wm_meta["use_proprio"]):
+        raise ValueError(
+            f"Scorer use_proprio={ckpt['use_proprio']} does not match world-model use_proprio={wm_meta['use_proprio']}"
+        )
+    if "max_seq_len" in ckpt and int(ckpt["max_seq_len"]) != int(wm_meta["max_seq_len"]):
+        raise ValueError(
+            f"Scorer max_seq_len={ckpt['max_seq_len']} does not match world-model max_seq_len={wm_meta['max_seq_len']}"
+        )
+    if "seq_len" in ckpt and int(ckpt["seq_len"]) != int(wm_meta["max_seq_len"]):
+        raise ValueError(
+            f"Scorer seq_len={ckpt['seq_len']} does not match world-model max_seq_len={wm_meta['max_seq_len']}"
+        )
+    if "temporal_stride" in ckpt and int(ckpt["temporal_stride"]) != int(macro_action_repeat):
+        raise ValueError(
+            f"Scorer temporal_stride={ckpt['temporal_stride']} does not match "
+            f"--macro_action_repeat={macro_action_repeat}"
+        )
+    if "action_block_size" in ckpt and int(ckpt["action_block_size"]) != int(macro_action_repeat):
+        raise ValueError(
+            f"Scorer action_block_size={ckpt['action_block_size']} does not match "
+            f"--macro_action_repeat={macro_action_repeat}"
+        )
+    hidden_dim = int(ckpt.get("hidden_dim", 512))
+    dropout = float(ckpt.get("dropout", 0.0))
+    latent_dim = int(wm_meta["latent_dim"])
+    exploration_dim = int(ckpt.get("exploration_feature_dim", 128))
+
+    if ckpt.get("safety_head") is not None:
+        safety = LatentEnergyHead(latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
+        clean_load_state(safety, ckpt["safety_head"])
+        safety.eval()
+        heads.safety_head = safety
+
+    if ckpt.get("goal_head") is not None:
+        goal = GoalEnergyHead(latent_dim=latent_dim, dropout=dropout).to(device)
+        clean_load_state(goal, ckpt["goal_head"])
+        goal.eval()
+        heads.goal_head = goal
+
+    if ckpt.get("exploration") is not None:
+        exploration = ExplorationBonus(
+            latent_dim=latent_dim,
+            feature_dim=exploration_dim,
+        ).to(device)
+        clean_load_state(exploration, ckpt["exploration"])
+        exploration.eval()
+        heads.exploration = exploration
+
+    heads.goal_weight = float(ckpt.get("goal_weight", 0.0))
+    heads.exploration_weight = float(ckpt.get("exploration_weight", 0.0))
+    heads.safety_weight = 1.0
+    meta = {
+        "has_safety_head": heads.safety_head is not None,
+        "has_goal_head": heads.goal_head is not None,
+        "has_exploration": heads.exploration is not None,
+        "has_progress_head_ckpt": ckpt.get("progress_head") is not None,
+        "goal_weight": heads.goal_weight,
+        "exploration_weight": heads.exploration_weight,
+        "safety_mode": ckpt.get("safety_mode"),
+        "seq_len": ckpt.get("seq_len"),
+        "temporal_stride": ckpt.get("temporal_stride"),
+        "action_block_size": ckpt.get("action_block_size"),
+        "window_stride": ckpt.get("window_stride"),
+        "use_proprio": ckpt.get("use_proprio"),
+    }
+    return heads, meta
 
 def load_frozen_policy(ckpt_path: str, gs) -> ActorCritic:
     model = ActorCritic(obs_dim=50, act_dim=12).to(gs.device)
@@ -421,6 +687,40 @@ def collect_proprio(robot, act_dofs, q0, prev_action):
     q_rel = q - q0.unsqueeze(0)
     proprio = torch.cat([pos[:, 2:3], quat, vel_b, ang_b, q_rel, dq, prev_action], dim=1)
     return proprio, to_numpy(pos[0]), to_numpy(quat[0])
+
+
+def canonical_breadcrumb_proprio(
+    q0: torch.Tensor,
+    device: torch.device,
+    torch_mod,
+) -> torch.Tensor:
+    """Return a neutral proprio token for externally provided goal images.
+
+    When the world model is trained with proprio enabled, breadcrumb / target
+    images still need a proprio input at encode time. For the intended
+    deployment setup ("here is a picture of the object, go find it"), there is
+    no meaningful robot state attached to that image, so we use a canonical
+    standing token:
+
+    - nominal spawn height
+    - identity orientation
+    - zero linear / angular velocity
+    - zero joint offsets / joint velocities
+    - zero previous action
+
+    This keeps target-image encoding runtime-valid without requiring simulator
+    oracle state.
+    """
+    dtype = q0.dtype
+    batch = 1
+    pos_z = torch_mod.full((batch, 1), ROBOT_SPAWN_Z, device=device, dtype=dtype)
+    quat = torch_mod.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype)
+    vel_b = torch_mod.zeros((batch, 3), device=device, dtype=dtype)
+    ang_b = torch_mod.zeros((batch, 3), device=device, dtype=dtype)
+    q_rel = torch_mod.zeros((batch, 12), device=device, dtype=dtype)
+    dq = torch_mod.zeros((batch, 12), device=device, dtype=dtype)
+    prev_action = torch_mod.zeros((batch, 12), device=device, dtype=dtype)
+    return torch_mod.cat([pos_z, quat, vel_b, ang_b, q_rel, dq, prev_action], dim=1)
 
 def sync_render_robot(src_robot, src_act_dofs, dst_robot, dst_act_dofs):
     pos = src_robot.get_pos()
@@ -546,6 +846,17 @@ def select_score_latent(
     return z_raw
 
 
+@torch.no_grad()
+def estimate_current_safety_energy(
+    z_proj: torch.Tensor,
+    heads: PlannerHeads,
+) -> float | None:
+    if heads.safety_head is None:
+        return None
+    value = heads.safety_head(z_proj.to(next(heads.safety_head.parameters()).device))
+    return float(value.reshape(-1)[0].item())
+
+
 def choose_redundant_prototype(
     bank: list[torch.Tensor],
     hit_counts: list[int],
@@ -658,57 +969,328 @@ def apply_prototype_update_steps(
         insert_steps[idx] = step
 
 
-def choose_frontier_subgoal(
+def apply_prototype_update_graph(
+    neighbors: list[set[int]],
+    update: PrototypeBankUpdate,
+) -> None:
+    """Keep prototype-transition graph aligned with bank mutations."""
+    idx = update.prototype_idx
+    if idx is None:
+        return
+    if update.action == "inserted":
+        if idx == len(neighbors):
+            neighbors.append(set())
+        elif 0 <= idx < len(neighbors):
+            stale = list(neighbors[idx])
+            for other in stale:
+                if 0 <= other < len(neighbors):
+                    neighbors[other].discard(idx)
+            neighbors[idx].clear()
+        return
+    if update.action == "replaced" and 0 <= idx < len(neighbors):
+        stale = list(neighbors[idx])
+        for other in stale:
+            if 0 <= other < len(neighbors):
+                neighbors[other].discard(idx)
+        neighbors[idx].clear()
+
+
+def add_prototype_graph_edge(
+    neighbors: list[set[int]],
+    prev_idx: int | None,
+    cur_idx: int | None,
+) -> None:
+    if prev_idx is None or cur_idx is None or prev_idx == cur_idx:
+        return
+    if prev_idx < 0 or cur_idx < 0:
+        return
+    if prev_idx >= len(neighbors) or cur_idx >= len(neighbors):
+        return
+    neighbors[prev_idx].add(cur_idx)
+    neighbors[cur_idx].add(prev_idx)
+
+
+def cosine_similarity_scalar(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_norm = F.normalize(a.detach().cpu().float().unsqueeze(0), p=2, dim=-1)
+    b_norm = F.normalize(b.detach().cpu().float().unsqueeze(0), p=2, dim=-1)
+    return float(F.cosine_similarity(a_norm, b_norm, dim=-1).item())
+
+
+def latent_displacement(a: torch.Tensor, b: torch.Tensor) -> float:
+    return max(0.0, 1.0 - cosine_similarity_scalar(a, b))
+
+
+def estimate_dead_reckoning_step(
+    prev_xy: np.ndarray,
+    yaw_rad: float,
+    proprio: torch.Tensor,
+    dt_s: float,
+) -> np.ndarray:
+    """Integrate a short XY odometry step from body-frame velocity."""
+    prop_np = proprio[0].detach().cpu().numpy()
+    vel_b = np.asarray(prop_np[5:8], dtype=np.float32)
+    c = math.cos(yaw_rad)
+    s = math.sin(yaw_rad)
+    vel_world_xy = np.array([
+        c * vel_b[0] - s * vel_b[1],
+        s * vel_b[0] + c * vel_b[1],
+    ], dtype=np.float32)
+    return np.asarray(prev_xy, dtype=np.float32) + vel_world_xy * float(dt_s)
+
+
+def match_keyframe_node(
+    nodes: list[KeyframeNode],
+    score_latent: torch.Tensor,
+    odom_xy: np.ndarray,
+    step: int,
+    sim_threshold: float,
+    match_radius_m: float,
+    min_step_gap: int,
+) -> int | None:
+    if not nodes:
+        return None
+
+    best_idx = None
+    best_sim = -1.0
+    for node in nodes:
+        if step - node.last_seen_step < min_step_gap:
+            continue
+        odom_dist = float(np.linalg.norm(np.asarray(node.odom_xy, dtype=np.float32) - odom_xy))
+        if odom_dist > match_radius_m:
+            continue
+        sim = cosine_similarity_scalar(score_latent, node.score_latent)
+        if sim >= sim_threshold and sim > best_sim:
+            best_sim = sim
+            best_idx = node.idx
+    return best_idx
+
+
+def add_keyframe_node(
+    nodes: list[KeyframeNode],
+    neighbors: list[set[int]],
+    score_latent: torch.Tensor,
+    proj_latent: torch.Tensor,
+    odom_xy: np.ndarray,
+    yaw_rad: float,
+    step: int,
+) -> int:
+    node_idx = len(nodes)
+    nodes.append(KeyframeNode(
+        idx=node_idx,
+        score_latent=score_latent.detach().cpu().float().clone(),
+        proj_latent=proj_latent.detach().cpu().float().clone(),
+        step=step,
+        last_seen_step=step,
+        visit_count=1,
+        odom_xy=(float(odom_xy[0]), float(odom_xy[1])),
+        yaw_rad=float(yaw_rad),
+    ))
+    neighbors.append(set())
+    return node_idx
+
+
+def touch_keyframe_node(
+    node: KeyframeNode,
+    odom_xy: np.ndarray,
+    yaw_rad: float,
+    step: int,
+) -> None:
+    node.last_seen_step = step
+    node.visit_count += 1
+    node.odom_xy = (float(odom_xy[0]), float(odom_xy[1]))
+    node.yaw_rad = float(yaw_rad)
+
+
+def bfs_shortest_paths(
+    neighbors: list[set[int]],
+    start_idx: int,
+) -> tuple[dict[int, int], dict[int, int | None]]:
+    from collections import deque
+
+    dist: dict[int, int] = {start_idx: 0}
+    parent: dict[int, int | None] = {start_idx: None}
+    queue = deque([start_idx])
+    while queue:
+        idx = queue.popleft()
+        for nxt in neighbors[idx]:
+            if nxt in dist:
+                continue
+            dist[nxt] = dist[idx] + 1
+            parent[nxt] = idx
+            queue.append(nxt)
+    return dist, parent
+
+
+def reconstruct_path(
+    parent: dict[int, int | None],
+    target_idx: int,
+) -> list[int]:
+    path: list[int] = []
+    idx: int | None = target_idx
+    while idx is not None:
+        path.append(idx)
+        idx = parent.get(idx)
+    path.reverse()
+    return path
+
+
+def choose_route_path(
     bank: list[torch.Tensor],
     hit_counts: list[int],
     last_seen_steps: list[int],
     insert_steps: list[int],
-    current_latent: torch.Tensor,
+    neighbors: list[set[int]],
+    current_idx: int,
     current_step: int,
     min_age_steps: int,
     frontier_window_steps: int,
-) -> int | None:
-    """Pick a low-hit frontier prototype rather than deep history behind the robot."""
-    if not bank:
+    min_hops: int,
+    goal_latent: torch.Tensor | None,
+    goal_route_improve_margin: float,
+) -> tuple[str, int, list[int], float | None] | None:
+    """Choose a graph route toward either a better goal basin or a frontier node."""
+    if not bank or current_idx < 0 or current_idx >= len(bank):
         return None
 
-    current = current_latent.detach().cpu().float()
-    current = F.normalize(current.unsqueeze(0), p=2, dim=-1).squeeze(0)
-    bank_tensor = torch.stack(bank)
-    sims = torch.mv(bank_tensor, current)
+    dist, parent = bfs_shortest_paths(neighbors, current_idx)
+    reachable = [
+        idx for idx, hops in dist.items()
+        if idx != current_idx and hops >= max(1, min_hops)
+    ]
+    if not reachable:
+        return None
+
+    current_goal_sim = None
+    goal_sims: list[float] | None = None
+    if goal_latent is not None:
+        goal_sims = [cosine_similarity_scalar(node, goal_latent) for node in bank]
+        current_goal_sim = goal_sims[current_idx]
+        better_goal_nodes = [
+            idx for idx in reachable
+            if goal_sims[idx] >= current_goal_sim + goal_route_improve_margin
+        ]
+        if better_goal_nodes:
+            target_idx = max(
+                better_goal_nodes,
+                key=lambda idx: (
+                    goal_sims[idx],
+                    -dist[idx],
+                    -hit_counts[idx],
+                    insert_steps[idx],
+                ),
+            )
+            path = reconstruct_path(parent, target_idx)
+            if len(path) >= 2:
+                return ("goal", target_idx, path[1:], goal_sims[target_idx])
 
     newest_insert = max(insert_steps) if insert_steps else current_step
     frontier_cutoff = newest_insert - max(0, frontier_window_steps)
-
-    eligible: list[int] = []
-    for idx in range(len(bank)):
-        age = current_step - int(last_seen_steps[idx])
-        if age < min_age_steps:
-            continue
-        if int(insert_steps[idx]) < frontier_cutoff:
-            continue
-        eligible.append(idx)
-
-    if not eligible:
-        for idx in range(len(bank)):
-            age = current_step - int(last_seen_steps[idx])
-            if age >= min_age_steps:
-                eligible.append(idx)
-    if not eligible:
+    frontier_nodes = [
+        idx for idx in reachable
+        if (current_step - int(last_seen_steps[idx])) >= min_age_steps
+        and int(insert_steps[idx]) >= frontier_cutoff
+    ]
+    if not frontier_nodes:
+        frontier_nodes = [
+            idx for idx in reachable
+            if (current_step - int(last_seen_steps[idx])) >= min_age_steps
+        ]
+    if not frontier_nodes:
+        frontier_nodes = reachable
+    if not frontier_nodes:
         return None
 
-    best_idx = eligible[0]
-    best_key = None
-    for idx in eligible:
-        key = (
-            int(insert_steps[idx]),
-            -int(hit_counts[idx]),
-            -float(sims[idx].item()),
-        )
-        if best_key is None or key > best_key:
-            best_key = key
-            best_idx = idx
-    return best_idx
+    target_idx = max(
+        frontier_nodes,
+        key=lambda idx: (
+            -hit_counts[idx],
+            -len(neighbors[idx]),
+            insert_steps[idx],
+            dist[idx],
+        ),
+    )
+    path = reconstruct_path(parent, target_idx)
+    if len(path) < 2:
+        return None
+    target_goal_sim = None if goal_sims is None else goal_sims[target_idx]
+    return ("frontier", target_idx, path[1:], target_goal_sim)
+
+
+def choose_keyframe_route_path(
+    nodes: list[KeyframeNode],
+    neighbors: list[set[int]],
+    current_idx: int,
+    current_step: int,
+    min_age_steps: int,
+    frontier_window_steps: int,
+    min_hops: int,
+    goal_latent: torch.Tensor | None,
+    goal_route_improve_margin: float,
+) -> tuple[str, int, list[int], float | None] | None:
+    if not nodes or current_idx < 0 or current_idx >= len(nodes):
+        return None
+
+    dist, parent = bfs_shortest_paths(neighbors, current_idx)
+    reachable = [
+        idx for idx, hops in dist.items()
+        if idx != current_idx and hops >= max(1, min_hops)
+    ]
+    if not reachable:
+        return None
+
+    goal_sims: dict[int, float] = {}
+    if goal_latent is not None:
+        current_goal_sim = cosine_similarity_scalar(nodes[current_idx].score_latent, goal_latent)
+        better_goal_nodes = []
+        for idx in reachable:
+            sim = cosine_similarity_scalar(nodes[idx].score_latent, goal_latent)
+            goal_sims[idx] = sim
+            if sim >= current_goal_sim + goal_route_improve_margin:
+                better_goal_nodes.append(idx)
+        if better_goal_nodes:
+            target_idx = max(
+                better_goal_nodes,
+                key=lambda idx: (
+                    goal_sims[idx],
+                    -dist[idx],
+                    -nodes[idx].visit_count,
+                    nodes[idx].step,
+                ),
+            )
+            path = reconstruct_path(parent, target_idx)
+            if len(path) >= 2:
+                return ("goal", target_idx, path[1:], goal_sims[target_idx])
+
+    newest_insert = max(node.step for node in nodes)
+    frontier_cutoff = newest_insert - max(0, frontier_window_steps)
+    frontier_nodes = [
+        idx for idx in reachable
+        if (current_step - nodes[idx].last_seen_step) >= min_age_steps
+        and nodes[idx].step >= frontier_cutoff
+    ]
+    if not frontier_nodes:
+        frontier_nodes = [
+            idx for idx in reachable
+            if (current_step - nodes[idx].last_seen_step) >= min_age_steps
+        ]
+    if not frontier_nodes:
+        frontier_nodes = reachable
+    if not frontier_nodes:
+        return None
+
+    target_idx = max(
+        frontier_nodes,
+        key=lambda idx: (
+            -nodes[idx].visit_count,
+            -len(neighbors[idx]),
+            nodes[idx].step,
+            dist[idx],
+        ),
+    )
+    path = reconstruct_path(parent, target_idx)
+    if len(path) < 2:
+        return None
+    return ("frontier", target_idx, path[1:], goal_sims.get(target_idx))
 
 
 # ---- Breadcrumb encoding ------------------------------------------------- #
@@ -753,32 +1335,55 @@ def encode_breadcrumb(
     rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
     rgb_chw = np.ascontiguousarray(np.transpose(rgb[:, :, :3], (2, 0, 1)))
     vis_t = torch.from_numpy(rgb_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
-    
-    z_raw, z_proj = world_model.encode(vis_t, None)
+
+    proprio_t = None
+    if world_model.encoder.use_proprio:
+        proprio_t = canonical_breadcrumb_proprio(q0, planning_device, torch_mod)
+
+    z_raw, z_proj = world_model.encode(vis_t, proprio_t)
     return z_raw.squeeze(0).detach(), z_proj.squeeze(0).detach()
 
 
 # ---- PPO execution ------------------------------------------------------- #
 
+@torch.no_grad()
 def execute_command(
     scene, robot, policy, act_dofs, q0, prev_action,
-    nominal_cmd, sim_cfg, gs, torch_mod,
+    nominal_cmd, sim_cfg, gs, torch_mod, macro_action_repeat=1,
+    command_representation: str = "mean_scaled",
+    command_block_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    proprio, _, _ = collect_proprio(robot, act_dofs, q0, prev_action)
-    cmd = nominal_cmd.to(device=gs.device, dtype=torch_mod.float32).view(1, 3)
-    obs_tensor = torch.cat([proprio, cmd], dim=1)
-    actions = policy.act_deterministic(obs_tensor)
+    nominal_cmd = nominal_cmd.to(device=gs.device, dtype=torch_mod.float32).flatten()
+    last_action = prev_action.detach().clone()
+    if command_representation == "active_block":
+        block_size = int(command_block_size if command_block_size is not None else max(1, int(macro_action_repeat)))
+        if nominal_cmd.numel() != block_size * 3:
+            raise ValueError(
+                f"Expected active_block command with {block_size * 3} values, got {nominal_cmd.numel()}"
+            )
+        cmd_seq = nominal_cmd.view(block_size, 3)
+    else:
+        cmd = nominal_cmd.view(1, 3)
+        repeats = max(1, int(macro_action_repeat))
+        cmd_seq = cmd.expand(repeats, -1)
 
-    q_tgt = q0.unsqueeze(0) + sim_cfg.action_scale * actions
-    q_tgt[:, 0:4] = torch_mod.clamp(q_tgt[:, 0:4], -0.8, 0.8)
-    q_tgt[:, 4:8] = torch_mod.clamp(q_tgt[:, 4:8], -1.5, 1.5)
-    q_tgt[:, 8:12] = torch_mod.clamp(q_tgt[:, 8:12], -2.5, -0.5)
+    for step_cmd in cmd_seq:
+        cmd = step_cmd.view(1, 3)
+        proprio, _, _ = collect_proprio(robot, act_dofs, q0, last_action)
+        obs_tensor = torch.cat([proprio, cmd], dim=1)
+        actions = policy.act_deterministic(obs_tensor)
 
-    robot.control_dofs_position(q_tgt, act_dofs)
-    for _ in range(sim_cfg.decimation):
-        scene.step()
+        q_tgt = q0.unsqueeze(0) + sim_cfg.action_scale * actions
+        q_tgt[:, 0:4] = torch_mod.clamp(q_tgt[:, 0:4], -0.8, 0.8)
+        q_tgt[:, 4:8] = torch_mod.clamp(q_tgt[:, 4:8], -1.5, 1.5)
+        q_tgt[:, 8:12] = torch_mod.clamp(q_tgt[:, 8:12], -2.5, -0.5)
 
-    return cmd.detach().clone(), actions.detach().clone()
+        robot.control_dofs_position(q_tgt, act_dofs)
+        for _ in range(sim_cfg.decimation):
+            scene.step()
+        last_action = actions.detach().clone()
+
+    return nominal_cmd.detach().clone(), last_action
 
 
 # ---- Visualization ------------------------------------------------------- #
@@ -1089,7 +1694,7 @@ def has_line_of_sight(a_xy, b_xy, obstacle_layout, step_size=0.03, margin=0.05):
 def main():
     args = parse_args()
     if args.out_dir is None:
-        args.out_dir = os.path.join("inference_runs", f"pure_wm_seed_{args.seed:04d}")
+        args.out_dir = os.path.join("inference_runs", f"perception_only_seed_{args.seed:04d}")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1098,10 +1703,58 @@ def main():
     torch.manual_seed(args.seed)
 
     world_model, wm_meta = load_world_model(args.wm_ckpt, planning_device)
+    planner_heads, scorer_meta = load_planner_heads(
+        args.scorer_ckpt, planning_device, wm_meta, args.macro_action_repeat,
+    )
+    if args.exploration_weight is not None:
+        planner_heads.exploration_weight = float(args.exploration_weight)
     camera_cfg = ego_camera_config_from_args(args)
 
-    print(f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
-          f"image_size={wm_meta['image_size']}")
+    print(
+        f"Loaded world model: latent_dim={wm_meta['latent_dim']} "
+        f"image_size={wm_meta['image_size']} "
+        f"cmd_dim={wm_meta['cmd_dim']} "
+        f"cmd_repr={wm_meta['command_representation']}"
+    )
+    if wm_meta["use_proprio"]:
+        if not args.allow_mixed_latent_wm:
+            raise ValueError(
+                "scripts/6_infer_pure_wm.py requires a pure-vision world-model checkpoint, "
+                "but the supplied checkpoint was trained with proprio enabled. "
+                "Retrain LeWM without --use_proprio, or pass --allow_mixed_latent_wm "
+                "only for legacy debugging."
+            )
+        print(
+            "Warning: allowing a mixed latent world model in pure-perception inference. "
+            "Exploration and safety will be evaluated in a vision+proprio latent, not "
+            "pure perception."
+        )
+    if wm_meta["command_representation"] == "active_block":
+        if int(args.macro_action_repeat) != int(wm_meta["command_block_size"]):
+            raise ValueError(
+                f"Active-block checkpoint expects --macro_action_repeat={wm_meta['command_block_size']}, "
+                f"got {args.macro_action_repeat}."
+            )
+    if args.scorer_ckpt is not None:
+        print(
+            "Loaded planner heads: "
+            f"safety={scorer_meta.get('has_safety_head', False)} "
+            f"goal={scorer_meta.get('has_goal_head', False)} "
+            f"exploration={scorer_meta.get('has_exploration', False)} "
+            f"(seq={scorer_meta.get('seq_len')}, "
+            f"stride={scorer_meta.get('temporal_stride')}, "
+            f"block={scorer_meta.get('action_block_size')}, "
+            f"use_proprio={scorer_meta.get('use_proprio')})"
+        )
+        if scorer_meta.get("has_goal_head", False):
+            print("Ignoring goal head in scorer checkpoint; the active planner optimizes safety + novelty only.")
+    if args.score_space != "proj":
+        print(
+            f"Ignoring --score_space={args.score_space!r}; "
+            "the active planner always scores projected latents."
+        )
+    if scorer_meta.get("has_progress_head_ckpt", False):
+        print("Ignoring legacy progress head stored in scorer checkpoint.")
 
     obstacle_layout, beacon_layout, start_cell = generate_enclosed_maze(
         seed=args.seed,
@@ -1126,33 +1779,16 @@ def main():
             if b.identity == args.target_beacon:
                 target_beacon = b
                 break
+        if target_beacon is None:
+            available = ", ".join(sorted(b.identity for b in beacon_layout.beacons)) or "<none>"
+            raise ValueError(
+                f"Requested --target_beacon={args.target_beacon!r}, but generated maze "
+                f"contains: {available}"
+            )
     if target_beacon is None and beacon_layout.beacons:
-        best_dist = -1.0
-        for b in beacon_layout.beacons:
-            d = float(np.linalg.norm(np.array(b.pos[:2]) - spawn_xy))
-            if d > best_dist:
-                best_dist = d
-                target_beacon = b
+        target_beacon = sorted(beacon_layout.beacons, key=lambda b: b.identity)[0]
 
     spawn_yaw = 0.0
-    best_score = -float("inf")
-    for probe_yaw in [0.0, math.pi / 2, math.pi, -math.pi / 2]:
-        probe_xy = spawn_xy + 0.3 * np.array(
-            [math.cos(probe_yaw), math.sin(probe_yaw)], dtype=np.float32,
-        )
-        blocked = bool(detect_collisions(
-            torch.from_numpy(probe_xy.reshape(1, 2)),
-            obstacle_layout, margin=0.12,
-        )[0].item())
-        if not blocked:
-            score = 1.0
-            if target_beacon is not None:
-                dx = float(target_beacon.pos[0]) - float(spawn_xy[0])
-                dy = float(target_beacon.pos[1]) - float(spawn_xy[1])
-                score = math.cos(probe_yaw - math.atan2(dy, dx))
-            if score > best_score:
-                best_score = score
-                spawn_yaw = probe_yaw
 
     target_claim_xy = beacon_claim_xy(target_beacon, args.wall_thickness) if target_beacon else None
     breadcrumb_xy = [float(target_beacon.pos[0]), float(target_beacon.pos[1])] if target_beacon else None
@@ -1161,10 +1797,12 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
-          f"iters={args.cem_iters}, K={args.mpc_execute}, Score={args.score_space}, "
-          f"Novelty={args.novelty_weight}, ActionPen={args.action_penalty_weight}, "
-          f"Bank={args.visited_bank_size}, ProtoThresh={args.prototype_sim_threshold:.3f}, "
-          f"Plateau={args.stall_plateau_steps}, SubgoalBudget={args.subgoal_budget_steps}")
+          f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
+          f"Cmd={wm_meta['command_representation']}:{wm_meta['cmd_dim']}, "
+          f"Latent=proj, Objective=safety+novelty, "
+          f"GoalSucc={args.success_goal_sim_threshold:.2f}, "
+          f"ExploreW={planner_heads.exploration_weight:.3f}, "
+          f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
     physics_scene = ego_scene = third_person_scene = None
@@ -1173,36 +1811,21 @@ def main():
     tp_frames_hwc: List[np.ndarray] = []
     combined_frames: List[np.ndarray] = []
     path_xy: List[List[float]] = []
+    oracle_path_xy: List[List[float]] = []
     costs_log: List[float] = []
     cmds_log: List[List[float]] = []
-    visited_bank: List[torch.Tensor] = []
-    visited_bank_hits: List[int] = []
-    visited_bank_last_seen_steps: List[int] = []
-    visited_bank_insert_steps: List[int] = []
-    visited_seen = 0
-    visited_insertions = 0
-    visited_replacements = 0
-    visited_hits_total = 0
-    last_novel_prototype_step = 0
+    mode_log: List[str] = []
+    goal_similarity_log: List[float | None] = []
     terminate_reason = "max_steps"
     collision_count = 0
     frame_substitution_count = 0
     first_collision_step: int | None = None
-    visited_bank_fill_step: int | None = None
-    visited_bank_replacement_step: int | None = None
-    subgoal_active = False
-    subgoal_target_idx: int | None = None
-    subgoal_target_latent: torch.Tensor | None = None
-    subgoal_end_step: int | None = None
-    subgoal_exit_reason: str | None = None
-    subgoal_cooldown_until = 0
-    subgoal_activations = 0
-    subgoal_steps_total = 0
-    subgoal_last_activation_step: int | None = None
-    subgoal_last_target_idx: int | None = None
+    success_hold_count = 0
+    oracle_goal_reached = False
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
+    goal_activation_step: int | None = None
 
     try:
         import genesis as gs
@@ -1222,22 +1845,21 @@ def main():
             args.third_person_res, args.third_person_fov, 0.01,
         )
 
-        z_breadcrumb = None
+        z_breadcrumb_proj_ref = None
         if target_beacon is not None:
             z_breadcrumb_raw, z_breadcrumb_proj = encode_breadcrumb(
                 world_model, ego_scene, ego_robot, ego_act_dofs, ego_cam,
                 target_beacon, args.breadcrumb_view_dist,
                 planning_device, q0, gs, torch,
             )
-            z_breadcrumb = select_score_latent(
-                z_breadcrumb_raw, z_breadcrumb_proj, args.score_space,
-            )
+            z_breadcrumb_proj_ref = z_breadcrumb_proj.detach().clone()
             print(
                 f"Goal latents encoded: ||z_raw||={float(z_breadcrumb_raw.norm()):.3f} "
                 f"||z_proj||={float(z_breadcrumb_proj.norm()):.3f}"
             )
 
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
+        cmd_low_t, cmd_high_t, init_std_t, min_std_t = build_command_sampling_config(args, wm_meta)
 
         planner = PureCEMPlanner(
             world_model=world_model,
@@ -1245,20 +1867,19 @@ def main():
             n_candidates=args.n_candidates,
             cem_iters=args.cem_iters,
             elite_frac=args.elite_frac,
-            cmd_low=torch.tensor(args.cmd_low, dtype=torch.float32),
-            cmd_high=torch.tensor(args.cmd_high, dtype=torch.float32),
-            init_std=torch.tensor(args.cem_init_std, dtype=torch.float32),
-            min_std=torch.tensor(args.cem_min_std, dtype=torch.float32),
+            cmd_low=cmd_low_t,
+            cmd_high=cmd_high_t,
+            init_std=init_std_t,
+            min_std=min_std_t,
             device=planning_device,
-            score_space=args.score_space,
-            novelty_weight=args.novelty_weight,
             action_penalty_weight=args.action_penalty_weight,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
         last_clean_frame: np.ndarray | None = None
         plan_seq: torch.Tensor | None = None
-        plan_step_idx = 0 
+        plan_step_idx = 0
+        plan_metrics_last: dict[str, float] = {}
 
         obs = observe(
             physics_robot, physics_act_dofs,
@@ -1276,40 +1897,10 @@ def main():
         )
         tp_frames_hwc.append(tp_frame)
         combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
-        path_xy.append([float(obs["pos_np"][0]), float(obs["pos_np"][1])])
+        start_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
+        path_xy.append(start_xy)
+        oracle_path_xy.append(start_xy.copy())
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
-        score_latent_now = select_score_latent(
-            obs["z_raw"], obs["z_proj"], args.score_space,
-        ).squeeze(0)
-        
-        bank_update = update_prototype_bank(
-            visited_bank,
-            visited_bank_hits,
-            score_latent_now,
-            visited_seen,
-            args.visited_bank_size,
-            args.prototype_sim_threshold,
-        )
-        visited_seen = bank_update.n_seen
-        apply_prototype_update_steps(
-            visited_bank_last_seen_steps,
-            visited_bank_insert_steps,
-            bank_update,
-            0,
-        )
-        if bank_update.action == "inserted":
-            visited_insertions += 1
-            last_novel_prototype_step = 0
-        elif bank_update.action == "replaced":
-            visited_replacements += 1
-            last_novel_prototype_step = 0
-            if visited_bank_replacement_step is None:
-                visited_bank_replacement_step = 0
-        elif bank_update.action == "hit":
-            visited_hits_total += 1
-        if bank_update.filled_now:
-            visited_bank_fill_step = 0
-            print("Prototype bank full at initial observation; novel states will replace redundant prototypes")
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1320,81 +1911,31 @@ def main():
             )
 
         for step in range(args.steps):
-            if subgoal_active and (
-                subgoal_exit_reason is not None
-                or (subgoal_end_step is not None and step >= subgoal_end_step)
-            ):
-                reason = subgoal_exit_reason or "budget"
-                print(
-                    f"Step {step:03d} | return to beacon "
-                    f"(reason={reason}, subgoal_idx={subgoal_target_idx})"
-                )
-                subgoal_active = False
-                subgoal_target_idx = None
-                subgoal_target_latent = None
-                subgoal_end_step = None
-                subgoal_exit_reason = None
-                subgoal_cooldown_until = step + args.subgoal_cooldown_steps
-                planner.reset()
-                plan_seq = None
+            mode = "explore"
+            mode_log.append(mode)
 
-            if (
-                not subgoal_active
-                and step >= subgoal_cooldown_until
-                and len(visited_bank) >= 4
-                and (step - last_novel_prototype_step) >= args.stall_plateau_steps
-            ):
-                frontier_idx = choose_frontier_subgoal(
-                    visited_bank,
-                    visited_bank_hits,
-                    visited_bank_last_seen_steps,
-                    visited_bank_insert_steps,
-                    score_latent_now,
-                    step,
-                    args.subgoal_min_age_steps,
-                    args.subgoal_frontier_window_steps,
-                )
-                if frontier_idx is not None:
-                    frontier_age = step - int(visited_bank_last_seen_steps[frontier_idx])
-                    frontier_insert_age = step - int(visited_bank_insert_steps[frontier_idx])
-                    subgoal_active = True
-                    subgoal_target_idx = frontier_idx
-                    subgoal_target_latent = visited_bank[frontier_idx].detach().clone().to(planning_device)
-                    subgoal_end_step = step + args.subgoal_budget_steps
-                    subgoal_exit_reason = None
-                    subgoal_activations += 1
-                    subgoal_last_activation_step = step
-                    subgoal_last_target_idx = frontier_idx
-                    planner.reset()
-                    plan_seq = None
-                    print(
-                        f"Step {step:03d} | plateau escape -> frontier subgoal "
-                        f"idx={frontier_idx} hits={visited_bank_hits[frontier_idx]} "
-                        f"age={frontier_age} insert_age={frontier_insert_age}"
-                    )
-
-            need_replan = (plan_seq is None or plan_step_idx >= args.mpc_execute)
-
+            need_replan = plan_seq is None or plan_step_idx >= args.mpc_execute
             if need_replan:
-                novelty_bank = None
-                if args.novelty_weight > 0.0 and visited_bank:
-                    novelty_bank = torch.stack(visited_bank).to(planning_device)
-                active_goal = subgoal_target_latent if subgoal_active else z_breadcrumb
-                plan_seq, cost = planner.plan(obs["z_raw"], active_goal, novelty_bank)
+                plan_seq, cost, plan_metrics_last = planner.plan(
+                    obs["z_raw"],
+                    heads=planner_heads,
+                )
                 plan_step_idx = 0
-                costs_log.append(cost)
+                costs_log.append(float(cost))
 
             nominal_cmd = plan_seq[plan_step_idx]
             plan_step_idx += 1
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
+            cmd_display = format_command_for_log(cmd_vals, wm_meta)
             cmds_log.append(cmd_vals)
-            if subgoal_active:
-                subgoal_steps_total += 1
 
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
                 physics_act_dofs, q0, prev_action,
                 nominal_cmd.to(gs.device), sim_cfg, gs, torch,
+                macro_action_repeat=args.macro_action_repeat,
+                command_representation=str(wm_meta["command_representation"]),
+                command_block_size=int(wm_meta["command_block_size"]),
             )
             prev_action = actions.detach().clone()
 
@@ -1405,77 +1946,42 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
-            score_latent_now = select_score_latent(
-                obs["z_raw"], obs["z_proj"], args.score_space,
-            ).squeeze(0)
+            goal_sim_now = None
+            if z_breadcrumb_proj_ref is not None:
+                goal_sim_now = cosine_similarity_scalar(
+                    obs["z_proj"].squeeze(0),
+                    z_breadcrumb_proj_ref,
+                )
+
+            cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
+            prev_xy = path_xy[-1]
+            path_xy.append(cur_xy)
+            update_coverage_tracker(coverage_tracker, prev_xy, cur_xy)
+            oracle_cur_xy = cur_xy.copy()
+            oracle_path_xy.append(oracle_cur_xy)
+
             if obs["frame_substituted"]:
                 frame_substitution_count += 1
-            if not obs["frame_substituted"]:
+            else:
                 last_clean_frame = obs["frame_hwc"].copy()
-                bank_update = update_prototype_bank(
-                    visited_bank,
-                    visited_bank_hits,
-                    score_latent_now,
-                    visited_seen,
-                    args.visited_bank_size,
-                    args.prototype_sim_threshold,
-                )
-                visited_seen = bank_update.n_seen
-                apply_prototype_update_steps(
-                    visited_bank_last_seen_steps,
-                    visited_bank_insert_steps,
-                    bank_update,
-                    step,
-                )
-                if bank_update.action == "inserted":
-                    visited_insertions += 1
-                    last_novel_prototype_step = step
-                    if subgoal_active:
-                        subgoal_exit_reason = "novel_prototype"
-                elif bank_update.action == "replaced":
-                    visited_replacements += 1
-                    last_novel_prototype_step = step
-                    if subgoal_active:
-                        subgoal_exit_reason = "novel_prototype"
-                    if visited_bank_replacement_step is None:
-                        visited_bank_replacement_step = step
-                        print(
-                            f"Prototype bank replacement started at step {step:03d}; "
-                            "replacing redundant prototypes"
-                        )
-                elif bank_update.action == "hit":
-                    visited_hits_total += 1
-                if bank_update.filled_now and visited_bank_fill_step is None:
-                    visited_bank_fill_step = step
-                    print(
-                        f"Prototype bank full at step {step:03d}; "
-                        "novel states will replace redundant prototypes"
+                if (
+                    args.rnd_online_lr > 0.0
+                    and planner_heads.exploration is not None
+                    and planner_heads.exploration_weight > 0.0
+                ):
+                    planner_heads.exploration.online_update(
+                        obs["z_proj"].to(planning_device),
+                        lr=args.rnd_online_lr,
                     )
-            if subgoal_active and subgoal_target_latent is not None:
-                current_norm = F.normalize(
-                    score_latent_now.detach().cpu().float().unsqueeze(0),
-                    p=2, dim=-1,
-                )
-                target_norm = subgoal_target_latent.detach().cpu().float().unsqueeze(0)
-                sim_to_subgoal = float(F.cosine_similarity(
-                    current_norm, target_norm, dim=-1,
-                ).item())
-                if sim_to_subgoal >= args.prototype_sim_threshold:
-                    subgoal_exit_reason = "subgoal_reached"
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
                 tp_robot, tp_act_dofs, tp_cam,
                 args.chase_dist, args.chase_height, args.side_offset, args.lookahead,
             )
-
             ego_frames_hwc.append(obs["frame_hwc"])
             tp_frames_hwc.append(tp_frame)
             combined_frames.append(build_side_by_side_frame(obs["frame_hwc"], tp_frame))
-            cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
-            prev_xy = path_xy[-1]
-            path_xy.append(cur_xy)
-            update_coverage_tracker(coverage_tracker, prev_xy, cur_xy)
 
             pos_xy_t = torch.from_numpy(
                 np.asarray(obs["pos_np"][:2], dtype=np.float32),
@@ -1483,61 +1989,66 @@ def main():
             collided = bool(detect_collisions(
                 pos_xy_t, obstacle_layout, margin=sim_cfg.collision_margin,
             )[0].item())
-            
             if collided:
                 collision_count += 1
                 if first_collision_step is None:
                     first_collision_step = step
-                planner.reset()
-                plan_seq = None
 
-            if obs["pos_np"][2] < sim_cfg.min_z:
+            if float(obs["proprio"][0, 0].item()) < sim_cfg.min_z:
                 terminate_reason = "fallen"
                 print(f"Step {step:03d} | fallen")
                 break
 
             reached = False
+            if goal_sim_now is not None and goal_sim_now >= args.success_goal_sim_threshold:
+                success_hold_count += 1
+            else:
+                success_hold_count = 0
+            goal_similarity_log.append(None if goal_sim_now is None else float(goal_sim_now))
+            if success_hold_count >= args.success_hold_steps:
+                reached = True
+
+            dist_claim = None
             if target_beacon is not None and target_claim_xy is not None:
                 dist_claim = float(np.linalg.norm(
-                    np.asarray(cur_xy, dtype=np.float32) - target_claim_xy,
+                    np.asarray(oracle_cur_xy, dtype=np.float32) - target_claim_xy,
                 ))
                 min_goal_dist_m = min(min_goal_dist_m, dist_claim)
                 frontness = float(np.dot(
-                    np.asarray(cur_xy, dtype=np.float32) - np.array(target_beacon.pos[:2], dtype=np.float32),
+                    np.asarray(oracle_cur_xy, dtype=np.float32) - np.array(target_beacon.pos[:2], dtype=np.float32),
                     np.array(target_beacon.normal[:2], dtype=np.float32),
                 ))
                 los = has_line_of_sight(
-                    np.asarray(cur_xy, dtype=np.float32),
+                    np.asarray(oracle_cur_xy, dtype=np.float32),
                     target_claim_xy, obstacle_layout,
                     step_size=0.02, margin=0.01,
                 )
-                if dist_claim <= args.success_range and los and frontness > 0:
-                    reached = True
+                oracle_goal_reached = oracle_goal_reached or (
+                    dist_claim <= args.success_range and los and frontness > 0
+                )
 
-                if step % 20 == 0 or reached:
-                    cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
-                    cov_delta = cov_area - last_logged_coverage_area_m2
-                    last_logged_coverage_area_m2 = cov_area
-                    if args.visited_bank_size > 0:
-                        bank_status = f"{len(visited_bank)}/{args.visited_bank_size}"
-                    else:
-                        bank_status = "off"
-                    goal_mode = "beacon"
-                    if subgoal_active and subgoal_target_idx is not None:
-                        goal_mode = f"sub:{subgoal_target_idx}"
-                    print(
-                        f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
-                        f"cmd=[{cmd_vals[0]:+.2f}, {cmd_vals[1]:+.2f}, {cmd_vals[2]:+.2f}] "
-                        f"cost={costs_log[-1]:.3f} d_goal={dist_claim:.2f}m "
-                        f"coll={collision_count} cov={cov_area:.2f}m^2 "
-                        f"cov+={cov_delta:+.2f} proto={bank_status} "
-                        f"ins={visited_insertions} rep={visited_replacements} "
-                        f"goal={goal_mode}"
-                    )
+            if step % 20 == 0 or reached:
+                cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
+                cov_delta = cov_area - last_logged_coverage_area_m2
+                last_logged_coverage_area_m2 = cov_area
+                progress_str = (
+                    f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
+                    f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f}"
+                )
+                goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
+                goal_sim_str = "n/a" if goal_sim_now is None else f"{goal_sim_now:.3f}"
+                print(
+                    f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
+                    f"cmd={cmd_display} "
+                    f"cost={costs_log[-1]:.3f} goal_sim={goal_sim_str} d_goal={goal_str} "
+                    f"cov={cov_area:.2f}m^2 cov+={cov_delta:+.2f} "
+                    f"coll={collision_count} "
+                    f"mode={mode} {progress_str}"
+                )
 
             if reached:
                 terminate_reason = "goal_reached"
-                print(f"Step {step:03d} | REACHED {target_beacon.identity}")
+                print(f"Step {step:03d} | REACHED {target_beacon.identity if target_beacon else 'goal'}")
                 break
 
     finally:
@@ -1571,14 +2082,19 @@ def main():
         soft_coverage_gain_per_m = soft_coverage_area_m2 / path_length_m
 
     summary = {
-        "approach": "pure_world_model_terminal_cost",
-        "paper_section": "3.2",
+        "approach": "pure_world_model_perception_only",
         "seed": args.seed,
         "grid": f"{args.grid_rows}x{args.grid_cols}",
         "target": target_beacon.identity if target_beacon else None,
         "result": terminate_reason,
+        "oracle_goal_reached": oracle_goal_reached,
         "steps": len(cmds_log),
-        "collisions": collision_count,
+        "low_level_control_steps": len(cmds_log) * (
+            int(wm_meta["command_block_size"])
+            if wm_meta["command_representation"] == "active_block"
+            else max(1, args.macro_action_repeat)
+        ),
+        "oracle_collisions": collision_count,
         "first_collision_step": first_collision_step,
         "frame_substitutions": frame_substitution_count,
         "min_goal_dist_m": min_goal_dist_out,
@@ -1592,30 +2108,42 @@ def main():
             "cem_iters": args.cem_iters,
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
-            "score_space": args.score_space,
-            "novelty_weight": args.novelty_weight,
+            "macro_action_repeat": args.macro_action_repeat,
+            "latent_space": "proj",
+            "objective": "safety_plus_novelty",
+            "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
+            "world_model_cmd_dim": int(wm_meta["cmd_dim"]),
+            "world_model_command_representation": str(wm_meta["command_representation"]),
+            "world_model_command_block_size": int(wm_meta["command_block_size"]),
+            "world_model_command_latency": int(wm_meta["command_latency"]),
             "action_penalty_weight": args.action_penalty_weight,
-            "memory_type": "prototype_bank",
-            "visited_bank_size": args.visited_bank_size,
-            "prototype_sim_threshold": args.prototype_sim_threshold,
-            "stall_plateau_steps": args.stall_plateau_steps,
-            "subgoal_budget_steps": args.subgoal_budget_steps,
-            "subgoal_min_age_steps": args.subgoal_min_age_steps,
-            "subgoal_frontier_window_steps": args.subgoal_frontier_window_steps,
-            "subgoal_cooldown_steps": args.subgoal_cooldown_steps,
-            "visited_samples_seen": visited_seen,
-            "visited_insertions": visited_insertions,
-            "visited_replacements": visited_replacements,
-            "visited_hits": visited_hits_total,
-            "visited_bank_fill_step": visited_bank_fill_step,
-            "visited_bank_replacement_step": visited_bank_replacement_step,
-            "subgoal_activations": subgoal_activations,
-            "subgoal_steps_total": subgoal_steps_total,
-            "subgoal_last_activation_step": subgoal_last_activation_step,
-            "subgoal_last_target_idx": subgoal_last_target_idx,
+            "success_goal_sim_threshold": args.success_goal_sim_threshold,
+            "success_hold_steps": args.success_hold_steps,
+            "goal_activation_step": goal_activation_step,
+            "uses_safety_head": planner_heads.safety_head is not None,
+            "uses_goal_head": False,
+            "goal_head_present_ckpt": planner_heads.goal_head is not None,
+            "uses_exploration": planner_heads.exploration is not None,
+            "exploration_weight": planner_heads.exploration_weight,
+            "rnd_online_lr": args.rnd_online_lr,
+            "ignored_goal_weight_ckpt": planner_heads.goal_weight,
+            "ignored_recent_latent_window": args.recent_latent_window,
+            "ignored_revisit_penalty_weight": args.revisit_penalty_weight,
+            "ignored_forward_bonus_weight": args.forward_bonus_weight,
+            "ignored_forward_bonus_safety_threshold": args.forward_bonus_safety_threshold,
+            "ignored_current_safety_brake_threshold": args.current_safety_brake_threshold,
+            "ignored_unsafe_macro_action_repeat": args.unsafe_macro_action_repeat,
+            "ignored_goal_seek_sim_threshold": args.goal_direct_sim_threshold,
+            "ignored_goal_activation_hold_steps": args.goal_activation_hold_steps,
+            "ignores_progress_head_ckpt": scorer_meta.get("has_progress_head_ckpt", False),
+            "auto_scaled_defaults": getattr(args, "auto_scaled_defaults", {}),
+            "planner_heads": scorer_meta,
         },
         "coverage": coverage_metrics,
         "path_xy": path_xy,
+        "oracle_path_xy": oracle_path_xy,
+        "modes": mode_log,
+        "goal_similarity": goal_similarity_log,
         "commands": cmds_log,
         "costs": costs_log,
     }
@@ -1636,7 +2164,7 @@ def main():
 
     print("=" * 60)
     print(f"RESULT: {terminate_reason} | steps={len(cmds_log)} | "
-          f"collisions={collision_count} | time={elapsed:.1f}s")
+          f"oracle_collisions={collision_count} | time={elapsed:.1f}s")
     print(f"Output: {out_dir}")
     print("=" * 60)
 
