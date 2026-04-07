@@ -1065,23 +1065,37 @@ def estimate_current_safety_energy(
 
 
 @torch.no_grad()
-def teacher_forced_rollout_latent(
+def teacher_forced_rollout_latent_pair(
     world_model: LeWorldModel,
     z_start_raw: torch.Tensor,
     command: torch.Tensor,
-) -> torch.Tensor:
-    """Project one executed command into the rollout latent space."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return one-step predicted raw/projected latents for an executed command."""
     if command.ndim == 1:
         action_seq = command.unsqueeze(0).unsqueeze(0)
     elif command.ndim == 2:
         action_seq = command.unsqueeze(0)
     else:
         action_seq = command
-    z_pred_proj = world_model.plan_rollout(
+    action_seq = action_seq.to(z_start_raw.device)
+    z_pred_raw = world_model.plan_rollout_raw(z_start_raw, action_seq)
+    z_pred_proj = world_model.pred_projector.forward_seq(z_pred_raw)
+    return z_pred_raw[:, -1, :].detach(), z_pred_proj[:, -1, :].detach()
+
+
+@torch.no_grad()
+def teacher_forced_rollout_latent(
+    world_model: LeWorldModel,
+    z_start_raw: torch.Tensor,
+    command: torch.Tensor,
+) -> torch.Tensor:
+    """Project one executed command into the rollout latent space."""
+    _, z_pred_proj = teacher_forced_rollout_latent_pair(
+        world_model,
         z_start_raw,
-        action_seq.to(z_start_raw.device),
+        command,
     )
-    return z_pred_proj[:, -1, :].detach()
+    return z_pred_proj
 
 
 @torch.no_grad()
@@ -2327,20 +2341,41 @@ def main():
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
             cmd_display = format_command_for_log(cmd_vals, wm_meta)
             cmds_log.append(cmd_vals)
+            executed_rollout_raw = None
             executed_rollout_proj = None
             if (
-                args.exploration_bonus_mode == "visited_nn"
+                pending_plan_audit is not None
+                or args.exploration_bonus_mode == "visited_nn"
                 or (
                     args.rnd_online_lr > 0.0
                     and planner_heads.exploration is not None
                     and planner_heads.exploration_weight > 0.0
                 )
             ):
-                executed_rollout_proj = teacher_forced_rollout_latent(
+                executed_rollout_raw, executed_rollout_proj = teacher_forced_rollout_latent_pair(
                     world_model,
                     obs["z_raw"],
                     nominal_cmd.to(planning_device),
                 )
+            if (
+                args.exploration_bonus_mode == "visited_nn"
+                and executed_rollout_proj is None
+            ):
+                raise RuntimeError("visited_nn planning expected executed_rollout_proj to be available.")
+
+            if pending_plan_audit is not None and executed_rollout_raw is not None and executed_rollout_proj is not None:
+                pending_plan_audit["predicted_after_first_command"] = {
+                    "raw_norm": float(executed_rollout_raw.squeeze(0).norm().item()),
+                    "proj_norm": float(executed_rollout_proj.squeeze(0).norm().item()),
+                    "goal_similarity_proj": (
+                        None
+                        if z_breadcrumb_proj_ref is None
+                        else float(cosine_similarity_scalar(
+                            executed_rollout_proj.squeeze(0),
+                            z_breadcrumb_proj_ref,
+                        ))
+                    ),
+                }
 
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
@@ -2432,6 +2467,22 @@ def main():
                 start_state = pending_plan_audit["state_before"]
                 start_goal_dist = start_state["goal_dist_m"]
                 start_cov_area = start_state["coverage_area_m2"]
+                pred_raw = executed_rollout_raw.squeeze(0) if executed_rollout_raw is not None else None
+                pred_proj = executed_rollout_proj.squeeze(0) if executed_rollout_proj is not None else None
+                act_raw = obs["z_raw"].squeeze(0)
+                act_proj = obs["z_proj"].squeeze(0)
+                prediction_error = None
+                if pred_raw is not None and pred_proj is not None:
+                    raw_delta = pred_raw - act_raw
+                    proj_delta = pred_proj - act_proj
+                    prediction_error = {
+                        "raw_mse": float(raw_delta.square().mean().item()),
+                        "raw_l2": float(raw_delta.norm().item()),
+                        "raw_cosine": float(cosine_similarity_scalar(pred_raw, act_raw)),
+                        "proj_mse": float(proj_delta.square().mean().item()),
+                        "proj_l2": float(proj_delta.norm().item()),
+                        "proj_cosine": float(cosine_similarity_scalar(pred_proj, act_proj)),
+                    }
                 pending_plan_audit["actual_after_first_command"] = {
                     "pos_xy": [float(cur_xy[0]), float(cur_xy[1])],
                     "yaw_rad": float(obs["yaw_rad"]),
@@ -2463,6 +2514,8 @@ def main():
                     ),
                     "visited_bank_size_after": int(len(visited_rollout_bank)),
                 }
+                if prediction_error is not None:
+                    pending_plan_audit["prediction_error"] = prediction_error
                 plan_audit_records.append(pending_plan_audit)
                 pending_plan_audit = None
 
@@ -2584,6 +2637,54 @@ def main():
     soft_coverage_gain_per_m = None
     if soft_coverage_area_m2 is not None and path_length_m > 1e-6:
         soft_coverage_gain_per_m = soft_coverage_area_m2 / path_length_m
+    plan_audit_summary: dict[str, Any] | None = None
+    if plan_audit_records:
+        pred_error_records = [
+            rec["prediction_error"]
+            for rec in plan_audit_records
+            if "prediction_error" in rec
+        ]
+        collision_error_records = [
+            rec["prediction_error"]
+            for rec in plan_audit_records
+            if rec.get("actual_after_first_command", {}).get("collision")
+            and "prediction_error" in rec
+        ]
+        free_error_records = [
+            rec["prediction_error"]
+            for rec in plan_audit_records
+            if not rec.get("actual_after_first_command", {}).get("collision")
+            and "prediction_error" in rec
+        ]
+
+        def _mean_key(records: list[dict[str, float]], key: str) -> float | None:
+            if not records:
+                return None
+            return float(sum(float(rec[key]) for rec in records) / len(records))
+
+        plan_audit_summary = {
+            "records": len(plan_audit_records),
+            "prediction_error_mean": {
+                "raw_mse": _mean_key(pred_error_records, "raw_mse"),
+                "raw_l2": _mean_key(pred_error_records, "raw_l2"),
+                "raw_cosine": _mean_key(pred_error_records, "raw_cosine"),
+                "proj_mse": _mean_key(pred_error_records, "proj_mse"),
+                "proj_l2": _mean_key(pred_error_records, "proj_l2"),
+                "proj_cosine": _mean_key(pred_error_records, "proj_cosine"),
+            },
+            "prediction_error_collision": {
+                "count": len(collision_error_records),
+                "raw_mse": _mean_key(collision_error_records, "raw_mse"),
+                "proj_mse": _mean_key(collision_error_records, "proj_mse"),
+                "proj_cosine": _mean_key(collision_error_records, "proj_cosine"),
+            },
+            "prediction_error_noncollision": {
+                "count": len(free_error_records),
+                "raw_mse": _mean_key(free_error_records, "raw_mse"),
+                "proj_mse": _mean_key(free_error_records, "proj_mse"),
+                "proj_cosine": _mean_key(free_error_records, "proj_cosine"),
+            },
+        }
 
     summary = {
         "approach": "pure_world_model_perception_only",
@@ -2674,6 +2775,7 @@ def main():
             "enabled": bool(args.audit_plan),
             "records": len(plan_audit_records),
             "file": "plan_audit.jsonl" if plan_audit_records else None,
+            "summary": plan_audit_summary,
         },
     }
     with open(out_dir / "summary.json", "w") as f:
