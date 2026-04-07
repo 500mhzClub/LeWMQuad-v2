@@ -186,6 +186,8 @@ class PureCEMPlanner:
         terminal_displacement_weight: float = 0.0,
         exploration_safety_gate_threshold: float | None = None,
         exploration_safety_gate_sharpness: float = 5.0,
+        visited_rollout_bank: list[torch.Tensor] | None = None,
+        visited_rollout_knn_k: int = 8,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
@@ -232,11 +234,20 @@ class PureCEMPlanner:
 
             if (
                 heads is not None
-                and heads.exploration is not None
                 and heads.exploration_weight > 0.0
+                and (
+                    heads.exploration is not None
+                    or exploration_bonus_mode == "visited_nn"
+                )
             ):
                 n_cand, horizon, latent_dim = z_rollouts_proj.shape
-                if exploration_bonus_mode == "sum":
+                if exploration_bonus_mode == "visited_nn":
+                    bonus = visited_rollout_bank_novelty(
+                        z_rollouts_proj[:, -1, :],
+                        visited_rollout_bank,
+                        k=visited_rollout_knn_k,
+                    )
+                elif exploration_bonus_mode == "sum":
                     bonus = heads.exploration(
                         z_rollouts_proj.reshape(n_cand * horizon, latent_dim),
                     ).reshape(n_cand, horizon).sum(dim=-1)
@@ -351,8 +362,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exploration_weight", type=float, default=None,
                    help="Override learned RND exploration weight from the scorer checkpoint.")
     p.add_argument("--exploration_bonus_mode", type=str, default="terminal",
-                   choices=["sum", "terminal", "gain"],
-                   help="How to score learned novelty over predicted rollout latents.")
+                   choices=["sum", "terminal", "gain", "visited_nn"],
+                   help="How to score novelty over predicted rollout latents.")
     p.add_argument("--terminal_displacement_weight", type=float, default=0.0,
                    help="Optional bonus on predicted terminal latent displacement from the current observation.")
     p.add_argument("--exploration_safety_gate_threshold", type=float, default=None,
@@ -361,6 +372,8 @@ def parse_args() -> argparse.Namespace:
                    help="Sigmoid sharpness for the optional safety gate on the learned novelty bonus.")
     p.add_argument("--rnd_online_lr", type=float, default=1e-3,
                    help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
+    p.add_argument("--visited_nn_k", type=int, default=8,
+                   help="Average the k nearest rollout-bank distances when exploration_bonus_mode=visited_nn.")
     p.add_argument("--recent_latent_window", type=int, default=128,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--revisit_penalty_weight", type=float, default=0.35,
@@ -383,7 +396,7 @@ def parse_args() -> argparse.Namespace:
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--visited_bank_size", type=int, default=512,
-                   help="Prototype-bank capacity for novelty memory.")
+                   help="Capacity of the executed rollout-latent bank used by visited_nn novelty.")
     p.add_argument("--prototype_sim_threshold", type=float, default=0.995,
                    help="Add a new prototype only when cosine similarity to the nearest stored prototype is below this threshold.")
     p.add_argument("--keyframe_sim_threshold", type=float, default=0.985,
@@ -936,6 +949,31 @@ def teacher_forced_rollout_latent(
         action_seq.to(z_start_raw.device),
     )
     return z_pred_proj[:, -1, :].detach()
+
+
+@torch.no_grad()
+def visited_rollout_bank_novelty(
+    query_z: torch.Tensor,
+    visited_bank: list[torch.Tensor] | None,
+    k: int = 8,
+) -> torch.Tensor:
+    """Novelty from rollout-space distance to executed-trajectory memory.
+
+    Uses mean squared distance in projected latent space, averaged over the
+    k nearest visited rollout latents. This is a density score rather than a
+    per-state RND error, so slight view changes in the same local basin should
+    collapse as the bank fills in.
+    """
+    if not visited_bank:
+        return torch.zeros(query_z.shape[0], device=query_z.device, dtype=query_z.dtype)
+
+    bank = torch.stack(
+        [z.reshape(-1) for z in visited_bank],
+        dim=0,
+    ).to(device=query_z.device, dtype=query_z.dtype)
+    dists = (query_z.unsqueeze(1) - bank.unsqueeze(0)).square().mean(dim=-1)
+    k_eff = min(max(1, int(k)), int(bank.shape[0]))
+    return torch.topk(dists, k=k_eff, largest=False, dim=1).values.mean(dim=1)
 
 
 def choose_redundant_prototype(
@@ -1980,6 +2018,7 @@ def main():
         plan_seq: torch.Tensor | None = None
         plan_step_idx = 0
         plan_metrics_last: dict[str, float] = {}
+        visited_rollout_bank: list[torch.Tensor] = []
 
         obs = observe(
             physics_robot, physics_act_dofs,
@@ -2024,6 +2063,8 @@ def main():
                     terminal_displacement_weight=args.terminal_displacement_weight,
                     exploration_safety_gate_threshold=args.exploration_safety_gate_threshold,
                     exploration_safety_gate_sharpness=args.exploration_safety_gate_sharpness,
+                    visited_rollout_bank=visited_rollout_bank,
+                    visited_rollout_knn_k=args.visited_nn_k,
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
@@ -2033,13 +2074,16 @@ def main():
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
             cmd_display = format_command_for_log(cmd_vals, wm_meta)
             cmds_log.append(cmd_vals)
-            rnd_update_proj = None
+            executed_rollout_proj = None
             if (
-                args.rnd_online_lr > 0.0
-                and planner_heads.exploration is not None
-                and planner_heads.exploration_weight > 0.0
+                args.exploration_bonus_mode == "visited_nn"
+                or (
+                    args.rnd_online_lr > 0.0
+                    and planner_heads.exploration is not None
+                    and planner_heads.exploration_weight > 0.0
+                )
             ):
-                rnd_update_proj = teacher_forced_rollout_latent(
+                executed_rollout_proj = teacher_forced_rollout_latent(
                     world_model,
                     obs["z_raw"],
                     nominal_cmd.to(planning_device),
@@ -2086,11 +2130,22 @@ def main():
                 frame_substitution_count += 1
             else:
                 last_clean_frame = obs["frame_hwc"].copy()
-                if rnd_update_proj is not None:
+                if (
+                    executed_rollout_proj is not None
+                    and args.rnd_online_lr > 0.0
+                    and planner_heads.exploration is not None
+                    and planner_heads.exploration_weight > 0.0
+                    and args.exploration_bonus_mode != "visited_nn"
+                ):
                     planner_heads.exploration.online_update(
-                        rnd_update_proj,
+                        executed_rollout_proj,
                         lr=args.rnd_online_lr,
                     )
+
+            if executed_rollout_proj is not None and args.visited_bank_size > 0:
+                visited_rollout_bank.append(executed_rollout_proj.squeeze(0).detach().clone())
+                if len(visited_rollout_bank) > args.visited_bank_size:
+                    del visited_rollout_bank[0]
 
             tp_frame = render_third_person_frame(
                 physics_robot, physics_act_dofs,
@@ -2281,6 +2336,8 @@ def main():
             "uses_exploration": planner_heads.exploration is not None,
             "exploration_weight": planner_heads.exploration_weight,
             "exploration_bonus_mode": args.exploration_bonus_mode,
+            "visited_nn_k": args.visited_nn_k,
+            "visited_bank_size": args.visited_bank_size,
             "terminal_displacement_weight": args.terminal_displacement_weight,
             "exploration_safety_gate_threshold": args.exploration_safety_gate_threshold,
             "exploration_safety_gate_sharpness": args.exploration_safety_gate_sharpness,
