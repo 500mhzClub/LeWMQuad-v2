@@ -183,6 +183,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coverage_gain_batch_size", type=int, default=4096)
     p.add_argument("--coverage_gain_hops", type=int, default=5,
                    help="Number of future model steps in the rollout snippet scored by the coverage-gain head.")
+    p.add_argument("--coverage_gain_target_hops", type=int, default=20,
+                   help="Number of future model steps used to build the realized coverage-gain target.")
     p.add_argument("--coverage_gain_context_hops", type=int, default=10,
                    help="Number of recent model steps used to define already-visited local context for coverage-gain targets.")
     p.add_argument("--coverage_gain_radius_m", type=float, default=0.18,
@@ -1189,6 +1191,7 @@ def build_coverage_gain_pairs(
     rollout_obs_step: torch.Tensor,
     rollout_robot_xy: torch.Tensor,
     coverage_gain_hops: int,
+    coverage_gain_target_hops: int,
     coverage_gain_context_hops: int,
     temporal_stride: int,
     coverage_gain_radius_m: float,
@@ -1197,6 +1200,11 @@ def build_coverage_gain_pairs(
     """Build current-latent / rollout-snippet pairs with future coverage-gain targets."""
     if coverage_gain_hops <= 0:
         raise ValueError(f"coverage_gain_hops must be positive, got {coverage_gain_hops}")
+    if coverage_gain_target_hops < coverage_gain_hops:
+        raise ValueError(
+            "coverage_gain_target_hops must be >= coverage_gain_hops, got "
+            f"{coverage_gain_target_hops} < {coverage_gain_hops}",
+        )
     if coverage_gain_context_hops < 0:
         raise ValueError(
             f"coverage_gain_context_hops must be non-negative, got {coverage_gain_context_hops}",
@@ -1215,8 +1223,11 @@ def build_coverage_gain_pairs(
         if not fut_steps:
             continue
         for cur_step, (z_now, xy_now) in cur_steps.items():
-            future_steps = [cur_step + raw_stride * i for i in range(1, int(coverage_gain_hops) + 1)]
-            if any(step not in fut_steps for step in future_steps):
+            snippet_steps = [cur_step + raw_stride * i for i in range(1, int(coverage_gain_hops) + 1)]
+            target_steps = [cur_step + raw_stride * i for i in range(1, int(coverage_gain_target_hops) + 1)]
+            if any(step not in fut_steps for step in snippet_steps):
+                continue
+            if any(step not in fut_steps for step in target_steps):
                 continue
 
             context_steps = [cur_step]
@@ -1233,13 +1244,14 @@ def build_coverage_gain_pairs(
             if context_xy_seq.shape[0] == 0:
                 context_xy_seq = xy_now.view(1, 2).to(dtype=torch.float32)
 
-            future_pairs = [fut_steps[step] for step in future_steps]
+            snippet_pairs = [fut_steps[step] for step in snippet_steps]
+            target_pairs = [fut_steps[step] for step in target_steps]
             future_latents = torch.stack(
-                [z_future.to(dtype=torch.float32) for z_future, _xy in future_pairs],
+                [z_future.to(dtype=torch.float32) for z_future, _xy in snippet_pairs],
                 dim=0,
             )
             future_xy_seq = torch.stack(
-                [xy_future.to(dtype=torch.float32) for _z_future, xy_future in future_pairs],
+                [xy_future.to(dtype=torch.float32) for _z_future, xy_future in target_pairs],
                 dim=0,
             )
             gain_m2 = novel_path_area_gain_proxy(
@@ -1440,6 +1452,7 @@ def train_coverage_gain_head(
     print(
         f"  Pairs: {int(target_gain_pairs.numel()):,} | "
         f"hops={int(args.coverage_gain_hops)} | "
+        f"target_hops={int(args.coverage_gain_target_hops)} | "
         f"context={int(args.coverage_gain_context_hops)} | "
         f"target_mean={float(target_gain_pairs.mean().item()):.4f}m^2"
     )
@@ -2715,6 +2728,7 @@ def train(args):
                 rollout_obs_step_train,
                 rollout_robot_xy_train,
                 coverage_gain_hops=int(args.coverage_gain_hops),
+                coverage_gain_target_hops=int(args.coverage_gain_target_hops),
                 coverage_gain_context_hops=int(args.coverage_gain_context_hops),
                 temporal_stride=int(args.temporal_stride),
                 coverage_gain_radius_m=float(args.coverage_gain_radius_m),
@@ -2742,6 +2756,7 @@ def train(args):
                         rollout_obs_step_eval,
                         rollout_robot_xy_eval,
                         coverage_gain_hops=int(args.coverage_gain_hops),
+                        coverage_gain_target_hops=int(args.coverage_gain_target_hops),
                         coverage_gain_context_hops=int(args.coverage_gain_context_hops),
                         temporal_stride=int(args.temporal_stride),
                         coverage_gain_radius_m=float(args.coverage_gain_radius_m),
@@ -2778,6 +2793,7 @@ def train(args):
         "coverage_gain_weight": args.coverage_gain_weight,
         "displacement_hops": args.displacement_hops,
         "coverage_gain_hops": args.coverage_gain_hops,
+        "coverage_gain_target_hops": args.coverage_gain_target_hops,
         "coverage_gain_context_hops": args.coverage_gain_context_hops,
         "coverage_gain_radius_m": args.coverage_gain_radius_m,
         "latent_dim": args.latent_dim,
