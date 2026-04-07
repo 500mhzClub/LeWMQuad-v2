@@ -124,7 +124,7 @@ class SimConfig:
     min_z: float = 0.04
     max_tilt: float = 1.0
     collision_margin: float = 0.15
-    safe_clearance: float = 0.40
+    safe_clearance: float = 0.18
     # New: soft collision mode — don't always terminate on collision
     soft_collision_prob: float = 0.3   # probability of NOT terminating on collision
     near_miss_threshold: float = 0.20
