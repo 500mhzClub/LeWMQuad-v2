@@ -18,6 +18,7 @@ python3 scripts/6_infer_pure_wm.py \
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import os
@@ -714,6 +715,20 @@ def format_command_for_log(
         f"first=[{first_cmd[0]:+.2f}, {first_cmd[1]:+.2f}, {first_cmd[2]:+.2f}] "
         f"last=[{last_cmd[0]:+.2f}, {last_cmd[1]:+.2f}, {last_cmd[2]:+.2f}]"
     )
+
+
+def encode_nominal_command(
+    cmd_xyz: list[float] | tuple[float, float, float] | np.ndarray,
+    wm_meta: dict[str, Any],
+    device: torch.device,
+) -> torch.Tensor:
+    base = torch.tensor(cmd_xyz, device=device, dtype=torch.float32).flatten()
+    if base.numel() != 3:
+        raise ValueError(f"Expected 3 command values, got shape {tuple(base.shape)}")
+    if wm_meta.get("command_representation") != "active_block":
+        return base
+    block_size = int(wm_meta.get("command_block_size", 1))
+    return base.repeat(block_size)
 
 
 def load_planner_heads(
