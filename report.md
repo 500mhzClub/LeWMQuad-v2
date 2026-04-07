@@ -1,784 +1,1238 @@
-# Technical Report: Exploration / Planning Debugging on `LeWMQuad-v2`
+# Technical Report: First-Principles Failure Analysis of `LeWMQuad-v2`
 
 Date: 2026-04-07
 
 ## Scope
 
-This report summarizes the sequence of planner and scorer changes tried while debugging the persistent local-looping failure in `scripts/6_infer_pure_wm.py`.
+This report replaces the earlier narrow planner-debug writeup with a repo-wide
+re-evaluation from first principles.
 
-The core symptom was stable across many variants:
+The question is not only why `scripts/6_infer_pure_wm.py` looped locally, but
+why the full stack failed to produce a world-model-based exploration system
+that could generalize to new enclosed mazes at all.
 
-- the robot remained trapped in a small quadrant of the maze
-- it repeatedly executed slightly different local orbits
-- coverage improved only marginally
-- collision counts often remained high
+The analysis covers:
 
-The work fell into four phases:
+- training data generation
+- rendered dataset construction
+- world-model objective and deployment assumptions
+- planning-head supervision
+- inference-time planner design
+- the experiment sequence described in the previous report
 
-1. Fix obvious latent-space mismatches in the exploration signal.
-2. Replace RND-style novelty with visited-memory comparisons.
-3. Improve the visited-memory comparison with snippet and place-aware embeddings.
-4. Audit the planner to determine whether the remaining failure was due to bad heads, bad rollout prediction, or a flat objective.
+The main conclusion is stricter than the earlier report:
 
-The final conclusion is that the current scalar-head route is largely exhausted. The energy heads are accurate enough offline, but the planner still sees near-tied candidates inside a local basin and executes them into tiny wall-scraping motions. The remaining problem is not “novelty is broken” in the simple sense.
+- the final novelty and energy-head variants were not the primary root cause
+- the project failed because the full stack is structurally misaligned
+- the local-looping planner symptom is downstream of that larger mismatch
 
-## Experimental Setup
+## Executive Summary
 
-Most runs shared this base setup:
+The implementation failed for five main reasons.
 
-- World model: `lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt`
-- Command representation: `active_block`, `cmd_dim=15`
-- Temporal abstraction: `seq_len=4`, `stride=5`, `block=5`
-- Seed: `42`
+1. Training diversity was far too low relative to the claimed task.
+   The recommended pipeline collects only a few chunk seeds, and each chunk uses
+   one shared scene for all parallel environments. That yields many frames but
+   very few distinct geometries.
+
+2. Offline evaluation overstated progress.
+   The holdout split is by `(file, env)` episode id, not by scene seed or true
+   reset-separated episode, so train and eval still share obstacle layout and
+   beacon placement whenever they came from the same chunk.
+
+3. Several supervised heads are trained on targets contaminated by resets.
+   The advanced place, displacement, and coverage targets are built across
+   coarse per-env ids rather than true post-reset episodes, so some pairs can
+   cross teleports.
+
+4. The heads are evaluated on teacher-forced latent transitions but deployed on
+   open-loop autoregressive rollouts.
+   Good offline metrics on one-step predicted latents do not imply useful
+   ranking over multi-step planner candidates.
+
+5. Inference searches an unsupported action space from an underspecified state.
+   The planner samples arbitrary 15D command blocks over a long open-loop
+   horizon, while the dynamics model was trained on structured command data and
+   runtime planning starts from a single image latent with no latent history.
+
+The old report correctly identified that costs became nearly flat inside a
+local basin. It did not go far enough upstream. The flattened objective was a
+symptom of data, supervision, world-model deployment, and planner-search
+misalignment.
+
+## Intended Method
+
+The intended runtime idea is:
+
+- train a LeWorldModel on egocentric RGB and command blocks
+- train lightweight planning heads on frozen latents
+- plan in latent space with CEM
+- preserve pure-perception inference by avoiding online XY pose
+
+The recommended regime is:
+
+- `seq_len=4`
+- `temporal_stride=5`
+- `action_block_size=5`
+- `window_stride=5`
+- `command_representation=active_block`
+- no proprio in the encoder
+- planner horizon in model steps
 - `macro_action_repeat=5`
-- `plan_horizon=5`
 - `mpc_execute=5`
-- `cem_iters=10`
-- Safety mode: `consequence`
 
-Unless noted otherwise, all online inference remained latent-only at runtime. Some later heads used privileged XY pose offline for supervision during training.
+In principle this can work only if all of the following are true:
 
-## Code Changes Implemented
+- the world model sees enough scene diversity to learn reusable geometry
+- the latent state is sufficiently Markov for control
+- the planning heads are trained on the same rollout distribution used online
+- the planner searches only over action sequences supported by the data
+- the evaluation actually measures generalization to unseen mazes
 
-The following code paths were extended during this investigation:
+This repo does not satisfy those conditions.
 
-- `scripts/6_infer_pure_wm.py`
-  - fixed exploration-space mismatch bugs
-  - added `visited_nn` novelty
-  - added margin, tail-window, revisit penalty, and safety gate variants
-  - added snippet-level nearest-neighbor novelty
-  - added place-head and displacement-head loading/inference
-  - added planner auditing and predicted-vs-actual latent error logging
-- `scripts/4_train_energy_head.py`
-  - added rollout-space exploration training
-  - added place-head training
-  - fixed place-head triplet construction bug
-  - added raw-pose joins for pose-supervised place training
-  - added held-out evaluation for safety and place
-  - added displacement-head training and held-out evaluation
-- `lewm/models/energy_head.py`
-  - added `PlaceSnippetHead`
-  - added `DisplacementHead`
+## Repo-Wide Findings
 
-## Chronology of What Was Tried
+### 1. Training diversity is too low for the task
 
-### 1. Consequence safety + RND gain after latent-space alignment
+The README still presents the training pipeline as:
 
-#### Why
+```bash
+python3 scripts/1_physics_rollout.py --ckpt <ppo_ckpt> --steps 1000 --chunks 5
+```
 
-The first hypothesis was that novelty was failing because online RND updates were being applied in encoder observation space while planning and the retrained exploration head operated in rollout projected latent space.
+That is the first major failure point.
 
-#### Change
+Each chunk generates one scene and then rolls out all environments inside that
+shared scene. In other words:
 
-Online RND updates were changed to use the teacher-forced predicted latent for the executed command instead of the encoder-view observation latent.
+- many environments
+- many timesteps
+- very few unique obstacle layouts
 
-#### Result
+This is acceptable if the task is short-horizon local prediction inside a small
+scene family. It is not acceptable if the deployment target is generalization to
+new fully enclosed mazes with unseen topology.
 
-Run: `perception_only_stride5_block15_vision_s42_gain_rolloutv6_consequence_gainfix`
+The relevant implementation details are:
 
-- Coverage: `1.513 m^2`
-- Path length: `19.81 m`
-- Console collision count: `201`
-- Qualitative result: still trapped in the same quadrant and looping
+- `scripts/1_physics_rollout.py` generates one scene per chunk seed
+- all envs in that chunk share that obstacle and beacon layout
+- the README still documents a very small number of chunks
 
-Interpretation:
+The result is a dataset with high frame count and low scene entropy.
 
-- safety improved relative to more naive variants
-- the latent-space consistency bug was real
-- but fixing it did not solve the local-looping failure
+This is the most important first-principles problem in the repo.
 
-### 2. Full rollout-space RND update path
+### 2. The deployed inference task is harder than the training task
 
-#### Why
+Training scenes are generated by `generate_scene`, which mostly samples:
 
-After the first alignment fix, the remaining concern was that “memory” might still be tied to the wrong latent source or otherwise still be too weakly aligned with planning.
+- composite local maze fragments
+- added free obstacles
+- occasional free-obstacle scenes
 
-#### Change
+Inference does not use that distribution. It uses `generate_enclosed_maze`,
+which creates a fully enclosed recursive-backtracking grid maze with:
 
-The executed novelty update path was made consistently rollout-space / teacher-forced.
+- one globally connected topology
+- long corridors
+- dead ends
+- beacon placement at distant dead-end cells
 
-#### Result
+That is not just a local obstacle-avoidance problem. It is a long-horizon
+topological exploration problem.
 
-Run: `perception_only_stride5_block15_vision_s42_gain_rolloutv6_consequence_gainfix_rndrollout`
+So even if the world model learned short-horizon wall-contact dynamics well, the
+online task still requires a sequence-level escape and corridor commitment
+signal that the training task never demanded strongly enough.
 
-- Coverage: `1.761 m^2`
-- Path length: `15.10 m`
-- Console collision count: `339`
-- Qualitative result: still circling in the same basin
+### 3. Offline evaluation is scene-leaky
 
-Interpretation:
+The prior report treated strong held-out safety and place metrics as evidence
+that the heads were "good enough" offline. That claim is too strong.
 
-- this confirmed that plain RND error was the wrong comparison
-- it was still rewarding local latent/view variation instead of true escape
+The split is performed over `episode_id`, but `episode_id` is assigned once per
+`(file, env)` pair in `StreamingJEPADataset`. It is not assigned per reset-
+separated episode and it is not assigned per scene seed.
 
-### 3. Replace RND gain with nearest-neighbor visited-bank novelty
+That means:
 
-#### Why
+- all envs within one chunk still share the same geometry
+- train and eval can both contain different env streams from the same chunk
+- holdout metrics can remain high while real scene generalization is poor
 
-At this point the diagnosis was:
+This specifically weakens the report's conclusion that bad heads were mostly
+ruled out.
 
-- RND gain was not asking “have I been here before?”
-- it was only asking “does this endpoint still confuse the predictor?”
+What was actually ruled out is weaker:
 
-#### Change
+- the heads can fit cached latent-label relations within a scene-sharing split
+- the heads can look good on teacher-forced latent banks from that same regime
 
-Added `visited_nn`:
+That is not equivalent to:
 
-- maintain a bank of executed rollout latents
-- score candidate terminal states by k-NN distance to that bank
+- the heads rank open-loop candidate rollouts correctly in unseen mazes
 
-#### Result
+### 4. Reset contamination affects advanced supervision
 
-Run: `perception_only_stride5_block15_vision_s42_visitednn_k8`
+The world-model training path deliberately allows collisions and masks only
+`done` transitions. That part is reasonable.
 
-- Coverage: `0.840 m^2`
-- Path length: `6.57 m`
-- Console collision count: `729`
-- Qualitative result: no large retread loop, but severe corner-farming / getting stuck
+The deeper issue is that head training and pair-building reuse coarse per-env
+ids and raw-step arithmetic without explicitly segmenting resets into true
+episodes.
 
-Interpretation:
+As a result:
 
-- the failure mode changed
-- novelty stopped paying for large retracing loops
-- but the planner still found local latent variation inside a corner and got trapped there
+- displacement targets can pair pre-reset encoder states with post-reset future
+  rollout states if the raw step numbers line up
+- coverage-gain targets can do the same
+- place supervision built from cached rollout snippets can also inherit
+  cross-reset contamination
 
-### 4. Margin threshold + tail-window persistence
+This matters because the advanced heads are supposed to solve the exact failure
+mode the scalar heads could not solve. If those targets are partially polluted
+by teleports, their reported offline quality is less meaningful than it looks.
 
-#### Why
+### 5. Teacher forcing and open-loop planning are conflated
 
-The `visited_nn` score was still rewarding small local differences. The next hypothesis was that repeated corner behavior sat below a stable novelty scale and could be zeroed out with a margin. Also, requiring persistence across multiple rollout tail states might suppress endpoint blips.
+The latent cache used for safety and exploration heads is explicitly teacher
+forced:
 
-#### Change
+- encode the real observation sequence
+- run `predictor(z_t, cmd_t)` on those real observation latents
+- align the resulting rollout-view latent to the real next-frame labels
 
-Added:
+That is a sensible training probe.
 
-- `visited_nn_margin`
-- `visited_nn_tail_steps`
+But online planning does not rank one-step teacher-forced predictions. It ranks
+multi-step autoregressive rollouts from self-generated latent states.
 
-Novelty was computed over the rollout tail rather than just the final state.
+Those are different distributions:
 
-#### Result
+- offline head training sees one-step predicted latents conditioned on real
+  history
+- online planning sees multi-step predicted latents conditioned on previous
+  predicted latents
 
-Run: `perception_only_stride5_block15_vision_s42_visitednn_k8_m015_t3`
+The report correctly added audits for predicted-vs-actual error, but those
+audits only checked the first executed command, not the full open-loop horizon
+that determines candidate ranking.
 
-- Coverage: `1.659 m^2`
-- Path length: `14.01 m`
-- Console collision count: `428`
-- Qualitative result: novelty farming decreased, exploration improved, but looping persisted
+So the existing evidence does not actually clear the world model or head stack
+for multi-step planning.
 
-Interpretation:
+### 6. Runtime state is underspecified
 
-- this was a real improvement
-- late repeated basin states often got `x = 0`
-- however, once novelty shut off, the planner simply reverted to a local “safe” orbit
+Inference calls `observe(...)`, renders one frame, and encodes that single
+frame into `z_raw` and `z_proj`.
 
-### 5. Safety gate on exploration bonus
+Planning then starts from that one latent.
 
-#### Why
+This is a serious mismatch with the training setup:
 
-Some novelty bursts were clearly unsafe. The next idea was to suppress exploration where predicted safety was too poor.
+- the predictor is trained on sequences up to length 4
+- the robot is a contact-rich system with delayed action consequences
+- egocentric RGB alone is not fully Markov near walls and corners
 
-#### Change
+Removing both:
 
-Added a sigmoid safety gate on the exploration bonus:
+- latent history
+- proprio
 
-- threshold `0.18`
-- sharpness `12.0`
+turns the planning state into a partially observable proxy that cannot reliably
+distinguish:
 
-#### Result
+- facing a dead end
+- being slightly offset in a corridor
+- being locally stuck while still seeing small visual changes
 
-Run: `perception_only_stride5_block15_vision_s42_visitednn_k8_m015_t3_gate018_k12`
+The old report described low-motion local orbits. That is exactly the behavior
+expected when planning from an aliased state.
 
-- Coverage: `1.294 m^2`
-- Path length: `18.17 m`
-- Console collision count: `275`
-- Qualitative result: safer, but still looped locally
+### 7. The planner searches the wrong action space
 
-Interpretation:
+This is one of the strongest structural mismatches in the repo.
 
-- reduced collisions substantially
-- did not create a real escape mechanism
+The world model is trained on command blocks reconstructed from logged policy
+inputs. Those commands come from:
 
-### 6. Explicit revisit penalty
+- smooth OU exploration
+- long structured segments like retreat, recovery, spin, and wall-follow
 
-#### Why
+At inference, `PureCEMPlanner` does not search over those supported motion
+primitives. It samples arbitrary continuous command vectors with Gaussian noise.
 
-If novelty had shut off, repeated local states were receiving no positive reward, but also no explicit “do not stay here” pressure beyond a nearly flat safety term.
+In the recommended `active_block` setup, one model action is a flattened `5 x 3`
+block, and planning uses:
 
-#### Change
+- horizon 5
+- command dim 15
+- total open-loop search dimension 75
 
-Added a signed revisit penalty below the visited margin.
+That means the planner is optimizing over a large unconstrained command space
+that the frozen PPO-conditioned world model never saw densely in data.
 
-#### Result
+The likely result is exactly what was observed:
 
-Run: `perception_only_stride5_block15_vision_s42_visitednn_k8_m015_t3_r8_gate018_k12`
+- many candidates are behaviorally near-equivalent after being filtered through
+  the low-level controller
+- commanded differences collapse into tiny physical displacements
+- top candidates become nearly tied
 
-- Coverage: `1.466 m^2`
-- Path length: `15.64 m`
-- Console collision count: `216`
-- Qualitative result: best safety so far among the `visited_nn` family, but still trapped in the same broad basin
+This is not just a weak-head problem. It is an action-prior problem.
 
-Interpretation:
+### 8. `mpc_execute=5` makes the deployment even more open-loop
 
-- revisit penalties helped safety
-- but once all candidates in the basin had similar revisit penalties, the term became nearly a constant offset and stopped affecting ranking
+The recommended runtime executes five model steps before replanning.
 
-### 7. Snippet-level rather than state-level nearest-neighbor novelty
+That means the planner:
 
-#### Why
+- optimizes a long open-loop sequence
+- commits to all five macro steps
+- replans only after substantial latent-model drift could already have
+  accumulated
 
-Even the tail-window version was still comparing individual states unless the snippet representation itself was changed. The next hypothesis was that a multi-step snippet metric might better capture “same place / same basin” than state k-NN.
+The report observed that longer-horizon tests felt more OOD, but the same issue
+already exists in the recommended configuration. Even if only the first command
+was audited for prediction error, the planner ranking itself is based on the
+full rollout.
 
-#### Change
+For a collision-rich navigation task, that is too optimistic a deployment
+assumption.
 
-When `visited_nn_tail_steps > 1`, the planner compared rollout snippets against executed snippets, not just isolated tail states.
+### 9. The current scalar objectives are not aligned with escape
 
-#### Result
+The previous report was correct here.
 
-Run: `perception_only_stride5_block15_vision_s42_visitednn_snippet_k8_m015_t3_r8_gate018_k12`
-
-- Coverage: `1.484 m^2`
-- Path length: `18.37 m`
-- Console collision count: `171`
-- Qualitative result: modest improvement again, but still strong local looping
-
-Interpretation:
-
-- snippet comparison was directionally better
-- but raw latent MSE in snippet space was still not sufficiently place-aware
-
-### 8. First learned place-head attempt (temporal proxy)
-
-#### Why
-
-The raw latent/snippet geometry was clearly not enough. The next step was a learned place/snippet embedding head trained from rollout snippets.
-
-#### Initial issue
-
-The first implementation had a bug:
-
-- `place_positive_radius` and `place_negative_gap` were compared against raw `obs_step`
-- snippet starts were spaced by `temporal_stride=5`
-- this produced zero valid positive triplets
-
-Symptom:
-
-- place loss stayed exactly `0.0`
-
-#### Fix
-
-The trainer was patched to interpret radii in snippet-start units and fail loudly if no valid triplets were built.
-
-#### Result after fix
-
-Temporal-proxy place-head training became valid, but online behavior still failed to escape.
-
-Key runtime example:
-
-Run: `perception_only_stride5_block15_vision_s42_visitednn_place_fix_bankfix`
-
-- Coverage: `1.294 m^2`
-- Path length: `15.47 m`
-- Console collision count: `422`
-- Qualitative result: revisit penalty stayed near constant and the system still looped
-
-Interpretation:
-
-- the temporal-proxy place head was not enough
-- stronger supervision was needed
-
-### 9. Pose-supervised place head
-
-#### Why
-
-The next move was to stop relying on temporal overlap as a proxy and supervise the place head with true same-episode XY proximity, while still keeping latent-only inference.
-
-#### Change
-
-Joined rendered HDF5 chunks with raw rollout chunks so pose labels from `jepa_raw_data_v3` could supervise the place head.
-
-#### Held-out metrics
-
-From `rolloutv8_place_pose` training:
-
-- Held-out safety:
-  - `rmse=0.1850`
-  - `mae=0.0986`
-  - `pearson=0.808`
-  - `collision_auc=0.908`
-  - `pred(coll)=0.569`
-  - `pred(no-coll)=0.076`
-- Held-out place:
-  - `queries=4096`
-  - `R@1=0.974`
-  - `R@5=0.999`
-  - `d_pos=0.053`
-  - `d_neg=0.516`
-
-These are strong offline metrics.
-
-#### Runtime result
-
-Run: `perception_only_stride5_block15_vision_s42_visitednn_place_pose`
-
-- Coverage: `1.39 m^2`
-- Path length from summary not captured separately in this report
-- Console collision count: `333`
-- Qualitative result: still looping
-
-Interpretation:
-
-- the place head was not the main bottleneck anymore
-- despite strong held-out retrieval, the planner still failed online
-
-### 10. Myopia / longer-horizon test
-
-#### Why
-
-One possibility was that the planner simply did not see far enough ahead to commit to temporarily worse sequences that would eventually escape the basin.
-
-#### Change
-
-A much less myopic configuration was tried:
-
-- larger horizon
-- smaller `mpc_execute`
-- more CEM iterations
-
-#### Result
-
-This was much slower and appeared further outside the world model’s training regime. Early metrics were poor, so this line was not pursued further.
-
-Interpretation:
-
-- even if myopia contributes, the chosen ablation was too expensive and likely too OOD to be the main path forward
-
-### 11. Planner audit without prediction-error logging
-
-#### Why
-
-At this point the question was no longer “which novelty head is best?” It was:
-
-- are the top-ranked candidates meaningfully different?
-- is the planner picking a clearly better option that reality then invalidates?
-- or are all candidates nearly tied inside the basin?
-
-#### Change
-
-Added `--audit_plan` to log:
-
-- state before replan
-- selected plan
-- final-iteration top-K candidates
-- actual post-execution outcome after the first command
-
-#### Result
-
-Run: `perception_only_stride5_block15_vision_s42_visitednn_place_pose_audit`
-
-Summary derived from `plan_audit.jsonl`:
-
-- mean top-5 cost spread: `0.010997`
-- mean top-5 safety spread: `0.011369`
-- mean top-5 revisit spread: `0.000106`
-- mean actual first-step displacement: `0.01094 m`
-- mean coverage gain per replan: `0.000562 m^2`
-- collision rate: `0.80`
-
-Interpretation:
-
-- inside the basin, the planner sees near-tied candidates
-- revisit penalty is effectively constant across top-K
-- actual executed motion is tiny
-- the planner is not meaningfully separating “good escape” from “local scrape” candidates
-
-### 12. Predicted-vs-actual latent error audit
-
-#### Why
-
-The next question was whether rollout prediction itself collapsed near collisions. If collision steps were much harder to predict, the world model could still be the primary bottleneck.
-
-#### Change
-
-Added predicted-vs-actual latent error logging:
-
-- raw MSE / L2 / cosine
-- projected MSE / L2 / cosine
-- reported separately for collision and non-collision audited steps
-
-#### Result
-
-Run: `perception_only_stride5_block15_vision_s42_visitednn_place_pose_audit_prederr`
-
-Prediction error summary:
-
-- Mean projected prediction error:
-  - `proj_mse=0.1700`
-  - `proj_cosine=0.898`
-- Collision steps:
-  - `count=32`
-  - `proj_mse=0.1699`
-  - `proj_cosine=0.894`
-- Non-collision steps:
-  - `count=8`
-  - `proj_mse=0.1706`
-  - `proj_cosine=0.914`
-
-Interpretation:
-
-- collision prediction error was not meaningfully worse than non-collision prediction error
-- this argues against a simple “rollout model catastrophically fails only at contact” explanation
-
-### 13. Pose-supervised displacement head
-
-#### Why
-
-Since novelty saturated and revisit became almost constant inside a basin, the next idea was to add a non-heuristic positive motion term: predict actual XY displacement over a short future horizon from latents, then reward plans that are predicted to move.
-
-#### Change
-
-Added `DisplacementHead`:
-
-- trained from true pose-supervised XY deltas
-- latent-only at inference
-
-#### Held-out metrics
-
-From `rolloutv9_disp` training:
-
-- Held-out safety:
-  - `rmse=0.1850`
-  - `mae=0.0993`
-  - `pearson=0.808`
-  - `collision_auc=0.909`
-- Held-out place:
-  - `R@1=0.973`
-  - `R@5=0.998`
-  - `d_pos=0.053`
-  - `d_neg=0.518`
-- Held-out displacement:
-  - `n=18738`
-  - `rmse=0.0451 m`
-  - `mae=0.0381 m`
-  - `pearson=0.401`
-  - `pred mean=0.066 m`
-  - `target mean=0.068 m`
-
-Interpretation:
-
-- the displacement head learned the scale reasonably well
-- but its ranking power was only moderate
-
-### 14. Displacement-head online audit
-
-#### Why
-
-Before integrating displacement strongly into planning, it was necessary to check whether it actually separated top-K candidates inside the local basin.
-
-#### Result
-
-Run: `perception_only_stride5_block15_vision_s42_disp_audit`
-
-Audit-derived statistics:
-
-- mean selected predicted displacement: `0.05525 m`
-- mean actual first-step displacement: `0.01565 m`
-- correlation predicted vs actual displacement: `0.3746`
-- mean top-5 predicted-displacement spread: `0.000460 m`
-- mean top-5 cost spread: `0.01576`
-- mean top-5 safety spread: `0.01630`
-- mean top-5 revisit spread: `0.000140`
-- mean coverage gain per replan: `0.00194 m^2`
-- collision rate: `0.425`
-
-Interpretation:
-
-- the displacement head is somewhat informative offline
-- but inside the top-5 candidate set it is almost constant
-- a reasonable planner weight will not materially change ranking
-- using a very large weight to force an effect would likely be unstable and not principled
-
-### 15. Sequence-level coverage-gain head
-
-#### Why
-
-After the audits, the working hypothesis was:
-
-- local scalar terms were too flat inside the basin
-- the planner needed a sequence-level value target
-- the target should reward realized future escape or coverage gain, not endpoint novelty
-
-The first implementation attempted the more informative of the two continuous variants:
-
-- input: current encoder latent plus a short future rollout snippet
-- target: realized future local coverage gain computed from pose-supervised XY paths
-
-The intent was to keep inference latent-only while using pose only offline for supervision.
-
-#### Change
-
-Implemented `CoverageGainHead` and added:
-
-- training-time pair construction from:
-  - current encoder latent
-  - rollout snippet of `coverage_gain_hops`
-- a pose-supervised local coverage-gain proxy target
-- held-out evaluation
-- checkpoint save/load and optional planner weight
-
-Two versions of the target were tried:
-
-1. `rolloutv10_covgain`
-   - target window matched the snippet horizon
-2. `rolloutv10_covgain_v2`
-   - target window extended to `coverage_gain_target_hops=20`
-   - intended to capture delayed realized gain rather than immediate local novelty
-
-#### Result
-
-Both versions collapsed.
-
-`rolloutv10_covgain`:
-
-- training target mean: `0.0000 m²`
-- held-out:
-  - `rmse=0.0037 m²`
-  - `mae=0.0037 m²`
-  - `pearson=nan`
-  - `pred=0.0037 m²`
-  - `target=0.0000 m²`
-
-`rolloutv10_covgain_v2`:
-
-- pairs: `146,187`
-- training target mean: `0.0000 m²`
-- held-out:
-  - `n=16,203`
-  - `rmse=0.0037 m²`
-  - `mae=0.0037 m²`
-  - `pearson=nan`
-  - `pred=0.0037 m²`
-  - `target=0.0000 m²`
-
-No inference run was performed from these checkpoints because the target itself was degenerate.
-
-#### Interpretation
-
-This is not a model-capacity failure. It is a target-construction failure.
-
-The pose-based local coverage-gain proxy was effectively zero on almost all training/eval pairs under this cached stride/block regime. So the head simply learned a tiny constant output.
-
-Most likely causes:
-
-- the recent-context suppression radius was too aggressive relative to the actual path geometry
-- the paired windows were too local and overlapping
-- the realized future path rarely produced nonzero local gain under this proxy, even over a longer target horizon
-
-The important conclusion is not just that this head failed, but why:
-
-- the sequence-level direction was correct
-- continuous local coverage-gain regression, as currently defined, was not a viable target on this dataset/cache
-
-## What We Learned
-
-### 1. The energy heads are not the main bottleneck anymore
-
-The held-out metrics are strong enough that “bad heads” is no longer the primary explanation.
-
-The strongest evidence:
-
-- safety `collision_auc ≈ 0.91`
-- place `R@1 ≈ 0.97`, `R@5 ≈ 1.0`
-
-This is much stronger than the online behavior would suggest.
-
-### 2. The problem is now planner ranking inside a local basin
-
-Across the audits:
-
-- top-K cost spread is tiny
-- top-K safety spread is tiny
-- top-K revisit spread is effectively zero
-- top-K predicted-displacement spread is also effectively zero
-
-Inside the local loop, all candidates are nearly tied.
-
-### 3. Revisit penalties became constant offsets
-
-The revisit mechanism was useful for suppressing large retreading and some novelty farming, but once the robot was inside a basin:
-
-- `x` went to zero
-- `r` stayed nearly constant across candidates
-
-At that point the revisit term no longer changes the argmin and does not help escape.
-
-### 4. Runtime behavior is low-motion even when commands differ
-
-The planner produces different command sequences, but actual executed first-step motion remains small:
-
-- around `1.1 cm` in the place-audit run
-- around `1.6 cm` in the displacement-audit run
-
-This means the planner-world-model-policy stack near contacts is effectively low-motion and locally self-consistent enough to keep orbiting.
-
-### 5. Prediction error is not obviously worse on collisions
-
-The collision vs non-collision prediction-error audit does not show a sharp collapse near contact.
-
-That does not prove the rollout model is “good enough” in all relevant senses, but it does mean the failure is not simply explained by a special collision-prediction breakdown.
-
-## Pure-Perception Status
-
-The project crossed two different purity boundaries:
-
-### Runtime inference purity
-
-`rolloutv8_place_pose` and `rolloutv9_disp` still preserve pure-perception inference in the narrow runtime sense:
-
-- at inference time the planner uses only image-derived latents and learned heads
-- it does not use live XY pose
-
-### Training-time purity
-
-These same runs are no longer pure-perception in the stricter method-level sense because offline supervision used privileged pose:
-
-- place head: `pose_xy_same_episode`
-- displacement head: `pose_xy_delta_same_episode`
-
-An explicit frontier-map planner would also break pure-perception at inference because it would require online XY state.
-
-## Why Frontier Routing Was Not Pursued
-
-An explicit frontier-map route was considered because it is likely to work better as an exploration objective than scalar novelty. However, it was not the right next step here because:
-
-- it would require online XY pose
-- that breaks pure-perception inference
-- it moves the system into an explicit navigation heuristic/controller regime
-
-Given the user’s constraint and the desire to avoid “heuristic hell,” this path was not advanced as the main recommendation.
-
-## Recommended Next Steps
-
-### Primary recommendation: train a binary sequence-level escape head
-
-The current heads are all local scalar terms:
+The experimented objectives mostly score:
 
 - per-state safety
-- per-state or per-snippet novelty
-- per-plan endpoint displacement
+- per-state or tail novelty
+- per-terminal displacement
+- optional heuristic revisit penalties
 
-The observed failure is sequence-level:
+But the failure mode is inherently sequence-level:
 
-- the planner needs a signal for “this whole candidate rollout will actually get me out of the basin”
-- not “this endpoint is a bit novel” or “this endpoint might move slightly”
+- a useful escape maneuver may look temporarily worse
+- leaving a basin may require committing to a corridor before reward appears
+- candidate endpoints can remain locally similar while only a full rollout
+  pattern reveals escape
 
-The coverage-gain head has now been tried and failed because the current continuous local gain target collapses to almost all zeros. The next clean experiment is therefore:
+So the report was right that more RND tuning and more kNN margin tuning were
+unlikely to solve the problem.
 
-1. Train an `EscapeHead`.
-   - Inputs:
-     - current latent
-     - candidate rollout snippet or rollout tail
-   - Targets:
-     - binary escape label such as “did this sequence leave the current local basin?”
-   - Use pose only offline to build the labels.
+Where the report was incomplete is that this misalignment sits on top of the
+larger data and deployment mismatches above.
 
-2. Evaluate it on held-out data before using it online.
-   - Report:
-     - AUC
-     - precision/recall
-     - ranking quality among candidates from the same local state
+## Re-Assessment of the Previous Experiments
 
-3. Add it to `6_infer_pure_wm.py` in audit-only mode first.
-   - score the top-K planner candidates
-   - check whether it meaningfully spreads candidates inside the currently observed basin
+### Latent-space alignment fixes
 
-4. Only integrate it into the planner if it clearly separates top-K candidates.
-   - start with a small weight
-   - keep the strong safety head in the loop
+Those fixes were valid and worth doing.
 
-### Secondary recommendation: stop investing in more RND / visited-NN / displacement tuning
+The report correctly identified an exploration-space mismatch between:
 
-These branches have been tested thoroughly enough to support a stop decision:
+- encoder-view observation latents
+- rollout projected latents used by the planner
 
-- plain RND gain
-- rollout-space RND updates
-- visited-bank nearest neighbors
-- margin thresholds
-- tail-step novelty
-- safety gates
-- revisit penalties
-- snippet k-NN
-- place-aware snippet k-NN
-- displacement-head reward
+Fixing that removed an obvious bug.
 
-All of them changed behavior, but none solved the core escape failure.
+It did not solve the problem because the deeper issue was not just which latent
+space novelty was computed in.
 
-### What not to do next
+### RND and visited-memory experiments
 
-The following are not recommended as the next main line of work:
+These experiments showed something useful:
+
+- plain RND rewards predictor confusion, not revisitation
+- nearest-neighbor memory changes behavior
+- snippet-level comparisons are better than isolated endpoint novelty
+
+That is all credible.
+
+But the experiments were still trying to repair the task with local scalar
+signals inside a planning stack that was already searching unsupported action
+sequences from aliased state.
+
+So the negative result is not surprising.
+
+### Place-head experiments
+
+The place-head story has two parts.
+
+The bug fix was real:
+
+- the first implementation built no valid positives
+- the trainer had to be patched
+
+The pose-supervised version then achieved very strong retrieval numbers.
+
+However, those results should not be over-read because:
+
+- the split is scene-leaky
+- the latent bank is teacher-forced
+- the online problem is open-loop candidate ranking in unseen mazes
+
+So the correct conclusion is not "place is solved." The correct conclusion is:
+
+- place supervision improved the metric space
+- but that metric space still did not solve the deployment problem
+
+### Displacement-head experiments
+
+The displacement head also taught the right lesson.
+
+It learned a rough scale of motion offline, but online:
+
+- top candidate spread was tiny
+- predicted motion correlated only weakly with actual motion
+- selected plans still produced low displacement
+
+That strongly suggests the planner is operating in a regime where:
+
+- candidate commands differ numerically
+- the closed-loop PPO and the environment map many of them to similar motion
+
+Again, that is more consistent with action-space mismatch than with a simple
+"need a better displacement weight" story.
+
+### Coverage-gain head experiments
+
+The prior report interpreted these as target collapse, and that part is correct.
+
+The coverage-gain proxy produced almost all zeros under the cached regime.
+
+That indicates one or more of:
+
+- the target definition was too local
+- the context suppression radius was too aggressive
+- the target windows were too overlapping
+- the underlying data did not contain enough meaningful escape trajectories
+
+The last point is especially important. A sequence-level target can only succeed
+if the dataset actually contains many examples of successful sequence-level
+escape.
+
+This repo does not establish that.
+
+## Why the System Looked Locally Self-Consistent Online
+
+The report documented a strong symptom:
+
+- top candidate cost spread was tiny
+- actual displacement per executed step was tiny
+- prediction error on audited first steps did not explode
+
+That is exactly what should happen when all of the following hold:
+
+- the planner samples many unsupported but behaviorally similar command blocks
+- the low-level policy collapses them into similar motions
+- the latent state is aliased
+- the objective is local
+- the environment is topologically hard
+
+In that regime, the planner can be internally self-consistent and still fail.
+
+That is why the old report's final symptom diagnosis was directionally right:
+
+- the planner cannot separate good escape candidates from local scrapes
+
+But the deeper reason is not simply that the scalar heads were exhausted.
+
+It is that the entire training and deployment setup made that failure likely.
+
+## Final Root-Cause Hierarchy
+
+Ordered from most fundamental to least fundamental:
+
+1. Insufficient scene diversity.
+2. Training/deployment task mismatch between local training scenes and enclosed
+   inference mazes.
+3. Scene-leaky evaluation protocol.
+4. Reset-contaminated supervision for advanced heads.
+5. Teacher-forced head training used as a proxy for open-loop planner quality.
+6. Single-frame pure-vision state aliasing.
+7. Unsupported high-dimensional continuous action search at inference.
+8. Excessively open-loop execution with `mpc_execute=5`.
+9. Local scalar objectives that do not encode escape.
+
+The report's earlier conclusion should therefore be updated from:
+
+- "the scalar-head route is largely exhausted"
+
+to:
+
+- "the current planner objective family is exhausted inside a stack that is
+  already fundamentally misaligned"
+
+## What Would Need To Change
+
+The next useful work is not another kNN or RND ablation.
+
+The stack needs these structural changes first.
+
+### 1. Rebuild episode identity correctly
+
+All advanced supervision should be rebuilt on true reset-separated episodes.
+
+Required changes:
+
+- segment each `(file, env)` stream on `done`
+- assign new episode ids after every reset
+- forbid displacement, place, and coverage pairs that cross resets
+
+Without this, advanced pose-supervised heads remain suspect.
+
+### 2. Evaluate by scene seed, not by env id
+
+Held-out evaluation should split by chunk or scene seed so that:
+
+- train and eval do not share obstacle geometry
+- train and eval do not share beacon placement
+- reported metrics reflect real scene generalization
+
+Until that is done, offline results should be treated as optimistic diagnostics,
+not proof that the heads are deployment-ready.
+
+### 3. Increase scene diversity drastically
+
+Five chunks is not a serious dataset for this problem.
+
+The system needs:
+
+- many more chunk seeds
+- much wider topology variation
+- stronger coverage of enclosed-maze-like structures if that remains the target
+
+Frame count is not the bottleneck. Distinct geometry count is.
+
+### 4. Fix the planning state
+
+Pure single-frame vision is too weak for this setting.
+
+At minimum, one of these is needed:
+
+- recent latent history as planner state
+- a recurrent state estimator
+- proprio reintroduced for deployment
+
+If strict pure-perception inference must remain, then latent history is the
+cleanest next move.
+
+### 5. Constrain the planner to supported action sequences
+
+The planner should not sample arbitrary 75D command sequences.
+
+Better options:
+
+- search over motion primitives from the training distribution
+- learn an action prior over block commands
+- search in a lower-dimensional skill space
+
+This is likely more important than any additional scalar head tuning.
+
+### 6. Replan every macro step before new head work
+
+Before introducing another learned value head, reduce deployment mismatch:
+
+- set `mpc_execute=1`
+- keep macro semantics aligned to the world model
+- minimize open-loop commitment
+
+Only after that is it meaningful to measure whether a new value head improves
+ranking.
+
+### 7. Then test a true sequence-level escape value
+
+After the structural issues above are fixed, a sequence-level head becomes a
+reasonable next experiment.
+
+It should:
+
+- score current state plus candidate rollout snippet
+- be trained on true escape labels or corridor commitment labels
+- be evaluated on unseen scenes
+- be audited on open-loop candidate ranking, not only teacher-forced metrics
+
+The earlier `EscapeHead` idea remains directionally sound, but only after the
+stack is cleaned up.
+
+## Implemented Remediation After This Analysis
+
+The codebase no longer matches the exact pre-fix state analyzed above.
+
+The analysis remains the correct explanation of why the earlier implementation
+failed. But several of the structural fixes and next-step items have now been
+implemented in code so that the next full recollection and retraining cycle can
+test the intended design rather than the older broken one.
+
+What follows is a repo-state addendum: what has now been changed, why it was
+changed, and what those changes do and do not guarantee.
+
+### 1. Episode identity and scene-aware evaluation are now structurally fixed
+
+The dataset and training stack now expose the concepts that were previously
+missing:
+
+- true reset-separated `episode_id`
+- per-sample `scene_id`
+- held-out scene filtering for train/eval
+
+Concretely:
+
+- `lewm/data/streaming_dataset.py` now segments raw per-env streams on `done`
+  and emits true episode ids instead of treating each `(file, env)` stream as
+  one coarse episode
+- the same dataset now builds stable scene ids from scene metadata and can
+  restrict loading to a specified set of scene ids
+- `scripts/3_train_lewm.py` now defaults to held-out scene evaluation for the
+  base world model rather than judging LeWM only by in-training loss
+- `scripts/4_train_energy_head.py` already defaults to held-out scene-level
+  evaluation for the planning heads and latent cache splits
+
+This directly addresses two of the biggest report findings:
+
+- reset contamination in supervision
+- scene leakage in offline evaluation
+
+It does not by itself prove generalization. It only makes the reported offline
+metrics much more honest than they were before.
+
+### 2. Enclosed-maze data collection now exposes topology and a deployment-like start regime
+
+The enclosed-maze generator is no longer just a wall emitter.
+
+`lewm/maze_utils.py` now supports returning maze metadata in addition to the
+wall and beacon layout. That metadata includes:
+
+- cell centers
+- cell adjacency
+- dead-end cells
+- beacon cells
+- start cell
+- world bounds
+
+That topology is now propagated through `scripts/1_physics_rollout.py` in the
+enclosed-scene metadata.
+
+The rollout collector also now uses topology-aware spawn and respawn handling:
+
+- enclosed-maze episodes default to start-region jitter rather than generic
+  safe-point sampling
+- bounded spawn sampling keeps resets inside the actual maze interior
+- the start distribution is therefore much closer to the intended inference
+  start distribution
+
+This fixes the earlier mismatch where training episodes in enclosed scenes could
+start in geometrically valid but task-irrelevant locations.
+
+### 3. The collector now has a closed-loop maze teacher instead of relying only on open-loop wandering
+
+This is the largest new data change.
+
+`scripts/1_physics_rollout.py` now supports:
+
+- `--command_policy open_loop`
+- `--command_policy maze_teacher`
+- `--command_policy mixed`
+
+`mixed` is the intended serious-data default.
+
+In enclosed mazes, the new maze teacher uses privileged topology only during
+data collection, not at inference. It:
+
+- tracks the robot's current cell in the carved maze
+- samples new targets from beacon cells, dead-end/frontier cells, or other
+  reachable cells
+- follows shortest-path next hops over the maze adjacency graph
+- converts those target directions into body-frame velocity commands
+- injects small noise so the trajectories do not collapse into one deterministic
+  policy trace
+
+The command log now distinguishes these teacher-controlled segments with new
+pattern ids:
+
+- `maze_teacher_beacon`
+- `maze_teacher_frontier`
+- `maze_teacher_explore`
+
+This directly addresses the report's strongest data complaint:
+
+- the old dataset had many frames but too few meaningful long-horizon
+  maze-solving behaviors
+
+The new collector does not make the training set perfect. It does, however,
+create a path to recollect data that actually contains:
+
+- corridor commitment
+- frontier reaching
+- dead-end approach and exit
+- beacon-reaching trajectories
+
+Those behaviors were previously underrepresented or absent.
+
+### 4. A real sequence-level escape/frontier head now exists in the training stack
+
+The earlier report argued that local scalar terms were fundamentally misaligned
+with the maze task and that a sequence-level escape value was the right next
+idea after structural cleanup.
+
+That head is now implemented.
+
+`lewm/models/energy_head.py` now includes `EscapeFrontierHead`, a
+sequence-conditioned value head that consumes:
+
+- the current projected latent
+- a rollout snippet of future projected latents
+
+and predicts a non-negative sequence value where larger is better.
+
+The corresponding training pipeline now exists in
+`scripts/4_train_energy_head.py`.
+
+It adds:
+
+- CLI support for the new head and its supervision windows
+- pose-based target construction
+- train and held-out eval loops
+- checkpoint serialization into the combined `trajectory_scorer.pt`
+
+The new pose target is not just another endpoint displacement proxy. It mixes:
+
+- local frontier area gain beyond recent context
+- terminal escape distance from the recent-context support
+- peak escape distance achieved over the future snippet
+
+So the target rewards both:
+
+- leaving the current local basin
+- opening genuinely new area over a longer horizon
+
+This is the first implemented head in the repo that is explicitly designed
+around the report's sequence-level failure mode.
+
+### 5. Inference now includes the missing planner-side structural fixes
+
+The current `scripts/6_infer_pure_wm.py` is no longer the same planner that
+motivated the original failure report.
+
+The active runtime now supports all of the following.
+
+#### Latent history
+
+The planner no longer has to start from a single latent without context.
+
+`lewm/models/predictor.py`, `lewm/models/lewm.py`, and
+`scripts/6_infer_pure_wm.py` now support:
+
+- latent history rollout conditioning
+- aligned action-history conditioning
+- `history_context_len` bounded by the world-model `max_seq_len`
+
+That does not eliminate partial observability entirely, but it is materially
+closer to the training-time predictor state than the earlier single-frame
+planner.
+
+#### Primitive-constrained action search
+
+The planner now supports a primitive library extracted from supported command
+patterns instead of only free Gaussian search in flattened `active_block`
+space.
+
+This directly addresses the report's earlier action-prior complaint:
+
+- the planner no longer has to search only in an unsupported 75D continuous
+  block space
+
+Continuous search still exists for comparison, but primitive-space planning is
+now the intended serious runtime path.
+
+#### Direct online goal cost
+
+The target beacon is no longer just an offline evaluation signal.
+
+The planner now supports rollout-space goal scoring via:
+
+- `goal_cost_mode=terminal_cosine`
+- `goal_cost_mode=terminal_l2`
+- `goal_cost_mode=head`
+
+The default is rollout-terminal cosine similarity to the encoded breadcrumb in
+the same projected latent space that the planner scores.
+
+That fixes one of the most important runtime mismatches from the old stack:
+
+- the system is now allowed to optimize for the target online when the task is
+  goal-directed beacon navigation
+
+#### Escape/frontier bonus at planning time
+
+The new `EscapeFrontierHead` is also loaded and scored online when present in
+the scorer checkpoint.
+
+That means the planner can now combine:
+
+- safety
+- goal attraction
+- novelty
+- short local coverage gain
+- long-horizon escape/frontier value
+
+rather than relying only on per-state novelty and small endpoint heuristics.
+
+### 6. The runtime now has a perception-only keyframe memory router
+
+The report previously argued that latent history alone might still not be
+enough for the hardest version of the task.
+
+That stronger memory structure has now been implemented in a perception-only
+form.
+
+`scripts/6_infer_pure_wm.py` now maintains a persistent keyframe graph built
+from projected-latent observations. The active memory path is:
+
+- `--memory_router_mode keyframe`
+
+The runtime behavior is:
+
+- add or match keyframe nodes using latent similarity
+- connect consecutive nodes into a graph
+- monitor plateau behavior when local progress stalls
+- choose a remembered frontier or better-goal keyframe route
+- temporarily bias planning toward the next route waypoint in projected latent
+  space
+
+Important properties of this memory path:
+
+- it is perception-only at runtime
+- it does not require online XY pose for the actual routing decision
+- the dead-reckoning radius gate can be disabled, and the current default
+  reporting reflects that this should be treated as a perception-first route
+  system rather than the older odometry-heavy route mode
+
+This is not a full SLAM system or explicit occupancy map. It is a practical
+long-horizon memory layer over latent observations.
+
+### 7. The report's "What would need to change" section is therefore partly implemented
+
+At this point, the repo has already implemented most of the structural items
+that were previously listed only as recommendations:
+
+- true reset-separated episodes
+- held-out scene evaluation
+- deployment-like enclosed-maze spawn distribution
+- constrained primitive planning
+- latent-history planner state
+- direct online goal cost
+- a sequence-level escape/frontier value head
+- a perception-only longer-horizon memory router
+
+The biggest remaining non-implementation step is not more code. It is the
+fresh full retraining cycle:
+
+- recollect a new dataset with the maze-teacher curriculum
+- rerender it
+- retrain LeWM from scratch
+- retrain the planning heads from scratch
+- run multi-seed held-out evaluation on the new stack
+
+### 8. What is still not guaranteed even after these code changes
+
+The new implementation materially improves the stack, but it does not
+automatically prove success.
+
+There are still three reasons a fresh retrain could fail:
+
+1. The recollected dataset may still not contain enough diverse successful
+   enclosed-maze behavior.
+2. The learned world model may still not support open-loop ranking well enough
+   over multi-step unseen-scene rollouts.
+3. The new memory and escape value may help, but the task may still require
+   either even more data scale or a stronger route/value formulation.
+
+So the current repo state should be described precisely as:
+
+- the implementation now includes the major structural fixes that the failure
+  analysis said were required
+- the next retrain is now a fair test of the intended method
+- the method is still not proven until that retrain succeeds on unseen mazes
+
+## Runbook
+
+This section is the current operational runbook for a fresh end-to-end cycle.
+It supersedes older historical command examples in the analysis above that were
+used to explain the original failure mode.
+
+The intended serious path is:
+
+1. collect a fresh dataset with the maze-teacher curriculum
+2. verify raw data coverage before spending time rendering or training
+3. render the final HDF5 dataset with geometry-aware labels
+4. verify the rendered dataset again
+5. train LeWM from scratch
+6. train the planning heads on frozen LeWM latents
+7. run single-seed sanity inference
+8. run multi-seed held-out inference with planner auditing enabled
+9. aggregate both end metrics and planner-audit metrics before judging success
+
+### 0. Preconditions
+
+You need:
+
+- a valid PPO checkpoint for the low-level controller
+- enough disk for raw rollout chunks, rendered HDF5, checkpoints, and videos
+- a consistent temporal abstraction across the whole stack
+
+For the recommended pure-perception path, keep the following aligned:
+
+- `seq_len=4`
+- `temporal_stride=5`
+- `action_block_size=5`
+- `window_stride=5`
+- `command_representation=active_block`
+
+If you change those values, change them consistently in:
+
+- dataset verification
+- LeWM training
+- planning-head training
+- inference compatibility checks
+
+### 1. Optional Smoke Test
+
+Before the serious run, do one small end-to-end smoke test:
+
+```bash
+python3 scripts/1_physics_rollout.py \
+  --ckpt <ppo_ckpt> \
+  --steps 1000 \
+  --chunks 5 \
+  --scene_distribution mixed
+
+python3 scripts/2_visual_renderer.py \
+  --raw_dir jepa_raw_data \
+  --out_dir jepa_final_dataset
+```
+
+Then run one short epoch of LeWM and one short inference run just to catch
+shape, metadata, and path issues. Do not treat the `--chunks 5` run as a real
+training dataset.
+
+### 2. Serious Raw Data Collection
+
+Collect a fresh rollout dataset with many chunk seeds and the mixed maze
+teacher:
+
+```bash
+python3 scripts/1_physics_rollout.py \
+  --ckpt <ppo_ckpt> \
+  --steps 1000 \
+  --chunks 200 \
+  --scene_distribution mixed \
+  --command_policy mixed \
+  --out_dir jepa_raw_data
+```
+
+Important current assumptions:
+
+- `--chunks 200` is a reasonable serious starting point; `--chunks 5` is only
+  for smoke tests
+- `--scene_distribution mixed` injects enclosed mazes into the collection set
+- `--command_policy mixed` keeps open-loop diversity while adding privileged
+  maze-teacher trajectories that actually reach dead ends, frontiers, and
+  beacons
+- topology-aware respawns are already wired through the collector, so enclosed
+  episodes start much closer to the deployment regime
+
+### 3. Verify Raw Dataset Coverage Before Rendering
+
+Run the dataset summary immediately after collection:
+
+```bash
+python3 scripts/summarize_dataset_coverage.py \
+  --raw_dir jepa_raw_data \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --out reports/jepa_raw_data_coverage.json
+```
+
+Read the report before moving on. At minimum, confirm that:
+
+- the dataset contains many unique scenes, not just many frames
+- enclosed scenes are present in nontrivial quantity
+- `maze_teacher_fraction` is nonzero and materially present
+- close-visible beacon episodes are not effectively zero
+- the estimated `windows_no_done` and `windows_no_done_no_collision` counts are
+  large enough to support training
+
+If those checks fail, recollect before rendering or training.
+
+Optional sanity checks:
+
+```bash
+python3 scripts/demo_no_clipping.py
+python3 scripts/demo_data_quality.py --ckpt <ppo_ckpt>
+```
+
+### 4. Render the Final Training Dataset
+
+Render the egocentric RGB dataset:
+
+```bash
+python3 scripts/2_visual_renderer.py \
+  --raw_dir jepa_raw_data \
+  --out_dir jepa_final_dataset
+```
+
+For a fresh render, the output dataset already includes recomputed
+geometry-derived labels, including obstacle-aware beacon visibility. You do not
+need a second relabel pass unless you are reusing an older rendered dataset.
+
+If you are reusing existing vision and only want to rebuild labels:
+
+```bash
+python3 scripts/2_visual_renderer.py \
+  --raw_dir jepa_raw_data \
+  --reuse_vision_from jepa_final_dataset_old \
+  --out_dir jepa_final_dataset \
+  --workers 1
+```
+
+### 5. Verify the Rendered Dataset
+
+Run the coverage summary again on both raw and rendered data:
+
+```bash
+python3 scripts/summarize_dataset_coverage.py \
+  --raw_dir jepa_raw_data \
+  --rendered_dir jepa_final_dataset \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --out reports/jepa_final_dataset_coverage.json
+```
+
+Use this second report to confirm:
+
+- raw and rendered chunk counts match
+- raw and rendered scene keys match
+- the rendered dataset still exposes the expected number of valid windows
+- nothing in the render pass silently collapsed scene coverage or labels
+
+### 6. Train the Base LeWorldModel
+
+Train the pure-vision LeWM with the recommended temporal abstraction:
+
+```bash
+python3 scripts/3_train_lewm.py \
+  --data_dir jepa_final_dataset \
+  --device cuda \
+  --epochs 30 \
+  --batch_size 128 \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --sigreg_lambda 0.09 \
+  --command_representation active_block \
+  --out_dir lewm_checkpoints_keyframe_exec_stride5_block15_vision \
+  --log_dir lewm_logs_keyframe_exec_stride5_block15_vision
+```
+
+Expected outcome:
+
+- scene-held-out evaluation runs by default
+- checkpoints are written under
+  `lewm_checkpoints_keyframe_exec_stride5_block15_vision`
+- the main artifact for downstream training is typically
+  `lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt`
+
+Do not proceed to head training until the run completes cleanly and the held-out
+scene loss looks stable rather than obviously diverging.
+
+### 7. Train the Planning Heads
+
+Train the scorer stack on frozen LeWM latents:
+
+```bash
+python3 scripts/4_train_energy_head.py \
+  --data_dir jepa_final_dataset \
+  --raw_data_dir jepa_raw_data \
+  --checkpoint lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
+  --device cuda \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --out_dir energy_head_checkpoints_keyframe_exec_stride5_block15_vision \
+  --log_dir energy_head_logs_keyframe_exec_stride5_block15_vision \
+  --safety_mode proximity \
+  --epochs 10 \
+  --skip_goal \
+  --skip_progress \
+  --exploration_epochs 5 \
+  --coverage_gain_weight 0.5 \
+  --escape_frontier_weight 1.0 \
+  --eval_split_group scene \
+  --exploration_weight 1.0
+```
+
+Expected output:
+
+- `energy_head_checkpoints_keyframe_exec_stride5_block15_vision/trajectory_scorer.pt`
+
+The script now reads encoder and temporal metadata from the LeWM checkpoint and
+fails fast on mismatches. Keep that strictness.
+
+### 8. Single-Seed Inference Sanity Check
+
+Run one held-out maze first before launching a sweep:
+
+```bash
+python3 scripts/6_infer_pure_wm.py \
+  --ppo_ckpt <ppo_ckpt> \
+  --wm_ckpt lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
+  --scorer_ckpt energy_head_checkpoints_keyframe_exec_stride5_block15_vision/trajectory_scorer.pt \
+  --seed 42 \
+  --steps 200 \
+  --macro_action_repeat 5 \
+  --mpc_execute 1 \
+  --cem_iters 10 \
+  --planner_action_space primitives \
+  --memory_router_mode keyframe \
+  --route_progress_weight 7.0 \
+  --rnd_online_lr 1e-3 \
+  --audit_plan \
+  --audit_every 1 \
+  --audit_topk 5 \
+  --out_dir inference_runs/perception_only_stride5_block15_vision_s42
+```
+
+Current intended deployment assumptions:
+
+- `macro_action_repeat=5` to match the command-block abstraction
+- `mpc_execute=1` so the planner replans every macro step
+- `planner_action_space=primitives` for supported command search
+- `memory_router_mode=keyframe` for longer-horizon perception-only rerouting
+- `audit_plan` enabled so the run exports planner diagnostics, not just end
+  success/failure
+
+Inspect the run directory before scaling up:
+
+- `summary.json`
+- `plan_audit.jsonl`
+- output videos
+- `trajectory.png`
+
+### 9. Multi-Seed Held-Out Evaluation
+
+Once the single-seed run looks sane, sweep multiple unseen mazes:
+
+```bash
+for seed in 42 43 44; do
+  python3 scripts/6_infer_pure_wm.py \
+    --ppo_ckpt <ppo_ckpt> \
+    --wm_ckpt lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
+    --scorer_ckpt energy_head_checkpoints_keyframe_exec_stride5_block15_vision/trajectory_scorer.pt \
+    --seed "$seed" \
+    --steps 200 \
+    --macro_action_repeat 5 \
+    --mpc_execute 1 \
+    --cem_iters 10 \
+    --planner_action_space primitives \
+    --memory_router_mode keyframe \
+    --route_progress_weight 7.0 \
+    --rnd_online_lr 1e-3 \
+    --audit_plan \
+    --audit_every 1 \
+    --audit_topk 5 \
+    --out_dir "inference_runs/perception_only_stride5_block15_vision_s${seed}"
+done
+```
+
+Then aggregate end metrics:
+
+```bash
+python3 scripts/7_aggregate_inference_runs.py \
+  --glob "inference_runs/perception_only_stride5_block15_vision_s*" \
+  --out inference_runs/perception_only_stride5_block15_vision_aggregate.json
+```
+
+And aggregate planner audits:
+
+```bash
+python3 scripts/aggregate_plan_audits.py \
+  --glob "inference_runs/perception_only_stride5_block15_vision_s*" \
+  --out inference_runs/perception_only_stride5_block15_vision_plan_audit_aggregate.json
+```
+
+### 10. What To Review Before Calling The Run A Success
+
+Do not stop at the usual end metrics alone.
+
+From `scripts/7_aggregate_inference_runs.py`, review:
+
+- oracle goal reach rate
+- perceptual goal detect rate
+- mean minimum goal distance
+- soft coverage area and gain
+- collisions
+
+From `scripts/aggregate_plan_audits.py`, review:
+
+- first-command and commitment prediction error
+- goal-similarity alignment between predicted and actual committed outcomes
+- predicted-vs-actual displacement and coverage alignment
+- top-1 vs top-2 planner cost margin
+- near-tie rate in the candidate set
+- correlation between selected planner cost and actual committed outcome
+
+This second report is the main guard against overinterpreting teacher-forced or
+offline-looking success. The central question is still whether the planner's
+ranking signal survives free-running deployment on unseen mazes.
+
+## What Not To Do Next
+
+The following are not good primary next steps:
 
 - more RND variants
-- more visited-margin or kNN hyperparameter sweeps
-- stronger displacement weights without new evidence
-- longer-horizon OOD planning as the primary path
-- porting the heuristic stuck-recovery controller from `5_infer_new_maze.py`
-- explicit frontier routing if pure-perception inference is meant to be preserved
+- more visited-kNN sweeps
+- stronger displacement weighting
+- more local revisit heuristics
+- relying on the current held-out metrics as proof the heads are solved
+
+These lines of work operate below the actual failure point.
 
 ## Final Conclusion
 
-The project is no longer blocked by obviously broken exploration heads.
+`LeWMQuad-v2` did not mainly fail because the final exploration head was weak.
 
-The strongest current evidence is:
+It failed because it attempted to solve a partially observable, long-horizon,
+topological exploration problem with:
 
-- the safety head is accurate enough offline
-- the place head is accurate enough offline
-- collision prediction error is not dramatically worse than non-collision prediction error
-- but online, top-K candidates inside a local basin are almost indistinguishable under the current scalar objectives
+- too little scene diversity
+- scene-leaky evaluation
+- partially contaminated supervised targets
+- teacher-forced offline probes used as a proxy for open-loop planning
+- a single-frame pure-vision planning state
+- an unsupported continuous command search space
+- local scalar objectives
 
-Therefore the next step should be a sequence-level value target that predicts realized escape, not another local novelty, displacement, or continuous local coverage-gain scalar.
+The previous report correctly captured the final online symptom:
 
-## Appendix: Representative Online Results
+- near-tied candidates inside a local basin
+- tiny executed motion
+- persistent looping
 
-The table below summarizes the main run family. Coverage and path length come from `summary.json`. For earlier runs where `summary.json` did not retain collision count, the console value is used.
-
-| Run | Main idea | Coverage `m^2` | Path `m` | Collisions | Outcome |
-| --- | --- | ---: | ---: | ---: | --- |
-| `gain_rolloutv6_consequence_gainfix` | align online RND update to rollout-space teacher-forced latent | 1.513 | 19.81 | 201 | loops in same quadrant |
-| `gain_rolloutv6_consequence_gainfix_rndrollout` | full rollout-space RND update path | 1.761 | 15.10 | 339 | still loops |
-| `visitednn_k8` | banked k-NN novelty | 0.840 | 6.57 | 729 | corner farming / trapped |
-| `visitednn_k8_m015_t3` | margin + tail persistence | 1.659 | 14.01 | 428 | better, still loops |
-| `visitednn_k8_m015_t3_gate018_k12` | novelty safety gate | 1.294 | 18.17 | 275 | safer, still loops |
-| `visitednn_k8_m015_t3_r8_gate018_k12` | revisit penalty | 1.466 | 15.64 | 216 | best safety in family, still loops |
-| `visitednn_snippet_k8_m015_t3_r8_gate018_k12` | snippet-level visited k-NN | 1.484 | 18.37 | 171 | still loops |
-| `visitednn_place_fix_bankfix` | temporal-proxy place head + bank fix | 1.294 | 15.47 | 422 | revisit nearly constant, still loops |
-| `visitednn_place_pose` | pose-supervised place head | 1.39 | not emphasized | 333 | still loops |
-| `visitednn_place_pose_audit` | audit-only short run | 0.388 | 2.30 | 157 over 200 steps | clear low-motion basin trap |
-| `disp_audit` | displacement-head audit | 0.724 | 3.77 | 84 over 200 steps | displacement not discriminative enough |
-
-## Appendix: Key Audit Numbers
-
-### Place-audit run
-
-- mean top-5 cost spread: `0.010997`
-- mean top-5 safety spread: `0.011369`
-- mean top-5 revisit spread: `0.000106`
-- mean actual first-step displacement: `0.01094 m`
-- mean coverage gain: `0.000562 m^2`
-- collision rate: `0.80`
-
-### Prediction-error audit
-
-- collision `proj_mse`: `0.1699`
-- non-collision `proj_mse`: `0.1706`
-- collision `proj_cosine`: `0.894`
-- non-collision `proj_cosine`: `0.914`
-
-### Displacement-audit run
-
-- mean selected predicted displacement: `0.05525 m`
-- mean actual first-step displacement: `0.01565 m`
-- predicted-vs-actual displacement correlation: `0.3746`
-- mean top-5 predicted-displacement spread: `0.000460 m`
-- mean top-5 cost spread: `0.01576`
-- mean top-5 safety spread: `0.01630`
-- mean top-5 revisit spread: `0.000140`
+But that symptom should now be interpreted as the downstream consequence of a
+misaligned data-model-planner stack, not as evidence that only one more
+sequence-level scalar head is missing.

@@ -250,23 +250,64 @@ class TransformerPredictor(nn.Module):
         self,
         z_start: torch.Tensor,
         action_seq: torch.Tensor,
+        z_history: torch.Tensor | None = None,
+        action_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Auto-regressive rollout for latent planning.
 
         Args:
             z_start:    (B, D) — initial latent embedding.
             action_seq: (B, H, cmd_dim) — candidate action sequence.
+            z_history: optional (B, C, D) history ending at ``z_start``.
+            action_history: optional (B, C-1, cmd_dim) action history aligned
+                with ``z_history`` source latents.
 
         Returns:
             (B, H, D) — predicted latents at each step.
         """
         batch, horizon, _ = action_seq.shape
-        z_buffer = [z_start.unsqueeze(1)]
+        if z_history is not None:
+            if z_history.ndim != 3:
+                raise ValueError(
+                    f"Expected z_history shape (B, C, D), got {tuple(z_history.shape)}",
+                )
+            if z_history.shape[0] != batch or z_history.shape[2] != z_start.shape[1]:
+                raise ValueError(
+                    f"Incompatible z_history shape {tuple(z_history.shape)} for "
+                    f"z_start {tuple(z_start.shape)}",
+                )
+            z_tokens = z_history
+            z_start_hist = z_history[:, -1, :]
+            if not torch.allclose(z_start_hist, z_start, atol=1e-5, rtol=1e-4):
+                raise ValueError("z_history must end at z_start.")
+            if action_history is None:
+                action_tokens = action_seq[:, :0, :]
+            else:
+                if action_history.ndim != 3:
+                    raise ValueError(
+                        "Expected action_history shape (B, C-1, cmd_dim), got "
+                        f"{tuple(action_history.shape)}",
+                    )
+                if action_history.shape[0] != batch or action_history.shape[2] != action_seq.shape[2]:
+                    raise ValueError(
+                        f"Incompatible action_history shape {tuple(action_history.shape)} for "
+                        f"action_seq {tuple(action_seq.shape)}",
+                    )
+                expected_hist = max(0, int(z_history.shape[1]) - 1)
+                if int(action_history.shape[1]) != expected_hist:
+                    raise ValueError(
+                        f"action_history length {action_history.shape[1]} does not match "
+                        f"z_history length {z_history.shape[1]}",
+                    )
+                action_tokens = action_history
+        else:
+            z_tokens = z_start.unsqueeze(1)
+            action_tokens = action_seq[:, :0, :]
         preds = []
 
         for step in range(horizon):
-            z_ctx = torch.cat(z_buffer, dim=1)
-            a_ctx = action_seq[:, : step + 1, :]
+            z_ctx = z_tokens
+            a_ctx = torch.cat([action_tokens, action_seq[:, step : step + 1, :]], dim=1)
             # Sliding window: keep only the last max_seq_len tokens
             if z_ctx.shape[1] > self.max_seq_len:
                 z_ctx = z_ctx[:, -self.max_seq_len:]
@@ -274,7 +315,8 @@ class TransformerPredictor(nn.Module):
             pred = self.forward(z_ctx, a_ctx)
             z_next = pred[:, -1, :]
             preds.append(z_next)
-            z_buffer.append(z_next.unsqueeze(1))
+            z_tokens = torch.cat([z_tokens, z_next.unsqueeze(1)], dim=1)
+            action_tokens = torch.cat([action_tokens, action_seq[:, step : step + 1, :]], dim=1)
 
         return torch.stack(preds, dim=1)
 

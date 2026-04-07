@@ -187,17 +187,28 @@ class LeWorldModel(nn.Module):
         self,
         z_start_raw: torch.Tensor,
         action_seq: torch.Tensor,
+        z_history_raw: torch.Tensor | None = None,
+        action_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Rollout predictor auto-regressively for latent planning.
 
         Args:
             z_start_raw: (B, D) — raw encoder embedding of the current frame.
             action_seq:  (B, H, cmd_dim) — candidate action sequence.
+            z_history_raw: optional (B, C, D) latent history ending at
+                ``z_start_raw``.
+            action_history: optional (B, C-1, cmd_dim) action history aligned
+                with ``z_history_raw``.
 
         Returns:
             z_pred_proj: (B, H, D) — projected predicted latents at each step.
         """
-        z_pred_raw = self.plan_rollout_raw(z_start_raw, action_seq)
+        z_pred_raw = self.plan_rollout_raw(
+            z_start_raw,
+            action_seq,
+            z_history_raw=z_history_raw,
+            action_history=action_history,
+        )
         z_pred_proj = self.pred_projector.forward_seq(z_pred_raw)
         return z_pred_proj
 
@@ -205,9 +216,16 @@ class LeWorldModel(nn.Module):
         self,
         z_start_raw: torch.Tensor,
         action_seq: torch.Tensor,
+        z_history_raw: torch.Tensor | None = None,
+        action_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Rollout predictor and return raw predicted latents."""
-        return self.predictor.rollout(z_start_raw, action_seq)
+        return self.predictor.rollout(
+            z_start_raw,
+            action_seq,
+            z_history=z_history_raw,
+            action_history=action_history,
+        )
 
     def plan_cost(
         self,

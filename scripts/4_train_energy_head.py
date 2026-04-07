@@ -57,6 +57,7 @@ from lewm.models import (
     PlaceSnippetHead,
     DisplacementHead,
     CoverageGainHead,
+    EscapeFrontierHead,
     TrajectoryScorer,
     composite_safety_target,
     consequence_safety_target,
@@ -193,9 +194,32 @@ def parse_args() -> argparse.Namespace:
                    help="Interpolation step for pose-based local coverage-gain targets.")
     p.add_argument("--coverage_gain_weight", type=float, default=0.0,
                    help="Optional planner bonus weight for the coverage-gain head. Kept at 0 by default for audit-first evaluation.")
+    # Escape/frontier head
+    p.add_argument("--skip_escape_frontier", action="store_true",
+                   help="Skip the sequence-level escape/frontier value head.")
+    p.add_argument("--escape_frontier_epochs", type=int, default=5)
+    p.add_argument("--escape_frontier_lr", type=float, default=3e-4)
+    p.add_argument("--escape_frontier_batch_size", type=int, default=4096)
+    p.add_argument("--escape_frontier_hops", type=int, default=5,
+                   help="Number of future model steps in the rollout snippet scored by the escape/frontier head.")
+    p.add_argument("--escape_frontier_target_hops", type=int, default=24,
+                   help="Number of future model steps used to build the realized escape/frontier target.")
+    p.add_argument("--escape_frontier_context_hops", type=int, default=12,
+                   help="Number of recent model steps defining the already-visited context for the escape/frontier target.")
+    p.add_argument("--escape_frontier_radius_m", type=float, default=0.20,
+                   help="Distance from recent context that counts as having escaped the local basin.")
+    p.add_argument("--escape_frontier_densify_step_m", type=float, default=0.04,
+                   help="Interpolation step for the pose-based escape/frontier target.")
+    p.add_argument("--escape_frontier_weight", type=float, default=0.0,
+                   help="Optional planner bonus weight for the escape/frontier head.")
     # Held-out evaluation
     p.add_argument("--skip_eval", action="store_true",
                    help="Skip held-out episode evaluation for safety/place heads.")
+    p.add_argument("--eval_split_group", type=str, default="scene",
+                   choices=["scene", "episode"],
+                   help="Which group id to hold out for evaluation. "
+                        "'scene' holds out whole chunk geometries; 'episode' "
+                        "keeps the older per-episode split.")
     p.add_argument("--eval_holdout_fraction", type=float, default=0.10,
                    help="Fraction of rollout episodes held out from training for validation.")
     p.add_argument("--eval_seed", type=int, default=42)
@@ -316,8 +340,8 @@ def load_frozen_encoder(args, device):
 # Phase 1: Extract latents + labels to disk
 # --------------------------------------------------------------------- #
 
-SHARD_SAMPLES = 500_000    # v9 stores encoder + rollout pose metadata for displacement-head training
-CACHE_VERSION = 9          # v9: add encoder episode/step/XY/yaw metadata
+SHARD_SAMPLES = 500_000
+CACHE_VERSION = 10         # v10: true reset-separated episode ids, scene ids, valid-rollout filtering
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -439,6 +463,7 @@ def extract_latents(args, device) -> str:
     )
 
     z_enc_buf: list[torch.Tensor] = []
+    sid_enc_buf: list[torch.Tensor] = []
     bid_enc_buf: list[torch.Tensor] = []
     br_enc_buf: list[torch.Tensor] = []
     epid_enc_buf: list[torch.Tensor] = []
@@ -446,6 +471,7 @@ def extract_latents(args, device) -> str:
     xy_enc_buf: list[torch.Tensor] = []
     yaw_enc_buf: list[torch.Tensor] = []
     z_rollout_buf: list[torch.Tensor] = []
+    sid_rollout_buf: list[torch.Tensor] = []
     st_rollout_buf: list[torch.Tensor] = []
     bid_rollout_buf: list[torch.Tensor] = []
     br_rollout_buf: list[torch.Tensor] = []
@@ -462,8 +488,8 @@ def extract_latents(args, device) -> str:
     pbar = None
 
     def flush_shard():
-        nonlocal z_enc_buf, bid_enc_buf, br_enc_buf, epid_enc_buf, step_enc_buf, xy_enc_buf, yaw_enc_buf
-        nonlocal z_rollout_buf, st_rollout_buf, bid_rollout_buf, br_rollout_buf, coll_rollout_buf
+        nonlocal z_enc_buf, sid_enc_buf, bid_enc_buf, br_enc_buf, epid_enc_buf, step_enc_buf, xy_enc_buf, yaw_enc_buf
+        nonlocal z_rollout_buf, sid_rollout_buf, st_rollout_buf, bid_rollout_buf, br_rollout_buf, coll_rollout_buf
         nonlocal epid_rollout_buf, step_rollout_buf, xy_rollout_buf, yaw_rollout_buf
         nonlocal buf_encoder_samples, buf_rollout_samples
         nonlocal shard_idx, total_encoder_samples, total_rollout_samples
@@ -472,6 +498,7 @@ def extract_latents(args, device) -> str:
         shard_path = os.path.join(cache_dir, f"shard_{shard_idx:04d}.pt")
         torch.save({
             "z_enc": torch.cat(z_enc_buf),
+            "scene_id_enc": torch.cat(sid_enc_buf),
             "beacon_identity_enc": torch.cat(bid_enc_buf),
             "beacon_range_enc": torch.cat(br_enc_buf),
             "episode_id_enc": (
@@ -487,6 +514,9 @@ def extract_latents(args, device) -> str:
                 torch.cat(yaw_enc_buf) if yaw_enc_buf else torch.empty((0,), dtype=torch.float32)
             ),
             "z_rollout": torch.cat(z_rollout_buf) if z_rollout_buf else torch.empty((0, args.latent_dim)),
+            "scene_id_rollout": (
+                torch.cat(sid_rollout_buf) if sid_rollout_buf else torch.empty((0,), dtype=torch.long)
+            ),
             "safety_target_rollout": (
                 torch.cat(st_rollout_buf) if st_rollout_buf else torch.empty((0,), dtype=torch.float32)
             ),
@@ -519,10 +549,10 @@ def extract_latents(args, device) -> str:
             f"samples -> {shard_path}",
             pbar,
         )
-        z_enc_buf, bid_enc_buf, br_enc_buf = [], [], []
+        z_enc_buf, sid_enc_buf, bid_enc_buf, br_enc_buf = [], [], [], []
         epid_enc_buf, step_enc_buf = [], []
         xy_enc_buf, yaw_enc_buf = [], []
-        z_rollout_buf, st_rollout_buf = [], []
+        z_rollout_buf, sid_rollout_buf, st_rollout_buf = [], [], []
         bid_rollout_buf, br_rollout_buf, coll_rollout_buf = [], [], []
         epid_rollout_buf, step_rollout_buf = [], []
         xy_rollout_buf, yaw_rollout_buf = [], []
@@ -542,6 +572,7 @@ def extract_latents(args, device) -> str:
 
             beacon_range = labels.get("beacon_range")
             beacon_identity = labels.get("beacon_identity")
+            scene_id = labels.get("scene_id")
             episode_id = labels.get("episode_id")
             obs_step = labels.get("obs_step")
             robot_xy = labels.get("robot_xy")
@@ -561,6 +592,10 @@ def extract_latents(args, device) -> str:
             z_enc_flat = z_proj.reshape(B * T, -1).float().cpu()
 
             # Encoder-view beacon labels (flattened)
+            if scene_id is not None:
+                sid_enc_flat = scene_id.long().reshape(B * T)
+            else:
+                sid_enc_flat = torch.full((B * T,), -1, dtype=torch.long)
             if beacon_range is not None:
                 br_enc_flat = beacon_range.float().reshape(B * T)
             else:
@@ -587,6 +622,7 @@ def extract_latents(args, device) -> str:
                 yaw_enc_flat = torch.full((B * T,), float("nan"), dtype=torch.float32)
 
             z_enc_buf.append(z_enc_flat)
+            sid_enc_buf.append(sid_enc_flat)
             bid_enc_buf.append(bid_enc_flat)
             br_enc_buf.append(br_enc_flat)
             epid_enc_buf.append(epid_enc_flat)
@@ -596,13 +632,22 @@ def extract_latents(args, device) -> str:
             buf_encoder_samples += B * T
 
             if T > 1:
-                z_rollout_flat = z_pred_proj[:, :-1, :].reshape(B * (T - 1), -1).float().cpu()
-                coll_rollout_flat = collisions.float()[:, 1:].reshape(B * (T - 1))
+                if episode_id is not None:
+                    valid_transition = (episode_id[:, :-1] == episode_id[:, 1:])
+                else:
+                    valid_transition = torch.ones((B, T - 1), dtype=torch.bool)
+
+                n_valid = int(valid_transition.sum().item())
+                if n_valid == 0:
+                    continue
+
+                z_rollout_flat = z_pred_proj[:, :-1, :][valid_transition].float().cpu()
+                coll_rollout_flat = collisions.float()[:, 1:][valid_transition]
 
                 if args.safety_mode == "consequence":
                     safety_rollout = consequence_safety_target(
-                        clearance.float()[:, 1:].reshape(B * (T - 1)),
-                        traversability[:, 1:].reshape(B * (T - 1)),
+                        clearance.float()[:, 1:][valid_transition],
+                        traversability[:, 1:][valid_transition],
                         coll_rollout_flat,
                         traversability_horizon=10,
                         contact_clearance=args.contact_clearance,
@@ -617,34 +662,39 @@ def extract_latents(args, device) -> str:
                         traversability_horizon=10,
                         w_safety=args.w_safety,
                         w_mobility=args.w_mobility,
-                    ).reshape(B * (T - 1))
+                    )[valid_transition]
 
+                if scene_id is not None:
+                    sid_rollout_flat = scene_id.long()[:, 1:][valid_transition]
+                else:
+                    sid_rollout_flat = torch.full((n_valid,), -1, dtype=torch.long)
                 if beacon_range is not None:
-                    br_rollout_flat = beacon_range.float()[:, 1:].reshape(B * (T - 1))
+                    br_rollout_flat = beacon_range.float()[:, 1:][valid_transition]
                 else:
-                    br_rollout_flat = torch.full((B * (T - 1),), 999.0)
+                    br_rollout_flat = torch.full((n_valid,), 999.0)
                 if beacon_identity is not None:
-                    bid_rollout_flat = beacon_identity.long()[:, 1:].reshape(B * (T - 1))
+                    bid_rollout_flat = beacon_identity.long()[:, 1:][valid_transition]
                 else:
-                    bid_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
+                    bid_rollout_flat = torch.full((n_valid,), -1, dtype=torch.long)
                 if episode_id is not None:
-                    epid_rollout_flat = episode_id.long()[:, 1:].reshape(B * (T - 1))
+                    epid_rollout_flat = episode_id.long()[:, 1:][valid_transition]
                 else:
-                    epid_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
+                    epid_rollout_flat = torch.full((n_valid,), -1, dtype=torch.long)
                 if obs_step is not None:
-                    step_rollout_flat = obs_step.long()[:, 1:].reshape(B * (T - 1))
+                    step_rollout_flat = obs_step.long()[:, 1:][valid_transition]
                 else:
-                    step_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
+                    step_rollout_flat = torch.full((n_valid,), -1, dtype=torch.long)
                 if robot_xy is not None:
-                    xy_rollout_flat = robot_xy.float()[:, 1:, :].reshape(B * (T - 1), 2)
+                    xy_rollout_flat = robot_xy.float()[:, 1:, :][valid_transition]
                 else:
-                    xy_rollout_flat = torch.full((B * (T - 1), 2), float("nan"), dtype=torch.float32)
+                    xy_rollout_flat = torch.full((n_valid, 2), float("nan"), dtype=torch.float32)
                 if robot_yaw is not None:
-                    yaw_rollout_flat = robot_yaw.float()[:, 1:].reshape(B * (T - 1))
+                    yaw_rollout_flat = robot_yaw.float()[:, 1:][valid_transition]
                 else:
-                    yaw_rollout_flat = torch.full((B * (T - 1),), float("nan"), dtype=torch.float32)
+                    yaw_rollout_flat = torch.full((n_valid,), float("nan"), dtype=torch.float32)
 
                 z_rollout_buf.append(z_rollout_flat)
+                sid_rollout_buf.append(sid_rollout_flat)
                 st_rollout_buf.append(safety_rollout)
                 bid_rollout_buf.append(bid_rollout_flat)
                 br_rollout_buf.append(br_rollout_flat)
@@ -653,7 +703,7 @@ def extract_latents(args, device) -> str:
                 step_rollout_buf.append(step_rollout_flat)
                 xy_rollout_buf.append(xy_rollout_flat)
                 yaw_rollout_buf.append(yaw_rollout_flat)
-                buf_rollout_samples += B * (T - 1)
+                buf_rollout_samples += n_valid
 
             if buf_encoder_samples >= SHARD_SAMPLES:
                 flush_shard()
@@ -704,16 +754,17 @@ def extract_latents(args, device) -> str:
 def load_cached_latents(cache_dir: str):
     """Load all shards and return encoder-view and rollout-view latent banks."""
     manifest = torch.load(os.path.join(cache_dir, "manifest.pt"), map_location="cpu")
-    z_enc_all, bid_enc_all, br_enc_all = [], [], []
+    z_enc_all, sid_enc_all, bid_enc_all, br_enc_all = [], [], [], []
     epid_enc_all, step_enc_all = [], []
     xy_enc_all, yaw_enc_all = [], []
-    z_rollout_all, st_rollout_all = [], []
+    z_rollout_all, sid_rollout_all, st_rollout_all = [], [], []
     bid_rollout_all, br_rollout_all, coll_rollout_all = [], [], []
     epid_rollout_all, step_rollout_all = [], []
     xy_rollout_all, yaw_rollout_all = [], []
     for i in range(manifest["n_shards"]):
         shard = torch.load(os.path.join(cache_dir, f"shard_{i:04d}.pt"), map_location="cpu")
         z_enc_all.append(shard["z_enc"])
+        sid_enc_all.append(shard.get("scene_id_enc", torch.full((shard["z_enc"].shape[0],), -1, dtype=torch.long)))
         bid_enc_all.append(shard["beacon_identity_enc"])
         br_enc_all.append(shard["beacon_range_enc"])
         epid_enc_all.append(shard.get("episode_id_enc", torch.empty((0,), dtype=torch.long)))
@@ -721,6 +772,7 @@ def load_cached_latents(cache_dir: str):
         xy_enc_all.append(shard.get("robot_xy_enc", torch.empty((0, 2), dtype=torch.float32)))
         yaw_enc_all.append(shard.get("robot_yaw_enc", torch.empty((0,), dtype=torch.float32)))
         z_rollout_all.append(shard["z_rollout"])
+        sid_rollout_all.append(shard.get("scene_id_rollout", torch.full((shard["z_rollout"].shape[0],), -1, dtype=torch.long)))
         st_rollout_all.append(shard["safety_target_rollout"])
         bid_rollout_all.append(shard["beacon_identity_rollout"])
         br_rollout_all.append(shard["beacon_range_rollout"])
@@ -735,6 +787,7 @@ def load_cached_latents(cache_dir: str):
         )
 
     enc_z = torch.cat(z_enc_all)
+    enc_sid = torch.cat(sid_enc_all)
     enc_bid = torch.cat(bid_enc_all)
     enc_br = torch.cat(br_enc_all)
     enc_epid = torch.cat(epid_enc_all)
@@ -742,6 +795,7 @@ def load_cached_latents(cache_dir: str):
     enc_xy = torch.cat(xy_enc_all)
     enc_yaw = torch.cat(yaw_enc_all)
     rollout_z = torch.cat(z_rollout_all)
+    rollout_sid = torch.cat(sid_rollout_all)
     rollout_st = torch.cat(st_rollout_all)
     rollout_bid = torch.cat(bid_rollout_all)
     rollout_br = torch.cat(br_rollout_all)
@@ -761,6 +815,7 @@ def load_cached_latents(cache_dir: str):
     return {
         "encoder": {
             "z": enc_z,
+            "scene_id": enc_sid,
             "beacon_identity": enc_bid,
             "beacon_range": enc_br,
             "episode_id": enc_epid,
@@ -770,6 +825,7 @@ def load_cached_latents(cache_dir: str):
         },
         "rollout": {
             "z": rollout_z,
+            "scene_id": rollout_sid,
             "safety_target": rollout_st,
             "beacon_identity": rollout_bid,
             "beacon_range": rollout_br,
@@ -782,42 +838,42 @@ def load_cached_latents(cache_dir: str):
     }
 
 
-def build_rollout_holdout_masks(
-    episode_id: torch.Tensor,
+def build_group_holdout_masks(
+    group_id: torch.Tensor,
     holdout_fraction: float,
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]] | None:
-    """Split rollout samples by episode id so evaluation uses unseen episodes."""
+    """Split samples by group id so evaluation uses unseen groups."""
     if holdout_fraction <= 0.0:
         return None
-    valid = episode_id >= 0
+    valid = group_id >= 0
     if not torch.any(valid):
         return None
 
-    unique_eps = torch.unique(episode_id[valid], sorted=True)
-    n_eps = int(unique_eps.numel())
-    if n_eps < 2:
+    unique_groups = torch.unique(group_id[valid], sorted=True)
+    n_groups = int(unique_groups.numel())
+    if n_groups < 2:
         return None
 
-    n_eval_eps = max(1, int(round(float(holdout_fraction) * n_eps)))
-    n_eval_eps = min(n_eval_eps, n_eps - 1)
-    if n_eval_eps <= 0:
+    n_eval_groups = max(1, int(round(float(holdout_fraction) * n_groups)))
+    n_eval_groups = min(n_eval_groups, n_groups - 1)
+    if n_eval_groups <= 0:
         return None
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
-    perm = torch.randperm(n_eps, generator=generator)
-    eval_eps = unique_eps[perm[:n_eval_eps]]
-    eval_mask = valid & torch.isin(episode_id, eval_eps)
+    perm = torch.randperm(n_groups, generator=generator)
+    eval_groups = unique_groups[perm[:n_eval_groups]]
+    eval_mask = valid & torch.isin(group_id, eval_groups)
     train_mask = valid & (~eval_mask)
 
     if not torch.any(train_mask) or not torch.any(eval_mask):
         return None
 
     return train_mask, eval_mask, {
-        "n_episodes": n_eps,
-        "n_train_episodes": int(torch.unique(episode_id[train_mask]).numel()),
-        "n_eval_episodes": int(torch.unique(episode_id[eval_mask]).numel()),
+        "n_groups": n_groups,
+        "n_train_groups": int(torch.unique(group_id[train_mask]).numel()),
+        "n_eval_groups": int(torch.unique(group_id[eval_mask]).numel()),
         "n_train_samples": int(train_mask.sum().item()),
         "n_eval_samples": int(eval_mask.sum().item()),
     }
@@ -1124,6 +1180,45 @@ def novel_path_area_gain_proxy(
     return novel_length_m * (2.0 * radius_m)
 
 
+def escape_frontier_value_proxy(
+    context_xy_seq: torch.Tensor,
+    future_xy_seq: torch.Tensor,
+    radius_m: float,
+    densify_step_m: float,
+) -> float:
+    """Pose-based sequence target for leaving a local basin and opening frontier.
+
+    The target mixes:
+    - frontier area gain beyond recent context
+    - terminal distance from the recent context support
+    - maximum distance achieved from the recent context support
+    """
+    if context_xy_seq.shape[0] == 0 or future_xy_seq.shape[0] == 0:
+        return 0.0
+
+    context_dense = densify_xy_path(context_xy_seq, densify_step_m)
+    chained_future = torch.cat(
+        [context_xy_seq[-1:].to(dtype=torch.float32), future_xy_seq.to(dtype=torch.float32)],
+        dim=0,
+    )
+    future_dense = densify_xy_path(chained_future, densify_step_m)
+    if future_dense.shape[0] <= 1:
+        return 0.0
+    future_dense = future_dense[1:]
+
+    frontier_gain = novel_path_area_gain_proxy(
+        context_xy_seq,
+        future_xy_seq,
+        radius_m=radius_m,
+        densify_step_m=densify_step_m,
+    )
+    dists = torch.cdist(future_dense, context_dense)
+    min_d = dists.amin(dim=1)
+    terminal_escape = max(0.0, float(min_d[-1].item()) - float(radius_m))
+    peak_escape = max(0.0, float(min_d.max().item()) - float(radius_m))
+    return frontier_gain + (2.0 * terminal_escape) + peak_escape
+
+
 def build_displacement_pairs(
     z_enc: torch.Tensor,
     enc_episode_id: torch.Tensor,
@@ -1276,6 +1371,100 @@ def build_coverage_gain_pairs(
         torch.stack(z_now_pairs, dim=0),
         torch.stack(z_future_seq_pairs, dim=0),
         torch.cat(target_gain_pairs, dim=0),
+    )
+
+
+def build_escape_frontier_pairs(
+    z_enc: torch.Tensor,
+    enc_episode_id: torch.Tensor,
+    enc_obs_step: torch.Tensor,
+    enc_robot_xy: torch.Tensor,
+    z_rollout: torch.Tensor,
+    rollout_episode_id: torch.Tensor,
+    rollout_obs_step: torch.Tensor,
+    rollout_robot_xy: torch.Tensor,
+    escape_frontier_hops: int,
+    escape_frontier_target_hops: int,
+    escape_frontier_context_hops: int,
+    temporal_stride: int,
+    escape_frontier_radius_m: float,
+    escape_frontier_densify_step_m: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build sequence targets for escaping the local basin and opening frontier."""
+    if escape_frontier_hops <= 0:
+        raise ValueError(f"escape_frontier_hops must be positive, got {escape_frontier_hops}")
+    if escape_frontier_target_hops < escape_frontier_hops:
+        raise ValueError(
+            "escape_frontier_target_hops must be >= escape_frontier_hops, got "
+            f"{escape_frontier_target_hops} < {escape_frontier_hops}",
+        )
+
+    current_bank = dedup_pose_latent_bank(z_enc, enc_episode_id, enc_obs_step, enc_robot_xy)
+    future_bank = dedup_pose_latent_bank(z_rollout, rollout_episode_id, rollout_obs_step, rollout_robot_xy)
+    raw_stride = int(temporal_stride)
+
+    z_now_pairs: list[torch.Tensor] = []
+    z_future_seq_pairs: list[torch.Tensor] = []
+    target_pairs: list[torch.Tensor] = []
+
+    for ep, cur_steps in current_bank.items():
+        fut_steps = future_bank.get(ep)
+        if not fut_steps:
+            continue
+        for cur_step, (z_now, xy_now) in cur_steps.items():
+            snippet_steps = [cur_step + raw_stride * i for i in range(1, int(escape_frontier_hops) + 1)]
+            target_steps = [cur_step + raw_stride * i for i in range(1, int(escape_frontier_target_hops) + 1)]
+            if any(step not in fut_steps for step in snippet_steps):
+                continue
+            if any(step not in fut_steps for step in target_steps):
+                continue
+
+            context_steps = [cur_step]
+            for hop in range(int(escape_frontier_context_hops), 0, -1):
+                prev_step = cur_step - raw_stride * hop
+                if prev_step in cur_steps:
+                    context_steps.insert(-1 if context_steps else 0, prev_step)
+            context_steps = sorted(set(context_steps))
+
+            context_xy_seq = torch.stack(
+                [cur_steps[step][1].to(dtype=torch.float32) for step in context_steps],
+                dim=0,
+            )
+            if context_xy_seq.shape[0] == 0:
+                context_xy_seq = xy_now.view(1, 2).to(dtype=torch.float32)
+
+            snippet_pairs = [fut_steps[step] for step in snippet_steps]
+            target_pairs_xy = [fut_steps[step] for step in target_steps]
+            future_latents = torch.stack(
+                [z_future.to(dtype=torch.float32) for z_future, _xy in snippet_pairs],
+                dim=0,
+            )
+            future_xy_seq = torch.stack(
+                [xy_future.to(dtype=torch.float32) for _z_future, xy_future in target_pairs_xy],
+                dim=0,
+            )
+            frontier_value = escape_frontier_value_proxy(
+                context_xy_seq,
+                future_xy_seq,
+                radius_m=float(escape_frontier_radius_m),
+                densify_step_m=float(escape_frontier_densify_step_m),
+            )
+
+            z_now_pairs.append(z_now.to(dtype=torch.float32))
+            z_future_seq_pairs.append(future_latents)
+            target_pairs.append(torch.tensor([frontier_value], dtype=torch.float32))
+
+    if not z_now_pairs:
+        raise ValueError(
+            "No valid current->future rollout escape/frontier pairs were found. "
+            "Check that pose metadata exists and escape_frontier_hops is compatible "
+            "with the cached temporal stride."
+        )
+
+    return (
+        torch.stack(z_now_pairs, dim=0),
+        torch.stack(z_future_seq_pairs, dim=0),
+        torch.cat(target_pairs, dim=0),
     )
 
 
@@ -1599,6 +1788,170 @@ def evaluate_coverage_gain_head(
         f"pearson={metrics['pearson']:.3f} "
         f"pred={metrics['pred_mean_m2']:.4f}m^2 "
         f"target={metrics['target_mean_m2']:.4f}m^2"
+    )
+    return metrics
+
+
+def train_escape_frontier_head(
+    args,
+    z_now_pairs: torch.Tensor,
+    z_future_seq_pairs: torch.Tensor,
+    target_pairs: torch.Tensor,
+    device,
+):
+    print("\n" + "=" * 60)
+    print("Phase 9: Training EscapeFrontierHead (sequence-level escape/frontier value)")
+    print("=" * 60)
+    print(
+        f"  Pairs: {int(target_pairs.numel()):,} | "
+        f"hops={int(args.escape_frontier_hops)} | "
+        f"target_hops={int(args.escape_frontier_target_hops)} | "
+        f"context={int(args.escape_frontier_context_hops)} | "
+        f"target_mean={float(target_pairs.mean().item()):.4f}"
+    )
+
+    dataset = TensorDataset(
+        z_now_pairs.to(dtype=torch.float32),
+        z_future_seq_pairs.to(dtype=torch.float32),
+        target_pairs.to(dtype=torch.float32),
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.escape_frontier_batch_size)),
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+    )
+    print(f"  {len(dataloader)} batches of {max(1, int(args.escape_frontier_batch_size))}")
+
+    head = EscapeFrontierHead(
+        latent_dim=args.latent_dim,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+    ).to(device)
+    head = torch.compile(head)
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=args.escape_frontier_lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.escape_frontier_epochs)
+
+    csv_path = os.path.join(args.log_dir, "escape_frontier_head_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow([
+                "step", "epoch", "loss", "pred_mean", "target_mean", "lr",
+            ])
+
+    global_step = 0
+    for epoch in range(args.escape_frontier_epochs):
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+        head.train()
+
+        with make_progress(args, dataloader, desc=f"  Escape {epoch + 1}/{args.escape_frontier_epochs}") as pbar:
+            for z_now_batch, z_future_seq_batch, target_batch in pbar:
+                z_now_batch = z_now_batch.to(device, non_blocking=True)
+                z_future_seq_batch = z_future_seq_batch.to(device, non_blocking=True)
+                target_batch = target_batch.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                pred = head(z_now_batch, z_future_seq_batch)
+                loss = F.mse_loss(pred, target_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(head.parameters(), max_norm=args.grad_clip)
+                optimizer.step()
+
+                global_step += 1
+                loss_val = float(loss.item())
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step,
+                        epoch + 1,
+                        f"{loss_val:.6f}",
+                        f"{pred.detach().mean().item():.6f}",
+                        f"{target_batch.detach().mean().item():.6f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        pred=f"{pred.detach().mean().item():.4f}",
+                        target=f"{target_batch.detach().mean().item():.4f}",
+                    )
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.6f} | time={time.time() - t0:.0f}s")
+
+    torch.save(
+        {"escape_frontier_head_state_dict": head.state_dict(), "epoch": args.escape_frontier_epochs},
+        os.path.join(args.out_dir, "escape_frontier_head.pt"),
+    )
+    print("  Escape/frontier head training complete.")
+    return head
+
+
+def evaluate_escape_frontier_head(
+    args,
+    head: nn.Module,
+    z_now_pairs: torch.Tensor,
+    z_future_seq_pairs: torch.Tensor,
+    target_pairs: torch.Tensor,
+    device,
+) -> dict[str, float] | None:
+    if target_pairs.numel() == 0:
+        return None
+
+    dataset = TensorDataset(z_now_pairs, z_future_seq_pairs, target_pairs)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.eval_batch_size)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    preds_all: list[torch.Tensor] = []
+    target_all: list[torch.Tensor] = []
+    head.eval()
+    with torch.inference_mode():
+        for z_now_batch, z_future_seq_batch, target_batch in dataloader:
+            z_now_batch = z_now_batch.to(device, non_blocking=True)
+            z_future_seq_batch = z_future_seq_batch.to(device, non_blocking=True)
+            pred = head(z_now_batch, z_future_seq_batch).float().cpu()
+            preds_all.append(pred)
+            target_all.append(target_batch.float().cpu())
+
+    pred = torch.cat(preds_all)
+    target = torch.cat(target_all)
+    mse = float((pred - target).square().mean().item())
+    metrics = {
+        "mse": mse,
+        "rmse": math.sqrt(max(0.0, mse)),
+        "mae": float((pred - target).abs().mean().item()),
+        "pearson": pearson_corrcoef(pred, target),
+        "pred_mean": float(pred.mean().item()),
+        "target_mean": float(target.mean().item()),
+        "n_eval": int(target.numel()),
+    }
+    print(
+        "  Held-out escape/frontier | "
+        f"n={metrics['n_eval']:,} "
+        f"rmse={metrics['rmse']:.4f} "
+        f"mae={metrics['mae']:.4f} "
+        f"pearson={metrics['pearson']:.3f} "
+        f"pred={metrics['pred_mean']:.4f} "
+        f"target={metrics['target_mean']:.4f}"
     )
     return metrics
 
@@ -2506,12 +2859,14 @@ def train(args):
     print("\nLoading cached latents...")
     latent_views = load_cached_latents(cache_dir)
     z_enc = latent_views["encoder"]["z"]
+    enc_scene_id = latent_views["encoder"]["scene_id"]
     beacon_id_enc = latent_views["encoder"]["beacon_identity"]
     beacon_range_enc = latent_views["encoder"]["beacon_range"]
     enc_episode_id = latent_views["encoder"]["episode_id"]
     enc_obs_step = latent_views["encoder"]["obs_step"]
     enc_robot_xy = latent_views["encoder"]["robot_xy"]
     z_rollout = latent_views["rollout"]["z"]
+    rollout_scene_id = latent_views["rollout"]["scene_id"]
     safety_target_rollout = latent_views["rollout"]["safety_target"]
     rollout_collisions = latent_views["rollout"]["collisions"]
     rollout_episode_id = latent_views["rollout"]["episode_id"]
@@ -2529,58 +2884,72 @@ def train(args):
     z_rollout_eval = torch.empty((0, z_rollout.shape[-1]), dtype=z_rollout.dtype)
     safety_target_eval = torch.empty((0,), dtype=safety_target_rollout.dtype)
     z_enc_train = z_enc
+    enc_scene_id_train = enc_scene_id
     enc_episode_id_train = enc_episode_id
     enc_obs_step_train = enc_obs_step
     enc_robot_xy_train = enc_robot_xy
     z_enc_eval = torch.empty((0, z_enc.shape[-1]), dtype=z_enc.dtype)
+    enc_scene_id_eval = torch.empty((0,), dtype=enc_scene_id.dtype)
     enc_episode_id_eval = torch.empty((0,), dtype=enc_episode_id.dtype)
     enc_obs_step_eval = torch.empty((0,), dtype=enc_obs_step.dtype)
     enc_robot_xy_eval = torch.empty((0, 2), dtype=enc_robot_xy.dtype)
+    rollout_scene_id_train = rollout_scene_id
     rollout_episode_id_train = rollout_episode_id
     rollout_obs_step_train = rollout_obs_step
     rollout_robot_xy_train = rollout_robot_xy
+    rollout_scene_id_eval = torch.empty((0,), dtype=rollout_scene_id.dtype)
     rollout_episode_id_eval = torch.empty((0,), dtype=rollout_episode_id.dtype)
     rollout_obs_step_eval = torch.empty((0,), dtype=rollout_obs_step.dtype)
     rollout_robot_xy_eval = torch.empty((0, 2), dtype=rollout_robot_xy.dtype)
     if not args.skip_eval:
-        split = build_rollout_holdout_masks(
-            rollout_episode_id,
+        split_group = rollout_scene_id if args.eval_split_group == "scene" else rollout_episode_id
+        split = build_group_holdout_masks(
+            split_group,
             holdout_fraction=float(args.eval_holdout_fraction),
             seed=int(args.eval_seed),
         )
         if split is None:
-            print("Held-out eval: disabled (not enough valid rollout episodes for a split).")
+            print("Held-out eval: disabled (not enough valid groups for the requested split).")
         else:
             train_mask, eval_mask, split_info = split
             z_rollout_train = z_rollout[train_mask]
             safety_target_train = safety_target_rollout[train_mask]
+            rollout_scene_id_train = rollout_scene_id[train_mask]
             rollout_episode_id_train = rollout_episode_id[train_mask]
             rollout_obs_step_train = rollout_obs_step[train_mask]
             rollout_robot_xy_train = rollout_robot_xy[train_mask]
             z_rollout_eval = z_rollout[eval_mask]
             safety_target_eval = safety_target_rollout[eval_mask]
             rollout_collisions_eval = rollout_collisions[eval_mask]
+            rollout_scene_id_eval = rollout_scene_id[eval_mask]
             rollout_episode_id_eval = rollout_episode_id[eval_mask]
             rollout_obs_step_eval = rollout_obs_step[eval_mask]
             rollout_robot_xy_eval = rollout_robot_xy[eval_mask]
-            eval_eps = torch.unique(rollout_episode_id_eval[rollout_episode_id_eval >= 0], sorted=True)
-            if eval_eps.numel() > 0:
+            if args.eval_split_group == "scene":
+                eval_groups = torch.unique(rollout_scene_id_eval[rollout_scene_id_eval >= 0], sorted=True)
+                enc_valid = enc_scene_id >= 0
+                enc_eval_mask = enc_valid & torch.isin(enc_scene_id, eval_groups)
+            else:
+                eval_groups = torch.unique(rollout_episode_id_eval[rollout_episode_id_eval >= 0], sorted=True)
                 enc_valid = enc_episode_id >= 0
-                enc_eval_mask = enc_valid & torch.isin(enc_episode_id, eval_eps)
+                enc_eval_mask = enc_valid & torch.isin(enc_episode_id, eval_groups)
+            if eval_groups.numel() > 0:
                 enc_train_mask = enc_valid & (~enc_eval_mask)
                 if torch.any(enc_train_mask):
                     z_enc_train = z_enc[enc_train_mask]
+                    enc_scene_id_train = enc_scene_id[enc_train_mask]
                     enc_episode_id_train = enc_episode_id[enc_train_mask]
                     enc_obs_step_train = enc_obs_step[enc_train_mask]
                     enc_robot_xy_train = enc_robot_xy[enc_train_mask]
                 if torch.any(enc_eval_mask):
                     z_enc_eval = z_enc[enc_eval_mask]
+                    enc_scene_id_eval = enc_scene_id[enc_eval_mask]
                     enc_episode_id_eval = enc_episode_id[enc_eval_mask]
                     enc_obs_step_eval = enc_obs_step[enc_eval_mask]
                     enc_robot_xy_eval = enc_robot_xy[enc_eval_mask]
             print(
-                "Held-out eval split: "
-                f"episodes train/eval={split_info['n_train_episodes']}/{split_info['n_eval_episodes']} "
+                f"Held-out eval split ({args.eval_split_group}): "
+                f"groups train/eval={split_info['n_train_groups']}/{split_info['n_eval_groups']} "
                 f"samples train/eval={split_info['n_train_samples']:,}/{split_info['n_eval_samples']:,}"
             )
 
@@ -2776,6 +3145,68 @@ def train(args):
                     if metrics is not None:
                         holdout_metrics["coverage_gain"] = metrics
 
+    # Phase 9: sequence-level escape/frontier head
+    escape_frontier_head = None
+    if not args.skip_escape_frontier:
+        try:
+            z_now_escape_train, z_future_escape_train, target_escape_train = build_escape_frontier_pairs(
+                z_enc_train,
+                enc_episode_id_train,
+                enc_obs_step_train,
+                enc_robot_xy_train,
+                z_rollout_train,
+                rollout_episode_id_train,
+                rollout_obs_step_train,
+                rollout_robot_xy_train,
+                escape_frontier_hops=int(args.escape_frontier_hops),
+                escape_frontier_target_hops=int(args.escape_frontier_target_hops),
+                escape_frontier_context_hops=int(args.escape_frontier_context_hops),
+                temporal_stride=int(args.temporal_stride),
+                escape_frontier_radius_m=float(args.escape_frontier_radius_m),
+                escape_frontier_densify_step_m=float(args.escape_frontier_densify_step_m),
+            )
+        except ValueError as exc:
+            print(f"  Skipping escape/frontier head: {exc}")
+        else:
+            escape_frontier_head = train_escape_frontier_head(
+                args,
+                z_now_escape_train,
+                z_future_escape_train,
+                target_escape_train,
+                device,
+            )
+            if z_enc_eval.numel() > 0 and z_rollout_eval.numel() > 0:
+                try:
+                    z_now_escape_eval, z_future_escape_eval, target_escape_eval = build_escape_frontier_pairs(
+                        z_enc_eval,
+                        enc_episode_id_eval,
+                        enc_obs_step_eval,
+                        enc_robot_xy_eval,
+                        z_rollout_eval,
+                        rollout_episode_id_eval,
+                        rollout_obs_step_eval,
+                        rollout_robot_xy_eval,
+                        escape_frontier_hops=int(args.escape_frontier_hops),
+                        escape_frontier_target_hops=int(args.escape_frontier_target_hops),
+                        escape_frontier_context_hops=int(args.escape_frontier_context_hops),
+                        temporal_stride=int(args.temporal_stride),
+                        escape_frontier_radius_m=float(args.escape_frontier_radius_m),
+                        escape_frontier_densify_step_m=float(args.escape_frontier_densify_step_m),
+                    )
+                except ValueError:
+                    z_now_escape_eval = None
+                if z_now_escape_eval is not None:
+                    metrics = evaluate_escape_frontier_head(
+                        args,
+                        escape_frontier_head,
+                        z_now_escape_eval,
+                        z_future_escape_eval,
+                        target_escape_eval,
+                        device,
+                    )
+                    if metrics is not None:
+                        holdout_metrics["escape_frontier"] = metrics
+
     # Save combined TrajectoryScorer checkpoint
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
     scorer_data = {
@@ -2786,16 +3217,24 @@ def train(args):
         "place_head": place_head.state_dict() if place_head is not None else None,
         "displacement_head": displacement_head.state_dict() if displacement_head is not None else None,
         "coverage_gain_head": coverage_gain_head.state_dict() if coverage_gain_head is not None else None,
+        "escape_frontier_head": (
+            escape_frontier_head.state_dict() if escape_frontier_head is not None else None
+        ),
         "goal_weight": args.goal_weight,
         "progress_weight": args.progress_weight,
         "exploration_weight": args.exploration_weight,
         "displacement_weight": args.displacement_weight,
         "coverage_gain_weight": args.coverage_gain_weight,
+        "escape_frontier_weight": args.escape_frontier_weight,
         "displacement_hops": args.displacement_hops,
         "coverage_gain_hops": args.coverage_gain_hops,
         "coverage_gain_target_hops": args.coverage_gain_target_hops,
         "coverage_gain_context_hops": args.coverage_gain_context_hops,
         "coverage_gain_radius_m": args.coverage_gain_radius_m,
+        "escape_frontier_hops": args.escape_frontier_hops,
+        "escape_frontier_target_hops": args.escape_frontier_target_hops,
+        "escape_frontier_context_hops": args.escape_frontier_context_hops,
+        "escape_frontier_radius_m": args.escape_frontier_radius_m,
         "latent_dim": args.latent_dim,
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
@@ -2808,6 +3247,7 @@ def train(args):
         "place_latent_source": "pred_projector_teacher_forced_snippet",
         "displacement_latent_source": "enc_projector_to_pred_projector_teacher_forced",
         "coverage_gain_latent_source": "enc_projector_to_pred_projector_teacher_forced_snippet",
+        "escape_frontier_latent_source": "enc_projector_to_pred_projector_teacher_forced_snippet",
         "place_supervision": (
             "pose_xy_same_episode"
             if args.raw_data_dir is not None
@@ -2823,9 +3263,15 @@ def train(args):
             if args.raw_data_dir is not None
             else None
         ),
+        "escape_frontier_supervision": (
+            "pose_xy_escape_plus_frontier_same_episode"
+            if args.raw_data_dir is not None
+            else None
+        ),
         "goal_latent_source": "enc_projector",
         "progress_latent_source": "enc_projector",
         "cache_version": CACHE_VERSION,
+        "eval_split_group": args.eval_split_group,
         "holdout_metrics": holdout_metrics,
         "seq_len": args.seq_len,
         "temporal_stride": args.temporal_stride,

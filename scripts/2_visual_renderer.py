@@ -568,6 +568,10 @@ def stitch_hdf5(
             if "beacon_layout" in data:
                 raw = data["beacon_layout"]
                 h5f.attrs["beacon_layout"] = str(raw.item() if hasattr(raw, "item") else raw)
+            for attr_key in ("scene_seed", "scene_type", "scene_meta"):
+                if attr_key in data:
+                    raw = data[attr_key]
+                    h5f.attrs[attr_key] = raw.item() if hasattr(raw, "item") else raw
             h5f.attrs["label_visibility_mode"] = "fov_range_front_los"
 
             # Copy vision from either temporary render shards or an existing HDF5.

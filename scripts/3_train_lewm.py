@@ -92,6 +92,11 @@ def parse_args() -> argparse.Namespace:
                    help="ViT patch size. Defaults to 14 for 224px data and 4 for 64px data.")
     p.add_argument("--use_proprio", action="store_true",
                    help="Fuse proprioception instead of the paper's vision-only encoder.")
+    p.add_argument("--skip_eval", action="store_true",
+                   help="Disable held-out scene evaluation for the base world model.")
+    p.add_argument("--eval_holdout_fraction", type=float, default=0.10,
+                   help="Fraction of scene groups held out for world-model validation.")
+    p.add_argument("--eval_seed", type=int, default=42)
     p.add_argument("--no_progress", action="store_true",
                    help="Disable animated tqdm progress bars and emit plain logs only.")
     return p.parse_args()
@@ -152,12 +157,46 @@ def progress_write(message: str, pbar=None) -> None:
     pbar.write(message)
 
 
+def build_transition_mask(
+    dones: torch.Tensor,
+    labels: dict | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if labels is not None and "episode_id" in labels:
+        episode_id = labels["episode_id"].to(device, non_blocking=True)
+        return episode_id[:, :-1] == episode_id[:, 1:]
+    return ~dones[:, 1:]
+
+
+def split_scene_ids(
+    scene_ids: list[int],
+    holdout_fraction: float,
+    seed: int,
+) -> tuple[set[int], set[int]] | None:
+    if holdout_fraction <= 0.0 or len(scene_ids) < 2:
+        return None
+    n_scenes = len(scene_ids)
+    n_eval = max(1, int(round(float(holdout_fraction) * n_scenes)))
+    n_eval = min(n_eval, n_scenes - 1)
+    if n_eval <= 0:
+        return None
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(n_scenes, generator=generator).tolist()
+    eval_ids = {int(scene_ids[idx]) for idx in perm[:n_eval]}
+    train_ids = {int(scene_id) for scene_id in scene_ids if int(scene_id) not in eval_ids}
+    if not train_ids or not eval_ids:
+        return None
+    return train_ids, eval_ids
+
+
 # --------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------- #
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
     print(f"Initialising LeWorldModel training on {device}")
     action_block_size = (
         args.action_block_size if args.action_block_size is not None else args.temporal_stride
@@ -180,7 +219,7 @@ def train(args: argparse.Namespace) -> None:
 
     # ---- Dataset / DataLoader ----------------------------------------
     num_workers = max(1, int(args.num_workers))
-    dataset = StreamingJEPADataset(
+    dataset_kwargs = dict(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
         temporal_stride=args.temporal_stride,
@@ -193,6 +232,35 @@ def train(args: argparse.Namespace) -> None:
         require_no_collision=False,
         num_workers=num_workers,
     )
+    dataset = StreamingJEPADataset(**dataset_kwargs)
+    train_dataset = dataset
+    eval_dataset = None
+    split = None if args.skip_eval else split_scene_ids(
+        sorted(set(int(scene_id) for scene_id in dataset._scene_ids.values())),
+        holdout_fraction=float(args.eval_holdout_fraction),
+        seed=int(args.eval_seed),
+    )
+    if split is None:
+        if args.skip_eval:
+            print("Held-out scene eval: disabled (--skip_eval).")
+        else:
+            print("Held-out scene eval: disabled (not enough scenes for a split).")
+    else:
+        train_scene_ids, eval_scene_ids = split
+        train_dataset = StreamingJEPADataset(
+            **dataset_kwargs,
+            allowed_scene_ids=train_scene_ids,
+        )
+        eval_dataset = StreamingJEPADataset(
+            **dataset_kwargs,
+            allowed_scene_ids=eval_scene_ids,
+        )
+        print(
+            "Held-out scene eval split: "
+            f"scenes train/eval={len(train_scene_ids)}/{len(eval_scene_ids)} "
+            f"windows train/eval={len(train_dataset._all_indices):,}/{len(eval_dataset._all_indices):,}"
+        )
+
     channels, height, width = dataset.vision_shape
     if channels != 3 or height != width:
         raise ValueError(f"Expected square RGB inputs, got shape {dataset.vision_shape}")
@@ -215,13 +283,23 @@ def train(args: argparse.Namespace) -> None:
         )
 
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=None,
         num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=max(1, int(args.prefetch_factor)),
         persistent_workers=True,
     )
+    eval_dataloader = None
+    if eval_dataset is not None:
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=None,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=max(1, int(args.prefetch_factor)),
+            persistent_workers=True,
+        )
 
     # ---- Model -------------------------------------------------------
     model = LeWorldModel(
@@ -251,6 +329,8 @@ def train(args: argparse.Namespace) -> None:
         "patch_size": int(patch_size),
         "use_proprio": bool(args.use_proprio),
         "max_seq_len": int(args.seq_len),
+        "eval_holdout_fraction": float(args.eval_holdout_fraction),
+        "eval_split_group": "scene",
     }
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -304,6 +384,76 @@ def train(args: argparse.Namespace) -> None:
                 "step", "epoch", "total_loss", "pred_loss", "sigreg_loss",
                 "lr", "z_proj_std", "grad_norm",
             ])
+    eval_csv_path = os.path.join(args.log_dir, "eval_metrics.csv")
+    if eval_dataloader is not None and not os.path.exists(eval_csv_path):
+        with open(eval_csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "epoch", "global_step", "total_loss", "pred_loss",
+                "sigreg_loss", "z_proj_std",
+            ])
+
+    def run_eval(epoch_idx: int) -> None:
+        if eval_dataloader is None:
+            return
+        model.eval()
+        total_loss_sum = 0.0
+        pred_loss_sum = 0.0
+        sigreg_loss_sum = 0.0
+        z_std_sum = 0.0
+        n_batches = 0
+        with torch.inference_mode():
+            for batch in eval_dataloader:
+                if len(batch) == 6:
+                    vision, proprio, cmds, dones, collisions, labels = batch
+                else:
+                    vision, proprio, cmds, dones, collisions = batch
+                    labels = None
+
+                vision = vision.to(device, non_blocking=True).float().div_(255.0)
+                proprio = proprio.to(device, non_blocking=True)
+                cmds = cmds.to(device, non_blocking=True)
+                dones = dones.to(device, non_blocking=True)
+                mask = build_transition_mask(dones, labels, device)
+
+                with autocast(amp_device, dtype=torch.bfloat16):
+                    out = model(vision, proprio, cmds, mask=mask)
+
+                total_loss_sum += float(out["loss"].item())
+                pred_loss_sum += float(out["pred_loss"].item())
+                sigreg_loss_sum += float(out["sigreg_loss"].item())
+                z_std_sum += float(out["z_proj_std"].item())
+                n_batches += 1
+
+        if n_batches == 0:
+            print(f"Eval epoch {epoch_idx + 1}: no held-out batches.")
+            model.train()
+            return
+
+        metrics = {
+            "total_loss": total_loss_sum / n_batches,
+            "pred_loss": pred_loss_sum / n_batches,
+            "sigreg_loss": sigreg_loss_sum / n_batches,
+            "z_proj_std": z_std_sum / n_batches,
+        }
+        with open(eval_csv_path, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch_idx + 1,
+                global_step,
+                f"{metrics['total_loss']:.6f}",
+                f"{metrics['pred_loss']:.6f}",
+                f"{metrics['sigreg_loss']:.6f}",
+                f"{metrics['z_proj_std']:.6f}",
+            ])
+        print(
+            f"Held-out eval epoch {epoch_idx + 1} | "
+            f"loss={metrics['total_loss']:.4f} "
+            f"pred={metrics['pred_loss']:.4f} "
+            f"sig={metrics['sigreg_loss']:.4f} "
+            f"z_std={metrics['z_proj_std']:.3f}"
+        )
+        model.train()
 
     # ---- Training loop -----------------------------------------------
     for epoch in range(start_epoch, args.epochs):
@@ -317,9 +467,10 @@ def train(args: argparse.Namespace) -> None:
             for batch in pbar:
                 # Dataset returns 5-tuple (old) or 6-tuple (new, with labels dict)
                 if len(batch) == 6:
-                    vision, proprio, cmds, dones, collisions, _labels = batch
+                    vision, proprio, cmds, dones, collisions, labels = batch
                 else:
                     vision, proprio, cmds, dones, collisions = batch
+                    labels = None
 
                 vision = vision.to(device, non_blocking=True).float().div_(255.0)
                 proprio = proprio.to(device, non_blocking=True)
@@ -329,11 +480,11 @@ def train(args: argparse.Namespace) -> None:
 
                 # Keep soft-collision transitions in the loss so the predictor
                 # learns wall-contact dynamics; only reset/teleport boundaries are masked.
-                mask = ~dones[:, 1:]
+                mask = build_transition_mask(dones, labels, device)
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with autocast("cuda", dtype=torch.bfloat16):
+                with autocast(amp_device, dtype=torch.bfloat16):
                     out = model(vision, proprio, cmds, mask=mask)
 
                 total_loss = out["loss"]
@@ -433,6 +584,7 @@ def train(args: argparse.Namespace) -> None:
             f"avg_loss={avg_epoch_loss:.4f} | "
             f"time={elapsed:.0f}s"
         )
+        run_eval(epoch)
 
         epoch_ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch + 1}.pt")
         save_checkpoint(

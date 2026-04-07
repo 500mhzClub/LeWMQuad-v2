@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Pure-perception maze inference with a minimal learned planner.
+"""Pure-perception maze inference with a learned world-model planner.
 
-The active control policy is intentionally narrow:
-  - Explore with learned safety + learned novelty.
-  - Treat beacon similarity as an evaluation signal only, not a planner cost.
-  - Keep simulator geometry for offline metrics only; never use it to steer.
-
-This file still contains some legacy helpers from earlier routing experiments,
-but the main loop no longer uses prototype banks, keyframe graphs, dead-reckoned
-route following, learned progress shaping, or goal-directed mode switching.
+The active stack now supports:
+  - learned safety, goal, and sequence-level exploration value terms
+  - constrained primitive-space planning over rollout latents
+  - persistent perception-only keyframe memory for long-horizon rerouting
+  - simulator geometry only for offline metrics and visualization
 
 python3 scripts/6_infer_pure_wm.py \
     --ppo_ckpt models/ppo/ckpt_20000.pt \
@@ -50,6 +47,7 @@ from lewm.camera_utils import (
     retract_camera_to_safe,
 )
 from lewm.checkpoint_utils import clean_state_dict, load_ppo_checkpoint
+from lewm.command_utils import sample_command_pattern
 from lewm.genesis_utils import init_genesis_once, to_numpy
 from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import generate_enclosed_maze
@@ -57,6 +55,7 @@ from lewm.models import (
     ActorCritic,
     CoverageGainHead,
     DisplacementHead,
+    EscapeFrontierHead,
     ExplorationBonus,
     GoalEnergyHead,
     LatentEnergyHead,
@@ -131,11 +130,14 @@ class PlannerHeads:
     place_head: PlaceSnippetHead | None = None
     coverage_gain_head: CoverageGainHead | None = None
     displacement_head: DisplacementHead | None = None
+    escape_frontier_head: EscapeFrontierHead | None = None
     goal_weight: float = 0.0
     exploration_weight: float = 0.0
     coverage_gain_weight: float = 0.0
     coverage_gain_hops: int = 0
     displacement_weight: float = 0.0
+    escape_frontier_weight: float = 0.0
+    escape_frontier_hops: int = 0
     safety_weight: float = 1.0
 
 
@@ -147,6 +149,55 @@ def summarize_command_sequence(seq: torch.Tensor) -> dict[str, list[Any]]:
         "command_last": seq_cpu[-1].tolist(),
         "command_mean": seq_cpu.mean(dim=0).tolist(),
     }
+
+
+@torch.no_grad()
+def summarize_predicted_rollout_metrics(
+    heads: PlannerHeads | None,
+    z_start_proj: torch.Tensor,
+    z_rollout_proj: torch.Tensor,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    if heads is None:
+        return metrics
+    if z_start_proj.ndim == 1:
+        z_start_proj = z_start_proj.unsqueeze(0)
+    if z_rollout_proj.ndim == 2:
+        z_rollout_proj = z_rollout_proj.unsqueeze(1)
+    if heads.safety_head is not None:
+        metrics["predicted_safety_cost"] = float(
+            heads.safety_head.score_trajectory(z_rollout_proj).squeeze(0).item()
+        )
+    if heads.coverage_gain_head is not None:
+        coverage_hops = int(heads.coverage_gain_hops) if int(heads.coverage_gain_hops) > 0 else int(z_rollout_proj.shape[1])
+        coverage_hops = max(1, min(int(z_rollout_proj.shape[1]), coverage_hops))
+        metrics["predicted_coverage_gain_m2"] = float(
+            heads.coverage_gain_head(
+                z_start_proj.expand(z_rollout_proj.shape[0], -1),
+                z_rollout_proj[:, :coverage_hops, :],
+            ).squeeze(0).item()
+        )
+    if heads.escape_frontier_head is not None:
+        frontier_hops = (
+            int(heads.escape_frontier_hops)
+            if int(heads.escape_frontier_hops) > 0
+            else int(z_rollout_proj.shape[1])
+        )
+        frontier_hops = max(1, min(int(z_rollout_proj.shape[1]), frontier_hops))
+        metrics["predicted_escape_frontier_value"] = float(
+            heads.escape_frontier_head(
+                z_start_proj.expand(z_rollout_proj.shape[0], -1),
+                z_rollout_proj[:, :frontier_hops, :],
+            ).squeeze(0).item()
+        )
+    if heads.displacement_head is not None:
+        metrics["predicted_displacement_m"] = float(
+            heads.displacement_head(
+                z_start_proj.expand(z_rollout_proj.shape[0], -1),
+                z_rollout_proj[:, -1, :],
+            ).squeeze(0).item()
+        )
+    return metrics
 
 
 # ---- Pure CEM planner ---------------------------------------------------- #
@@ -167,6 +218,8 @@ class PureCEMPlanner:
         min_std: torch.Tensor,
         device: torch.device,
         action_penalty_weight: float = 0.001,
+        primitive_bank: torch.Tensor | None = None,
+        primitive_jitter_std: torch.Tensor | None = None,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
@@ -191,17 +244,44 @@ class PureCEMPlanner:
                 )
         self.device = device
         self.action_penalty_weight = action_penalty_weight
+        self.primitive_bank = None
+        self.primitive_jitter_std = None
+        if primitive_bank is not None:
+            primitive_bank = primitive_bank.to(device=device, dtype=torch.float32)
+            if primitive_bank.ndim != 2 or primitive_bank.shape[1] != self.cmd_dim:
+                raise ValueError(
+                    f"primitive_bank must have shape (N, {self.cmd_dim}), got {tuple(primitive_bank.shape)}",
+                )
+            self.primitive_bank = primitive_bank
+            if primitive_jitter_std is None:
+                primitive_jitter_std = torch.zeros_like(self.cmd_low)
+            primitive_jitter_std = primitive_jitter_std.to(device=device, dtype=torch.float32)
+            if primitive_jitter_std.shape != self.cmd_low.shape:
+                raise ValueError(
+                    "primitive_jitter_std must match cmd shape "
+                    f"{tuple(self.cmd_low.shape)}, got {tuple(primitive_jitter_std.shape)}",
+                )
+            self.primitive_jitter_std = primitive_jitter_std
         self._warm_start: torch.Tensor | None = None
+        self._warm_start_indices: torch.Tensor | None = None
 
     def reset(self) -> None:
         self._warm_start = None
+        self._warm_start_indices = None
 
     @torch.no_grad()
     def plan(
         self,
         z_start_raw: torch.Tensor,
         z_start_proj: torch.Tensor | None = None,
+        z_goal_proj: torch.Tensor | None = None,
+        z_route_proj: torch.Tensor | None = None,
+        z_history_raw: torch.Tensor | None = None,
+        action_history: torch.Tensor | None = None,
         heads: PlannerHeads | None = None,
+        goal_cost_mode: str = "off",
+        route_cost_mode: str = "terminal_cosine",
+        route_progress_weight: float = 0.0,
         exploration_bonus_mode: str = "terminal",
         terminal_displacement_weight: float = 0.0,
         exploration_safety_gate_threshold: float | None = None,
@@ -223,18 +303,62 @@ class PureCEMPlanner:
             z0_proj = z_start_proj.to(self.device, dtype=torch.float32)
             if z0_proj.ndim != 2 or z0_proj.shape[0] != 1:
                 raise ValueError(f"Expected z_start_proj shape (1, D), got {tuple(z0_proj.shape)}")
+        z_goal = None
+        if z_goal_proj is not None:
+            z_goal = z_goal_proj.to(self.device, dtype=torch.float32)
+            if z_goal.ndim != 2 or z_goal.shape[0] != 1:
+                raise ValueError(f"Expected z_goal_proj shape (1, D), got {tuple(z_goal.shape)}")
+        z_route = None
+        if z_route_proj is not None:
+            z_route = z_route_proj.to(self.device, dtype=torch.float32)
+            if z_route.ndim != 2 or z_route.shape[0] != 1:
+                raise ValueError(f"Expected z_route_proj shape (1, D), got {tuple(z_route.shape)}")
+        z_hist_batch = None
+        action_hist_batch = None
+        if z_history_raw is not None:
+            z_history_raw = z_history_raw.to(self.device, dtype=torch.float32)
+            if z_history_raw.ndim != 3 or z_history_raw.shape[0] != 1:
+                raise ValueError(
+                    f"Expected z_history_raw shape (1, C, D), got {tuple(z_history_raw.shape)}",
+                )
+            z_hist_batch = z_history_raw.expand(self.n_candidates, -1, -1)
+            if action_history is not None:
+                action_history = action_history.to(self.device, dtype=torch.float32)
+                if action_history.ndim != 3 or action_history.shape[0] != 1:
+                    raise ValueError(
+                        f"Expected action_history shape (1, C-1, cmd_dim), got {tuple(action_history.shape)}",
+                    )
+                action_hist_batch = action_history.expand(self.n_candidates, -1, -1)
 
-        if self._warm_start is not None:
-            mean = self._warm_start.clone()
+        use_primitives = self.primitive_bank is not None and int(self.primitive_bank.shape[0]) > 0
+        if use_primitives:
+            n_primitives = int(self.primitive_bank.shape[0])
+            primitive_probs = torch.full(
+                (self.horizon, n_primitives),
+                1.0 / float(n_primitives),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            warm_indices = self._warm_start_indices.clone() if self._warm_start_indices is not None else None
         else:
-            mean = 0.5 * (self.cmd_low + self.cmd_high)
-            mean = mean.unsqueeze(0).expand(self.horizon, -1).clone()
-        std = self.init_std.unsqueeze(0).expand(self.horizon, -1).clone()
+            if self._warm_start is not None:
+                mean = self._warm_start.clone()
+            else:
+                mean = 0.5 * (self.cmd_low + self.cmd_high)
+                mean = mean.unsqueeze(0).expand(self.horizon, -1).clone()
+            std = self.init_std.unsqueeze(0).expand(self.horizon, -1).clone()
 
-        best_seq = mean.clone()
+        if use_primitives:
+            init_indices = warm_indices if warm_indices is not None else torch.zeros(
+                (self.horizon,), device=self.device, dtype=torch.long,
+            )
+            best_seq = self.primitive_bank[init_indices].detach().clone()
+        else:
+            best_seq = mean.clone()
         best_cost = float("inf")
         best_metrics: dict[str, float] = {}
         diagnostics: dict[str, Any] | None = None
+        best_indices: torch.Tensor | None = None
         prepared_visited_snippets = None
         prepared_visited_snippet_emb = None
         if (
@@ -257,17 +381,47 @@ class PureCEMPlanner:
                 prepared_visited_snippet_emb = heads.place_head(prepared_visited_snippets)
 
         for _ in range(self.cem_iters):
-            noise = torch.randn(
-                self.n_candidates, self.horizon, self.cmd_dim, device=self.device,
-            )
-            samples = mean.unsqueeze(0) + std.unsqueeze(0) * noise
-            samples = samples.clamp(
-                self.cmd_low.view(1, 1, -1),
-                self.cmd_high.view(1, 1, -1),
-            )
-            samples[0] = mean
+            samples_idx = None
+            if use_primitives:
+                if warm_indices is None:
+                    warm_indices = torch.argmax(primitive_probs, dim=-1)
+                samples_idx = torch.empty(
+                    (self.n_candidates, self.horizon),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                for step_idx in range(self.horizon):
+                    samples_idx[:, step_idx] = torch.multinomial(
+                        primitive_probs[step_idx],
+                        self.n_candidates,
+                        replacement=True,
+                    )
+                samples_idx[0] = warm_indices
+                samples = self.primitive_bank[samples_idx]
+                if self.primitive_jitter_std is not None and bool(torch.any(self.primitive_jitter_std > 0).item()):
+                    jitter = torch.randn_like(samples) * self.primitive_jitter_std.view(1, 1, -1)
+                    samples = (samples + jitter).clamp(
+                        self.cmd_low.view(1, 1, -1),
+                        self.cmd_high.view(1, 1, -1),
+                    )
+                    samples[0] = self.primitive_bank[warm_indices]
+            else:
+                noise = torch.randn(
+                    self.n_candidates, self.horizon, self.cmd_dim, device=self.device,
+                )
+                samples = mean.unsqueeze(0) + std.unsqueeze(0) * noise
+                samples = samples.clamp(
+                    self.cmd_low.view(1, 1, -1),
+                    self.cmd_high.view(1, 1, -1),
+                )
+                samples[0] = mean
 
-            z_rollouts_proj = self.world_model.plan_rollout(z0_batch, samples)
+            z_rollouts_proj = self.world_model.plan_rollout(
+                z0_batch,
+                samples,
+                z_history_raw=z_hist_batch,
+                action_history=action_hist_batch,
+            )
             costs = torch.zeros(self.n_candidates, device=self.device)
             metrics: dict[str, torch.Tensor] = {}
 
@@ -277,6 +431,72 @@ class PureCEMPlanner:
                 metrics["safety_cost"] = safety_cost
             else:
                 safety_cost = torch.zeros(self.n_candidates, device=self.device)
+
+            if (
+                heads is not None
+                and z_goal is not None
+                and float(heads.goal_weight) > 0.0
+                and goal_cost_mode != "off"
+            ):
+                z_goal_batch = z_goal.expand(self.n_candidates, -1)
+                if goal_cost_mode == "head":
+                    if heads.goal_head is None:
+                        raise ValueError("goal_cost_mode='head' requires a loaded goal_head.")
+                    goal_cost = heads.goal_weight * heads.goal_head.score_trajectory(
+                        z_rollouts_proj,
+                        z_goal_batch,
+                    )
+                    terminal_goal_similarity = F.cosine_similarity(
+                        F.normalize(z_rollouts_proj[:, -1, :], dim=-1),
+                        F.normalize(z_goal_batch, dim=-1),
+                        dim=-1,
+                    )
+                elif goal_cost_mode == "terminal_cosine":
+                    terminal_goal_similarity = F.cosine_similarity(
+                        F.normalize(z_rollouts_proj[:, -1, :], dim=-1),
+                        F.normalize(z_goal_batch, dim=-1),
+                        dim=-1,
+                    )
+                    goal_cost = heads.goal_weight * (1.0 - terminal_goal_similarity).clamp_min(0.0)
+                elif goal_cost_mode == "terminal_l2":
+                    diff = z_rollouts_proj[:, -1, :] - z_goal_batch
+                    goal_cost = heads.goal_weight * diff.square().mean(dim=-1)
+                    terminal_goal_similarity = F.cosine_similarity(
+                        F.normalize(z_rollouts_proj[:, -1, :], dim=-1),
+                        F.normalize(z_goal_batch, dim=-1),
+                        dim=-1,
+                    )
+                else:
+                    raise ValueError(f"Unsupported goal_cost_mode={goal_cost_mode!r}")
+                costs += goal_cost
+                metrics["goal_cost"] = goal_cost
+                metrics["goal_similarity_proj_terminal"] = terminal_goal_similarity
+
+            if (
+                z_route is not None
+                and float(route_progress_weight) > 0.0
+            ):
+                z_route_batch = z_route.expand(self.n_candidates, -1)
+                if route_cost_mode == "terminal_cosine":
+                    terminal_route_similarity = F.cosine_similarity(
+                        F.normalize(z_rollouts_proj[:, -1, :], dim=-1),
+                        F.normalize(z_route_batch, dim=-1),
+                        dim=-1,
+                    )
+                    route_cost = float(route_progress_weight) * (1.0 - terminal_route_similarity).clamp_min(0.0)
+                elif route_cost_mode == "terminal_l2":
+                    diff = z_rollouts_proj[:, -1, :] - z_route_batch
+                    route_cost = float(route_progress_weight) * diff.square().mean(dim=-1)
+                    terminal_route_similarity = F.cosine_similarity(
+                        F.normalize(z_rollouts_proj[:, -1, :], dim=-1),
+                        F.normalize(z_route_batch, dim=-1),
+                        dim=-1,
+                    )
+                else:
+                    raise ValueError(f"Unsupported route_cost_mode={route_cost_mode!r}")
+                costs += route_cost
+                metrics["route_cost"] = route_cost
+                metrics["route_similarity_proj_terminal"] = terminal_route_similarity
 
             if (
                 heads is not None
@@ -384,6 +604,28 @@ class PureCEMPlanner:
                     if heads.coverage_gain_weight > 0.0:
                         costs -= heads.coverage_gain_weight * predicted_coverage_gain
 
+            if heads is not None and heads.escape_frontier_head is not None:
+                if z0_proj is None:
+                    if heads.escape_frontier_weight > 0.0:
+                        raise ValueError(
+                            "escape_frontier_head requires z_start_proj when escape_frontier_weight > 0.",
+                        )
+                else:
+                    frontier_hops = (
+                        int(heads.escape_frontier_hops)
+                        if int(heads.escape_frontier_hops) > 0
+                        else self.horizon
+                    )
+                    frontier_hops = max(1, min(self.horizon, frontier_hops))
+                    start_proj = z0_proj.expand(self.n_candidates, -1)
+                    predicted_frontier_value = heads.escape_frontier_head(
+                        start_proj,
+                        z_rollouts_proj[:, :frontier_hops, :],
+                    )
+                    metrics["predicted_escape_frontier_value"] = predicted_frontier_value
+                    if heads.escape_frontier_weight > 0.0:
+                        costs -= heads.escape_frontier_weight * predicted_frontier_value
+
             if heads is not None and heads.displacement_head is not None:
                 if z0_proj is None:
                     if heads.displacement_weight > 0.0:
@@ -409,6 +651,8 @@ class PureCEMPlanner:
             if min_cost.item() < best_cost:
                 best_cost = min_cost.item()
                 best_seq = samples[min_idx.item()].detach().clone()
+                if samples_idx is not None:
+                    best_indices = samples_idx[min_idx.item()].detach().clone()
                 best_metrics = {
                     name: float(values[min_idx.item()].item())
                     for name, values in metrics.items()
@@ -440,13 +684,33 @@ class PureCEMPlanner:
                 }
 
             elite_idx = torch.topk(costs, k=self.n_elite, largest=False).indices
-            elite = samples[elite_idx]
-            mean = elite.mean(dim=0)
-            std = elite.std(dim=0, unbiased=False).clamp_min(self.min_std)
+            if use_primitives:
+                elite_indices = samples_idx[elite_idx]
+                counts = torch.zeros_like(primitive_probs)
+                ones = torch.ones((self.n_elite,), device=self.device, dtype=counts.dtype)
+                for step_idx in range(self.horizon):
+                    counts[step_idx].scatter_add_(0, elite_indices[:, step_idx], ones)
+                primitive_probs = counts + 1e-3
+                primitive_probs = primitive_probs / primitive_probs.sum(dim=-1, keepdim=True)
+                warm_indices = elite_indices[0].detach().clone()
+            else:
+                elite = samples[elite_idx]
+                mean = elite.mean(dim=0)
+                std = elite.std(dim=0, unbiased=False).clamp_min(self.min_std)
 
-        self._warm_start = torch.cat(
-            [best_seq[1:], best_seq[-1:].clone()], dim=0,
-        ).detach()
+        if use_primitives:
+            if best_indices is None:
+                best_indices = warm_indices
+            self._warm_start_indices = torch.cat(
+                [best_indices[1:], best_indices[-1:].clone()],
+                dim=0,
+            ).detach()
+            self._warm_start = None
+        else:
+            self._warm_start = torch.cat(
+                [best_seq[1:], best_seq[-1:].clone()], dim=0,
+            ).detach()
+            self._warm_start_indices = None
 
         if return_diagnostics:
             diagnostics = dict(diagnostics or {})
@@ -496,6 +760,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mpc_execute", type=int, default=1)
     p.add_argument("--macro_action_repeat", type=int, default=1,
                    help="Low-level control repeats per world-model planner step.")
+    p.add_argument("--history_context_len", type=int, default=None,
+                   help="Number of recent observation latents to provide as "
+                        "context to the planner rollout. Defaults to the world "
+                        "model max_seq_len. Set to 1 to disable history.")
     p.add_argument("--score_space", type=str, default="mixed",
                    choices=["mixed", "raw", "proj"],
                    help="Deprecated legacy flag. Planner now always scores in projected latent space.")
@@ -503,15 +771,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cmd_high", type=float, nargs=3, default=[0.8, 0.3, 1.0])
     p.add_argument("--cem_init_std", type=float, nargs=3, default=[0.3, 0.15, 0.4])
     p.add_argument("--cem_min_std", type=float, nargs=3, default=[0.05, 0.03, 0.08])
-    
+    p.add_argument("--planner_action_space", type=str, default="primitives",
+                   choices=["continuous", "primitives"],
+                   help="Search over unconstrained continuous command blocks or "
+                        "over a library of supported motion primitives.")
+    p.add_argument("--primitive_library_size", type=int, default=128,
+                   help="Number of command-block primitives to build when "
+                        "--planner_action_space=primitives.")
+    p.add_argument("--primitive_jitter_scale", type=float, default=0.05,
+                   help="Fraction of the initial command std used as local "
+                        "noise around each sampled primitive block.")
+
     p.add_argument("--novelty_weight", type=float, default=10.0,
                    help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--goal_cost_mode", type=str, default="terminal_cosine",
+                   choices=["off", "terminal_cosine", "terminal_l2", "head"],
+                   help="How to use the target breadcrumb in the planner cost. "
+                        "'terminal_cosine' is the default rollout-space goal term.")
+    p.add_argument("--goal_weight", type=float, default=None,
+                   help="Override the goal weight from the scorer checkpoint. "
+                        "Used by direct goal cost modes as well.")
     p.add_argument("--exploration_weight", type=float, default=None,
                    help="Override learned RND exploration weight from the scorer checkpoint.")
     p.add_argument("--coverage_gain_weight", type=float, default=None,
                    help="Override the learned coverage-gain bonus weight from the scorer checkpoint.")
     p.add_argument("--displacement_weight", type=float, default=None,
                    help="Override the learned displacement-head bonus weight from the scorer checkpoint.")
+    p.add_argument("--escape_frontier_weight", type=float, default=None,
+                   help="Override the learned escape/frontier bonus weight from the scorer checkpoint.")
     p.add_argument("--exploration_bonus_mode", type=str, default="terminal",
                    choices=["sum", "terminal", "gain", "visited_nn"],
                    help="How to score novelty over predicted rollout latents.")
@@ -546,7 +833,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--goal_progress_weight", type=float, default=8.0,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--route_progress_weight", type=float, default=7.0,
-                   help="Legacy routing-era flag. Ignored by the active planner.")
+                   help="Weight for the temporary keyframe-route waypoint objective.")
+    p.add_argument("--memory_router_mode", type=str, default="keyframe",
+                   choices=["off", "keyframe"],
+                   help="Persistent perception-only memory structure used when local planning plateaus.")
+    p.add_argument("--route_cost_mode", type=str, default="terminal_cosine",
+                   choices=["terminal_cosine", "terminal_l2"],
+                   help="How to score the current route waypoint in projected latent space.")
     p.add_argument("--recover_displacement_weight", type=float, default=2.5,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
@@ -562,8 +855,9 @@ def parse_args() -> argparse.Namespace:
                    help="Add a new prototype only when cosine similarity to the nearest stored prototype is below this threshold.")
     p.add_argument("--keyframe_sim_threshold", type=float, default=0.985,
                    help="Match the current observation to an existing keyframe node above this similarity.")
-    p.add_argument("--keyframe_match_radius_m", type=float, default=1.5,
-                   help="Maximum dead-reckoned distance allowed for keyframe reuse.")
+    p.add_argument("--keyframe_match_radius_m", type=float, default=-1.0,
+                   help="Optional dead-reckoned distance gate for keyframe reuse. "
+                        "Set <= 0 to keep routing perception-only.")
     p.add_argument("--keyframe_min_step_gap", type=int, default=8,
                    help="Minimum temporal separation before matching the current node back onto an older keyframe.")
     p.add_argument("--keyframe_add_interval", type=int, default=24,
@@ -723,6 +1017,64 @@ def build_command_sampling_config(
     )
 
 
+def build_action_primitive_bank(
+    wm_meta: dict[str, Any],
+    *,
+    library_size: int,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a library of supported command-block primitives.
+
+    The library is generated from the same command-pattern family used during
+    data collection rather than from unconstrained Gaussian noise.
+    """
+    cmd_repr = str(wm_meta.get("command_representation", "mean_scaled"))
+    block_size = int(wm_meta.get("command_block_size", 1))
+    rng = np.random.RandomState(int(seed))
+    primitives: list[np.ndarray] = []
+
+    canonical_cmds = [
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.2, 0.0, 0.0], dtype=np.float32),
+        np.array([0.4, 0.0, 0.0], dtype=np.float32),
+        np.array([-0.2, 0.0, 0.0], dtype=np.float32),
+        np.array([0.15, 0.0, 0.4], dtype=np.float32),
+        np.array([0.15, 0.0, -0.4], dtype=np.float32),
+        np.array([0.0, 0.0, 0.8], dtype=np.float32),
+        np.array([0.0, 0.0, -0.8], dtype=np.float32),
+    ]
+    for cmd in canonical_cmds:
+        if cmd_repr == "active_block":
+            primitives.append(np.tile(cmd[None, :], (block_size, 1)).reshape(-1))
+        else:
+            primitives.append(cmd.copy())
+
+    max_attempts = max(32, int(library_size) * 8)
+    attempts = 0
+    while len(primitives) < int(library_size) and attempts < max_attempts:
+        attempts += 1
+        seg_len = int(rng.randint(max(4, block_size), max(5, block_size * 8) + 1))
+        _name, seq = sample_command_pattern(rng, length=seg_len)
+        if cmd_repr == "active_block":
+            if seq.shape[0] < block_size:
+                continue
+            stride = max(1, block_size // 2)
+            for start in range(0, seq.shape[0] - block_size + 1, stride):
+                primitives.append(seq[start : start + block_size].reshape(-1).astype(np.float32))
+                if len(primitives) >= int(library_size):
+                    break
+        else:
+            primitives.append(seq.mean(axis=0).astype(np.float32))
+
+    if len(primitives) < int(library_size):
+        while len(primitives) < int(library_size):
+            primitives.append(primitives[len(primitives) % max(1, len(canonical_cmds))].copy())
+
+    bank = torch.tensor(np.stack(primitives[: int(library_size)], axis=0), device=device, dtype=torch.float32)
+    return bank
+
+
 def format_command_for_log(
     cmd_values: list[float],
     wm_meta: dict[str, Any],
@@ -812,6 +1164,8 @@ def load_planner_heads(
     coverage_gain_weight = float(ckpt.get("coverage_gain_weight", 0.0))
     coverage_gain_hops = int(ckpt.get("coverage_gain_hops", 0))
     displacement_weight = float(ckpt.get("displacement_weight", 0.0))
+    escape_frontier_weight = float(ckpt.get("escape_frontier_weight", 0.0))
+    escape_frontier_hops = int(ckpt.get("escape_frontier_hops", 0))
 
     if ckpt.get("safety_head") is not None:
         safety = LatentEnergyHead(latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
@@ -866,11 +1220,23 @@ def load_planner_heads(
         displacement_head.eval()
         heads.displacement_head = displacement_head
 
+    if ckpt.get("escape_frontier_head") is not None:
+        escape_frontier_head = EscapeFrontierHead(
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        ).to(device)
+        clean_load_state(escape_frontier_head, ckpt["escape_frontier_head"])
+        escape_frontier_head.eval()
+        heads.escape_frontier_head = escape_frontier_head
+
     heads.goal_weight = float(ckpt.get("goal_weight", 0.0))
     heads.exploration_weight = float(ckpt.get("exploration_weight", 0.0))
     heads.coverage_gain_weight = coverage_gain_weight
     heads.coverage_gain_hops = coverage_gain_hops
     heads.displacement_weight = displacement_weight
+    heads.escape_frontier_weight = escape_frontier_weight
+    heads.escape_frontier_hops = escape_frontier_hops
     heads.safety_weight = 1.0
     meta = {
         "has_safety_head": heads.safety_head is not None,
@@ -879,12 +1245,15 @@ def load_planner_heads(
         "has_place_head": heads.place_head is not None,
         "has_coverage_gain_head": heads.coverage_gain_head is not None,
         "has_displacement_head": heads.displacement_head is not None,
+        "has_escape_frontier_head": heads.escape_frontier_head is not None,
         "has_progress_head_ckpt": ckpt.get("progress_head") is not None,
         "goal_weight": heads.goal_weight,
         "exploration_weight": heads.exploration_weight,
         "coverage_gain_weight": heads.coverage_gain_weight,
         "coverage_gain_hops": heads.coverage_gain_hops,
         "displacement_weight": heads.displacement_weight,
+        "escape_frontier_weight": heads.escape_frontier_weight,
+        "escape_frontier_hops": heads.escape_frontier_hops,
         "safety_mode": ckpt.get("safety_mode"),
         "seq_len": ckpt.get("seq_len"),
         "temporal_stride": ckpt.get("temporal_stride"),
@@ -896,6 +1265,7 @@ def load_planner_heads(
         "place_latent_source": ckpt.get("place_latent_source"),
         "coverage_gain_latent_source": ckpt.get("coverage_gain_latent_source"),
         "displacement_latent_source": ckpt.get("displacement_latent_source"),
+        "escape_frontier_latent_source": ckpt.get("escape_frontier_latent_source"),
         "goal_latent_source": ckpt.get("goal_latent_source"),
         "progress_latent_source": ckpt.get("progress_latent_source"),
         "place_snippet_len": ckpt.get("place_snippet_len"),
@@ -905,6 +1275,10 @@ def load_planner_heads(
         "coverage_gain_supervision": ckpt.get("coverage_gain_supervision"),
         "displacement_hops": ckpt.get("displacement_hops"),
         "displacement_supervision": ckpt.get("displacement_supervision"),
+        "escape_frontier_target_hops": ckpt.get("escape_frontier_target_hops"),
+        "escape_frontier_context_hops": ckpt.get("escape_frontier_context_hops"),
+        "escape_frontier_radius_m": ckpt.get("escape_frontier_radius_m"),
+        "escape_frontier_supervision": ckpt.get("escape_frontier_supervision"),
         "holdout_metrics": ckpt.get("holdout_metrics"),
     }
     return heads, meta
@@ -1168,6 +1542,8 @@ def teacher_forced_rollout_latent_pair(
     world_model: LeWorldModel,
     z_start_raw: torch.Tensor,
     command: torch.Tensor,
+    z_history_raw: torch.Tensor | None = None,
+    action_history: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return one-step predicted raw/projected latents for an executed command."""
     if command.ndim == 1:
@@ -1177,7 +1553,12 @@ def teacher_forced_rollout_latent_pair(
     else:
         action_seq = command
     action_seq = action_seq.to(z_start_raw.device)
-    z_pred_raw = world_model.plan_rollout_raw(z_start_raw, action_seq)
+    z_pred_raw = world_model.plan_rollout_raw(
+        z_start_raw,
+        action_seq,
+        z_history_raw=z_history_raw,
+        action_history=action_history,
+    )
     z_pred_proj = world_model.pred_projector.forward_seq(z_pred_raw)
     return z_pred_raw[:, -1, :].detach(), z_pred_proj[:, -1, :].detach()
 
@@ -1187,14 +1568,41 @@ def teacher_forced_rollout_latent(
     world_model: LeWorldModel,
     z_start_raw: torch.Tensor,
     command: torch.Tensor,
+    z_history_raw: torch.Tensor | None = None,
+    action_history: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Project one executed command into the rollout latent space."""
     _, z_pred_proj = teacher_forced_rollout_latent_pair(
         world_model,
         z_start_raw,
         command,
+        z_history_raw=z_history_raw,
+        action_history=action_history,
     )
     return z_pred_proj
+
+
+def build_history_context_tensors(
+    latent_history_raw: deque[torch.Tensor],
+    action_history: deque[torch.Tensor],
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not latent_history_raw:
+        return None, None
+    if len(action_history) > max(0, len(latent_history_raw) - 1):
+        raise ValueError("action_history cannot be longer than latent_history_raw - 1")
+    z_hist = torch.stack(
+        [z.to(device=device, dtype=torch.float32).reshape(-1) for z in latent_history_raw],
+        dim=0,
+    ).unsqueeze(0)
+    if action_history:
+        a_hist = torch.stack(
+            [a.to(device=device, dtype=torch.float32).reshape(-1) for a in action_history],
+            dim=0,
+        ).unsqueeze(0)
+    else:
+        a_hist = None
+    return z_hist, a_hist
 
 
 @torch.no_grad()
@@ -1458,7 +1866,7 @@ def estimate_dead_reckoning_step(
 def match_keyframe_node(
     nodes: list[KeyframeNode],
     score_latent: torch.Tensor,
-    odom_xy: np.ndarray,
+    odom_xy: np.ndarray | None,
     step: int,
     sim_threshold: float,
     match_radius_m: float,
@@ -1472,9 +1880,10 @@ def match_keyframe_node(
     for node in nodes:
         if step - node.last_seen_step < min_step_gap:
             continue
-        odom_dist = float(np.linalg.norm(np.asarray(node.odom_xy, dtype=np.float32) - odom_xy))
-        if odom_dist > match_radius_m:
-            continue
+        if odom_xy is not None and float(match_radius_m) > 0.0:
+            odom_dist = float(np.linalg.norm(np.asarray(node.odom_xy, dtype=np.float32) - odom_xy))
+            if odom_dist > match_radius_m:
+                continue
         sim = cosine_similarity_scalar(score_latent, node.score_latent)
         if sim >= sim_threshold and sim > best_sim:
             best_sim = sim
@@ -1487,11 +1896,12 @@ def add_keyframe_node(
     neighbors: list[set[int]],
     score_latent: torch.Tensor,
     proj_latent: torch.Tensor,
-    odom_xy: np.ndarray,
+    odom_xy: np.ndarray | None,
     yaw_rad: float,
     step: int,
 ) -> int:
     node_idx = len(nodes)
+    odom_xy = np.zeros(2, dtype=np.float32) if odom_xy is None else np.asarray(odom_xy, dtype=np.float32)
     nodes.append(KeyframeNode(
         idx=node_idx,
         score_latent=score_latent.detach().cpu().float().clone(),
@@ -1508,10 +1918,11 @@ def add_keyframe_node(
 
 def touch_keyframe_node(
     node: KeyframeNode,
-    odom_xy: np.ndarray,
+    odom_xy: np.ndarray | None,
     yaw_rad: float,
     step: int,
 ) -> None:
+    odom_xy = np.asarray(node.odom_xy, dtype=np.float32) if odom_xy is None else np.asarray(odom_xy, dtype=np.float32)
     node.last_seen_step = step
     node.visit_count += 1
     node.odom_xy = (float(odom_xy[0]), float(odom_xy[1]))
@@ -2122,12 +2533,16 @@ def main():
     planner_heads, scorer_meta = load_planner_heads(
         args.scorer_ckpt, planning_device, wm_meta, args.macro_action_repeat,
     )
+    if args.goal_weight is not None:
+        planner_heads.goal_weight = float(args.goal_weight)
     if args.exploration_weight is not None:
         planner_heads.exploration_weight = float(args.exploration_weight)
     if args.coverage_gain_weight is not None:
         planner_heads.coverage_gain_weight = float(args.coverage_gain_weight)
     if args.displacement_weight is not None:
         planner_heads.displacement_weight = float(args.displacement_weight)
+    if args.escape_frontier_weight is not None:
+        planner_heads.escape_frontier_weight = float(args.escape_frontier_weight)
     camera_cfg = ego_camera_config_from_args(args)
 
     print(
@@ -2155,6 +2570,12 @@ def main():
                 f"Active-block checkpoint expects --macro_action_repeat={wm_meta['command_block_size']}, "
                 f"got {args.macro_action_repeat}."
             )
+    history_context_len = (
+        int(args.history_context_len)
+        if args.history_context_len is not None
+        else int(wm_meta["max_seq_len"])
+    )
+    history_context_len = max(1, min(history_context_len, int(wm_meta["max_seq_len"])))
     if args.scorer_ckpt is not None:
         print(
             "Loaded planner heads: "
@@ -2163,6 +2584,7 @@ def main():
             f"exploration={scorer_meta.get('has_exploration', False)} "
             f"place={scorer_meta.get('has_place_head', False)} "
             f"coverage_gain={scorer_meta.get('has_coverage_gain_head', False)} "
+            f"escape_frontier={scorer_meta.get('has_escape_frontier_head', False)} "
             f"displacement={scorer_meta.get('has_displacement_head', False)} "
             f"(seq={scorer_meta.get('seq_len')}, "
             f"stride={scorer_meta.get('temporal_stride')}, "
@@ -2181,6 +2603,7 @@ def main():
                 f"exploration={scorer_meta.get('exploration_latent_source', 'unknown')} "
                 f"place={scorer_meta.get('place_latent_source', 'unknown')} "
                 f"coverage_gain={scorer_meta.get('coverage_gain_latent_source', 'unknown')} "
+                f"escape_frontier={scorer_meta.get('escape_frontier_latent_source', 'unknown')} "
                 f"displacement={scorer_meta.get('displacement_latent_source', 'unknown')} "
                 f"goal={scorer_meta.get('goal_latent_source', 'unknown')}"
             )
@@ -2188,10 +2611,15 @@ def main():
             print(f"Place supervision: {scorer_meta.get('place_supervision')}")
         if scorer_meta.get("has_coverage_gain_head", False) and scorer_meta.get("coverage_gain_supervision") is not None:
             print(f"Coverage-gain supervision: {scorer_meta.get('coverage_gain_supervision')}")
+        if scorer_meta.get("has_escape_frontier_head", False) and scorer_meta.get("escape_frontier_supervision") is not None:
+            print(f"Escape/frontier supervision: {scorer_meta.get('escape_frontier_supervision')}")
         if scorer_meta.get("has_displacement_head", False) and scorer_meta.get("displacement_supervision") is not None:
             print(f"Displacement supervision: {scorer_meta.get('displacement_supervision')}")
         if scorer_meta.get("has_goal_head", False):
-            print("Ignoring goal head in scorer checkpoint; the active planner optimizes safety + novelty only.")
+            print(
+                f"Goal head present in scorer checkpoint. "
+                f"Planner goal mode: {args.goal_cost_mode}"
+            )
     if args.score_space != "proj":
         print(
             f"Ignoring --score_space={args.score_space!r}; "
@@ -2232,6 +2660,14 @@ def main():
     if target_beacon is None and beacon_layout.beacons:
         target_beacon = sorted(beacon_layout.beacons, key=lambda b: b.identity)[0]
 
+    if args.goal_cost_mode == "head" and planner_heads.goal_head is None:
+        raise ValueError(
+            "--goal_cost_mode=head requires a scorer checkpoint with a goal_head.",
+        )
+    if args.goal_cost_mode != "off" and target_beacon is None:
+        print("No target beacon available; disabling goal cost for this run.")
+        args.goal_cost_mode = "off"
+
     spawn_yaw = 0.0
 
     target_claim_xy = beacon_claim_xy(target_beacon, args.wall_thickness) if target_beacon else None
@@ -2242,8 +2678,15 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     objective_name = (
         f"safety+novelty[{args.exploration_bonus_mode}]"
+        + (
+            f"+goal[{args.goal_cost_mode}]"
+            if target_beacon is not None and args.goal_cost_mode != "off" and planner_heads.goal_weight > 0.0
+            else ""
+        )
         + ("+coverage_gain" if planner_heads.coverage_gain_head is not None and planner_heads.coverage_gain_weight > 0.0 else "")
+        + ("+escape_frontier" if planner_heads.escape_frontier_head is not None and planner_heads.escape_frontier_weight > 0.0 else "")
         + ("+disp_head" if planner_heads.displacement_head is not None and planner_heads.displacement_weight > 0.0 else "")
+        + ("+keyframe_route" if args.memory_router_mode != "off" and args.route_progress_weight > 0.0 else "")
         + ("+terminal_disp" if args.terminal_displacement_weight > 0.0 else "")
         + ("+safety_gate" if args.exploration_safety_gate_threshold is not None else "")
     )
@@ -2266,12 +2709,18 @@ def main():
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
           f"Cmd={wm_meta['command_representation']}:{wm_meta['cmd_dim']}, "
+          f"ActionSpace={args.planner_action_space}, "
+          f"Hist={history_context_len}, "
           f"Latent=proj, Objective={objective_name}, "
+          f"GoalW={planner_heads.goal_weight:.3f}, "
           f"GoalSucc={args.success_goal_sim_threshold:.2f}/{args.success_goal_raw_sim_threshold:.2f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
           f"ExploreMode={args.exploration_bonus_mode}, "
           f"CovGainW={planner_heads.coverage_gain_weight:.3f}, "
+          f"EscapeW={planner_heads.escape_frontier_weight:.3f}, "
           f"DispHeadW={planner_heads.displacement_weight:.3f}, "
+          f"RouteW={args.route_progress_weight:.3f}, "
+          f"Memory={args.memory_router_mode}, "
           f"DispW={args.terminal_displacement_weight:.3f}, "
           f"GateTau={args.exploration_safety_gate_threshold if args.exploration_safety_gate_threshold is not None else 'off'}, "
           f"GateK={args.exploration_safety_gate_sharpness:.3f}"
@@ -2338,6 +2787,16 @@ def main():
 
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
         cmd_low_t, cmd_high_t, init_std_t, min_std_t = build_command_sampling_config(args, wm_meta)
+        primitive_bank = None
+        primitive_jitter_std = None
+        if args.planner_action_space == "primitives":
+            primitive_bank = build_action_primitive_bank(
+                wm_meta,
+                library_size=max(8, int(args.primitive_library_size)),
+                seed=int(args.seed) + 17,
+                device=planning_device,
+            )
+            primitive_jitter_std = init_std_t * float(max(0.0, args.primitive_jitter_scale))
 
         planner = PureCEMPlanner(
             world_model=world_model,
@@ -2351,6 +2810,8 @@ def main():
             min_std=min_std_t,
             device=planning_device,
             action_penalty_weight=args.action_penalty_weight,
+            primitive_bank=primitive_bank,
+            primitive_jitter_std=primitive_jitter_std,
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
@@ -2361,7 +2822,25 @@ def main():
         visited_rollout_bank: list[torch.Tensor] = []
         plan_audit_records: list[dict[str, Any]] = []
         pending_plan_audit: dict[str, Any] | None = None
+        pending_audit_commit_raw: torch.Tensor | None = None
+        pending_audit_commit_proj: torch.Tensor | None = None
+        pending_audit_commit_steps = 0
+        pending_audit_commands_executed = 0
         replan_count = 0
+        latent_history_raw: deque[torch.Tensor] = deque(maxlen=history_context_len)
+        action_history_ctx: deque[torch.Tensor] = deque(maxlen=max(0, history_context_len - 1))
+        keyframe_nodes: list[KeyframeNode] = []
+        keyframe_neighbors: list[set[int]] = []
+        current_keyframe_idx: int | None = None
+        last_keyframe_add_step = -10**9
+        last_progress_step = 0
+        last_route_trigger_step = -10**9
+        best_goal_similarity_so_far = -1.0
+        active_route_kind: str | None = None
+        active_route_target_idx: int | None = None
+        active_route_path: list[int] = []
+        active_route_deadline = -1
+        route_events: list[dict[str, Any]] = []
         if args.audit_every < 1:
             raise ValueError("--audit_every must be >= 1.")
         if args.audit_topk < 1:
@@ -2374,6 +2853,7 @@ def main():
             world_model, planning_device,
             q0, prev_action,
         )
+        latent_history_raw.append(obs["z_raw"].squeeze(0).detach().clone())
         last_clean_frame = obs["frame_hwc"].copy()
         ego_frames_hwc.append(obs["frame_hwc"])
         tp_frame = render_third_person_frame(
@@ -2387,6 +2867,17 @@ def main():
         path_xy.append(start_xy)
         oracle_path_xy.append(start_xy.copy())
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
+        start_score_latent = F.normalize(obs["z_proj"].squeeze(0).detach().cpu().float(), dim=-1)
+        current_keyframe_idx = add_keyframe_node(
+            keyframe_nodes,
+            keyframe_neighbors,
+            start_score_latent,
+            obs["z_proj"].squeeze(0).detach().cpu().float(),
+            odom_xy=None,
+            yaw_rad=float(obs["yaw_rad"]),
+            step=0,
+        )
+        last_keyframe_add_step = 0
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -2395,13 +2886,109 @@ def main():
                     np.asarray(obs["pos_np"][:2], dtype=np.float32) - target_claim_xy,
                 )),
             )
+        if z_breadcrumb_proj_ref is not None:
+            best_goal_similarity_so_far = cosine_similarity_scalar(
+                obs["z_proj"].squeeze(0),
+                z_breadcrumb_proj_ref,
+            )
 
         for step in range(args.steps):
             mode = "explore"
+            route_waypoint_proj: torch.Tensor | None = None
+            route_similarity_now: float | None = None
+            if args.memory_router_mode == "keyframe":
+                if active_route_path and step >= active_route_deadline:
+                    route_events.append({
+                        "step": int(step),
+                        "event": "route_expired",
+                        "kind": active_route_kind,
+                        "target_idx": active_route_target_idx,
+                    })
+                    active_route_kind = None
+                    active_route_target_idx = None
+                    active_route_path = []
+                if active_route_path:
+                    next_idx = int(active_route_path[0])
+                    route_similarity_now = cosine_similarity_scalar(
+                        obs["z_proj"].squeeze(0),
+                        keyframe_nodes[next_idx].proj_latent,
+                    )
+                    if route_similarity_now >= max(0.90, float(args.keyframe_sim_threshold)):
+                        active_route_path.pop(0)
+                        last_progress_step = int(step)
+                        route_events.append({
+                            "step": int(step),
+                            "event": "route_waypoint_reached",
+                            "kind": active_route_kind,
+                            "waypoint_idx": next_idx,
+                            "remaining_hops": int(len(active_route_path)),
+                        })
+                    if not active_route_path:
+                        active_route_kind = None
+                        active_route_target_idx = None
+                    else:
+                        next_idx = int(active_route_path[0])
+                        route_waypoint_proj = keyframe_nodes[next_idx].proj_latent.to(
+                            planning_device,
+                            dtype=torch.float32,
+                        ).unsqueeze(0)
+                        mode = f"route_{active_route_kind or 'frontier'}"
+
+                plateau_steps = int(step - last_progress_step)
+                can_trigger_route = (
+                    not active_route_path
+                    and current_keyframe_idx is not None
+                    and len(keyframe_nodes) >= max(2, int(args.route_min_hops) + 1)
+                    and plateau_steps >= int(args.stall_plateau_steps)
+                    and (step - last_route_trigger_step) >= int(args.subgoal_cooldown_steps)
+                    and float(args.route_progress_weight) > 0.0
+                )
+                if can_trigger_route:
+                    route_choice = choose_keyframe_route_path(
+                        keyframe_nodes,
+                        keyframe_neighbors,
+                        current_idx=int(current_keyframe_idx),
+                        current_step=int(step),
+                        min_age_steps=int(args.subgoal_min_age_steps),
+                        frontier_window_steps=int(args.subgoal_frontier_window_steps),
+                        min_hops=int(args.route_min_hops),
+                        goal_latent=None if z_breadcrumb_proj_ref is None else z_breadcrumb_proj_ref.detach().cpu().float(),
+                        goal_route_improve_margin=float(args.goal_route_improve_margin),
+                    )
+                    if route_choice is not None:
+                        route_kind, route_target_idx, route_path_nodes, route_goal_sim = route_choice
+                        active_route_kind = str(route_kind)
+                        active_route_target_idx = int(route_target_idx)
+                        active_route_path = [int(idx) for idx in route_path_nodes]
+                        active_route_deadline = int(step + max(1, int(args.subgoal_budget_steps)))
+                        last_route_trigger_step = int(step)
+                        if active_route_path:
+                            route_waypoint_proj = keyframe_nodes[active_route_path[0]].proj_latent.to(
+                                planning_device,
+                                dtype=torch.float32,
+                            ).unsqueeze(0)
+                            mode = f"route_{active_route_kind}"
+                            route_events.append({
+                                "step": int(step),
+                                "event": "route_activated",
+                                "kind": active_route_kind,
+                                "target_idx": active_route_target_idx,
+                                "path_len": int(len(active_route_path)),
+                                "target_goal_similarity": (
+                                    None if route_goal_sim is None else float(route_goal_sim)
+                                ),
+                                "plateau_steps": plateau_steps,
+                            })
+
             mode_log.append(mode)
 
             need_replan = plan_seq is None or plan_step_idx >= args.mpc_execute
             if need_replan:
+                z_history_ctx, action_history_ctx_t = build_history_context_tensors(
+                    latent_history_raw,
+                    action_history_ctx,
+                    planning_device,
+                )
                 audit_this_plan = bool(args.audit_plan and (replan_count % args.audit_every == 0))
                 audit_start_cov_area = None
                 audit_start_goal_dist = None
@@ -2416,7 +3003,20 @@ def main():
                 plan_seq, cost, plan_metrics_last, plan_diagnostics = planner.plan(
                     obs["z_raw"],
                     z_start_proj=obs["z_proj"],
+                    z_goal_proj=(
+                        None
+                        if z_breadcrumb_proj_ref is None or args.goal_cost_mode == "off" or planner_heads.goal_weight <= 0.0
+                        else z_breadcrumb_proj_ref.unsqueeze(0)
+                    ),
+                    z_route_proj=route_waypoint_proj,
+                    z_history_raw=z_history_ctx,
+                    action_history=action_history_ctx_t,
                     heads=planner_heads,
+                    goal_cost_mode=args.goal_cost_mode,
+                    route_cost_mode=args.route_cost_mode,
+                    route_progress_weight=(
+                        0.0 if route_waypoint_proj is None else float(args.route_progress_weight)
+                    ),
                     exploration_bonus_mode=args.exploration_bonus_mode,
                     terminal_displacement_weight=args.terminal_displacement_weight,
                     exploration_safety_gate_threshold=args.exploration_safety_gate_threshold,
@@ -2432,11 +3032,46 @@ def main():
                 plan_step_idx = 0
                 costs_log.append(float(cost))
                 if audit_this_plan:
+                    audit_commit_steps = max(1, min(int(args.mpc_execute), int(plan_seq.shape[0])))
+                    audit_commit_seq = plan_seq[:audit_commit_steps].unsqueeze(0).to(planning_device)
+                    audit_commit_rollout_raw = world_model.plan_rollout_raw(
+                        obs["z_raw"],
+                        audit_commit_seq,
+                        z_history_raw=z_history_ctx,
+                        action_history=action_history_ctx_t,
+                    )
+                    audit_commit_rollout_proj = world_model.pred_projector.forward_seq(
+                        audit_commit_rollout_raw,
+                    )
+                    predicted_commitment_metrics = {
+                        "raw_norm": float(audit_commit_rollout_raw[:, -1, :].squeeze(0).norm().item()),
+                        "proj_norm": float(audit_commit_rollout_proj[:, -1, :].squeeze(0).norm().item()),
+                        "goal_similarity_proj": (
+                            None
+                            if z_breadcrumb_proj_ref is None
+                            else float(cosine_similarity_scalar(
+                                audit_commit_rollout_proj[:, -1, :].squeeze(0),
+                                z_breadcrumb_proj_ref,
+                            ))
+                        ),
+                    }
+                    predicted_commitment_metrics.update(
+                        summarize_predicted_rollout_metrics(
+                            planner_heads,
+                            obs["z_proj"],
+                            audit_commit_rollout_proj,
+                        )
+                    )
+                    pending_audit_commit_raw = audit_commit_rollout_raw[:, -1, :].detach().clone()
+                    pending_audit_commit_proj = audit_commit_rollout_proj[:, -1, :].detach().clone()
+                    pending_audit_commit_steps = audit_commit_steps
+                    pending_audit_commands_executed = 0
                     pending_plan_audit = {
                         "audit_version": 1,
                         "step": int(step),
                         "replan_index": int(replan_count),
                         "mode": mode,
+                        "planned_commitment_steps": int(audit_commit_steps),
                         "state_before": {
                             "pos_xy": [float(obs["pos_np"][0]), float(obs["pos_np"][1])],
                             "yaw_rad": float(obs["yaw_rad"]),
@@ -2446,10 +3081,15 @@ def main():
                             ),
                             "visited_bank_size": int(len(visited_rollout_bank)),
                         },
+                        "predicted_after_commitment": predicted_commitment_metrics,
                         "plan": plan_diagnostics,
                     }
                 else:
                     pending_plan_audit = None
+                    pending_audit_commit_raw = None
+                    pending_audit_commit_proj = None
+                    pending_audit_commit_steps = 0
+                    pending_audit_commands_executed = 0
                 replan_count += 1
 
             nominal_cmd = plan_seq[plan_step_idx]
@@ -2457,6 +3097,11 @@ def main():
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
             cmd_display = format_command_for_log(cmd_vals, wm_meta)
             cmds_log.append(cmd_vals)
+            z_history_ctx, action_history_ctx_t = build_history_context_tensors(
+                latent_history_raw,
+                action_history_ctx,
+                planning_device,
+            )
             executed_rollout_raw = None
             executed_rollout_proj = None
             if (
@@ -2472,6 +3117,8 @@ def main():
                     world_model,
                     obs["z_raw"],
                     nominal_cmd.to(planning_device),
+                    z_history_raw=z_history_ctx,
+                    action_history=action_history_ctx_t,
                 )
             if (
                 args.exploration_bonus_mode == "visited_nn"
@@ -2480,7 +3127,7 @@ def main():
                 raise RuntimeError("visited_nn planning expected executed_rollout_proj to be available.")
 
             if pending_plan_audit is not None and executed_rollout_raw is not None and executed_rollout_proj is not None:
-                pending_plan_audit["predicted_after_first_command"] = {
+                predicted_first_command = {
                     "raw_norm": float(executed_rollout_raw.squeeze(0).norm().item()),
                     "proj_norm": float(executed_rollout_proj.squeeze(0).norm().item()),
                     "goal_similarity_proj": (
@@ -2492,6 +3139,14 @@ def main():
                         ))
                     ),
                 }
+                predicted_first_command.update(
+                    summarize_predicted_rollout_metrics(
+                        planner_heads,
+                        obs["z_proj"],
+                        executed_rollout_proj,
+                    )
+                )
+                pending_plan_audit["predicted_after_first_command"] = predicted_first_command
 
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
@@ -2510,6 +3165,8 @@ def main():
                 world_model, planning_device,
                 q0, prev_action, last_clean_frame,
             )
+            action_history_ctx.append(nominal_cmd.detach().clone().reshape(-1))
+            latent_history_raw.append(obs["z_raw"].squeeze(0).detach().clone())
             goal_sim_now = None
             goal_sim_raw_now = None
             if z_breadcrumb_proj_ref is not None:
@@ -2522,6 +3179,65 @@ def main():
                     obs["z_raw"].squeeze(0),
                     z_breadcrumb_raw_ref,
                 )
+            if goal_sim_now is not None and goal_sim_now > best_goal_similarity_so_far + 1e-3:
+                best_goal_similarity_so_far = float(goal_sim_now)
+                last_progress_step = int(step)
+
+            if args.memory_router_mode == "keyframe":
+                score_latent_now = F.normalize(obs["z_proj"].squeeze(0).detach().cpu().float(), dim=-1)
+                prev_graph_idx = current_keyframe_idx
+                matched_idx = match_keyframe_node(
+                    keyframe_nodes,
+                    score_latent_now,
+                    odom_xy=None,
+                    step=int(step) + 1,
+                    sim_threshold=float(args.keyframe_sim_threshold),
+                    match_radius_m=float(args.keyframe_match_radius_m),
+                    min_step_gap=int(args.keyframe_min_step_gap),
+                )
+                if matched_idx is not None:
+                    touch_keyframe_node(
+                        keyframe_nodes[matched_idx],
+                        odom_xy=None,
+                        yaw_rad=float(obs["yaw_rad"]),
+                        step=int(step) + 1,
+                    )
+                    current_keyframe_idx = int(matched_idx)
+                    if prev_graph_idx is not None and prev_graph_idx != current_keyframe_idx:
+                        add_prototype_graph_edge(
+                            keyframe_neighbors,
+                            int(prev_graph_idx),
+                            int(current_keyframe_idx),
+                        )
+                else:
+                    should_add_keyframe = (
+                        prev_graph_idx is None
+                        or (int(step) + 1 - int(last_keyframe_add_step)) >= int(args.keyframe_add_interval)
+                    )
+                    if should_add_keyframe:
+                        current_keyframe_idx = add_keyframe_node(
+                            keyframe_nodes,
+                            keyframe_neighbors,
+                            score_latent_now,
+                            obs["z_proj"].squeeze(0).detach().cpu().float(),
+                            odom_xy=None,
+                            yaw_rad=float(obs["yaw_rad"]),
+                            step=int(step) + 1,
+                        )
+                        if prev_graph_idx is not None:
+                            add_prototype_graph_edge(
+                                keyframe_neighbors,
+                                int(prev_graph_idx),
+                                int(current_keyframe_idx),
+                            )
+                        last_keyframe_add_step = int(step) + 1
+                        last_progress_step = int(step)
+                        route_events.append({
+                            "step": int(step),
+                            "event": "keyframe_added",
+                            "keyframe_idx": int(current_keyframe_idx),
+                            "n_keyframes": int(len(keyframe_nodes)),
+                        })
 
             cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
             prev_xy = path_xy[-1]
@@ -2572,6 +3288,7 @@ def main():
                     first_collision_step = step
 
             if pending_plan_audit is not None:
+                pending_audit_commands_executed += 1
                 audit_cov_area = coverage_tracker_metrics(
                     coverage_tracker,
                 ).get("soft_coverage_area_m2")
@@ -2599,41 +3316,105 @@ def main():
                         "proj_l2": float(proj_delta.norm().item()),
                         "proj_cosine": float(cosine_similarity_scalar(pred_proj, act_proj)),
                     }
-                pending_plan_audit["actual_after_first_command"] = {
-                    "pos_xy": [float(cur_xy[0]), float(cur_xy[1])],
-                    "yaw_rad": float(obs["yaw_rad"]),
-                    "xy_displacement_m": float(math.hypot(
-                        cur_xy[0] - start_state["pos_xy"][0],
-                        cur_xy[1] - start_state["pos_xy"][1],
-                    )),
-                    "goal_dist_m": audit_goal_dist,
-                    "goal_dist_delta_m": (
+                if "actual_after_first_command" not in pending_plan_audit:
+                    pending_plan_audit["actual_after_first_command"] = {
+                        "executed_commands": 1,
+                        "pos_xy": [float(cur_xy[0]), float(cur_xy[1])],
+                        "yaw_rad": float(obs["yaw_rad"]),
+                        "xy_displacement_m": float(math.hypot(
+                            cur_xy[0] - start_state["pos_xy"][0],
+                            cur_xy[1] - start_state["pos_xy"][1],
+                        )),
+                        "goal_dist_m": audit_goal_dist,
+                        "goal_dist_delta_m": (
+                            None
+                            if start_goal_dist is None or audit_goal_dist is None
+                            else float(audit_goal_dist - start_goal_dist)
+                        ),
+                        "coverage_area_m2": (
+                            None if audit_cov_area is None else float(audit_cov_area)
+                        ),
+                        "coverage_gain_m2": (
+                            None
+                            if start_cov_area is None or audit_cov_area is None
+                            else float(audit_cov_area - start_cov_area)
+                        ),
+                        "collision": bool(collided),
+                        "collision_count": int(collision_count),
+                        "goal_similarity_proj": (
+                            None if goal_sim_now is None else float(goal_sim_now)
+                        ),
+                        "goal_similarity_raw": (
+                            None if goal_sim_raw_now is None else float(goal_sim_raw_now)
+                        ),
+                        "visited_bank_size_after": int(len(visited_rollout_bank)),
+                    }
+                    if prediction_error is not None:
+                        pending_plan_audit["prediction_error"] = prediction_error
+
+                if pending_audit_commands_executed >= pending_audit_commit_steps:
+                    commit_pred_raw = (
                         None
-                        if start_goal_dist is None or audit_goal_dist is None
-                        else float(audit_goal_dist - start_goal_dist)
-                    ),
-                    "coverage_area_m2": (
-                        None if audit_cov_area is None else float(audit_cov_area)
-                    ),
-                    "coverage_gain_m2": (
+                        if pending_audit_commit_raw is None
+                        else pending_audit_commit_raw.squeeze(0)
+                    )
+                    commit_pred_proj = (
                         None
-                        if start_cov_area is None or audit_cov_area is None
-                        else float(audit_cov_area - start_cov_area)
-                    ),
-                    "collision": bool(collided),
-                    "collision_count": int(collision_count),
-                    "goal_similarity_proj": (
-                        None if goal_sim_now is None else float(goal_sim_now)
-                    ),
-                    "goal_similarity_raw": (
-                        None if goal_sim_raw_now is None else float(goal_sim_raw_now)
-                    ),
-                    "visited_bank_size_after": int(len(visited_rollout_bank)),
-                }
-                if prediction_error is not None:
-                    pending_plan_audit["prediction_error"] = prediction_error
-                plan_audit_records.append(pending_plan_audit)
-                pending_plan_audit = None
+                        if pending_audit_commit_proj is None
+                        else pending_audit_commit_proj.squeeze(0)
+                    )
+                    commit_prediction_error = None
+                    if commit_pred_raw is not None and commit_pred_proj is not None:
+                        commit_raw_delta = commit_pred_raw - act_raw
+                        commit_proj_delta = commit_pred_proj - act_proj
+                        commit_prediction_error = {
+                            "raw_mse": float(commit_raw_delta.square().mean().item()),
+                            "raw_l2": float(commit_raw_delta.norm().item()),
+                            "raw_cosine": float(cosine_similarity_scalar(commit_pred_raw, act_raw)),
+                            "proj_mse": float(commit_proj_delta.square().mean().item()),
+                            "proj_l2": float(commit_proj_delta.norm().item()),
+                            "proj_cosine": float(cosine_similarity_scalar(commit_pred_proj, act_proj)),
+                        }
+                    pending_plan_audit["actual_after_commitment"] = {
+                        "executed_commands": int(pending_audit_commands_executed),
+                        "pos_xy": [float(cur_xy[0]), float(cur_xy[1])],
+                        "yaw_rad": float(obs["yaw_rad"]),
+                        "xy_displacement_m": float(math.hypot(
+                            cur_xy[0] - start_state["pos_xy"][0],
+                            cur_xy[1] - start_state["pos_xy"][1],
+                        )),
+                        "goal_dist_m": audit_goal_dist,
+                        "goal_dist_delta_m": (
+                            None
+                            if start_goal_dist is None or audit_goal_dist is None
+                            else float(audit_goal_dist - start_goal_dist)
+                        ),
+                        "coverage_area_m2": (
+                            None if audit_cov_area is None else float(audit_cov_area)
+                        ),
+                        "coverage_gain_m2": (
+                            None
+                            if start_cov_area is None or audit_cov_area is None
+                            else float(audit_cov_area - start_cov_area)
+                        ),
+                        "collision": bool(collided),
+                        "collision_count": int(collision_count),
+                        "goal_similarity_proj": (
+                            None if goal_sim_now is None else float(goal_sim_now)
+                        ),
+                        "goal_similarity_raw": (
+                            None if goal_sim_raw_now is None else float(goal_sim_raw_now)
+                        ),
+                        "visited_bank_size_after": int(len(visited_rollout_bank)),
+                    }
+                    if commit_prediction_error is not None:
+                        pending_plan_audit["prediction_error_after_commitment"] = commit_prediction_error
+                    plan_audit_records.append(pending_plan_audit)
+                    pending_plan_audit = None
+                    pending_audit_commit_raw = None
+                    pending_audit_commit_proj = None
+                    pending_audit_commit_steps = 0
+                    pending_audit_commands_executed = 0
 
             if float(obs["proprio"][0, 0].item()) < sim_cfg.min_z:
                 terminate_reason = "fallen"
@@ -2694,8 +3475,18 @@ def main():
                 ]
                 if "revisit_penalty" in plan_metrics_last:
                     progress_parts.append(f"r={plan_metrics_last['revisit_penalty']:.3f}")
+                if "goal_cost" in plan_metrics_last:
+                    progress_parts.append(f"gcost={plan_metrics_last['goal_cost']:.3f}")
+                if "goal_similarity_proj_terminal" in plan_metrics_last:
+                    progress_parts.append(f"gsim={plan_metrics_last['goal_similarity_proj_terminal']:.3f}")
+                if "route_cost" in plan_metrics_last:
+                    progress_parts.append(f"rcost={plan_metrics_last['route_cost']:.3f}")
+                if "route_similarity_proj_terminal" in plan_metrics_last:
+                    progress_parts.append(f"rsim={plan_metrics_last['route_similarity_proj_terminal']:.3f}")
                 if "predicted_coverage_gain_m2" in plan_metrics_last:
                     progress_parts.append(f"cg={plan_metrics_last['predicted_coverage_gain_m2']:.3f}")
+                if "predicted_escape_frontier_value" in plan_metrics_last:
+                    progress_parts.append(f"ef={plan_metrics_last['predicted_escape_frontier_value']:.3f}")
                 if "predicted_displacement_m" in plan_metrics_last:
                     progress_parts.append(f"disp={plan_metrics_last['predicted_displacement_m']:.3f}")
                 if "terminal_displacement_bonus" in plan_metrics_last:
@@ -2716,7 +3507,7 @@ def main():
                     f"cost={costs_log[-1]:.3f} goal_sim={goal_sim_str} d_goal={goal_str} "
                     f"cov={cov_area:.2f}m^2 cov+={cov_delta:+.2f} "
                     f"coll={collision_count} "
-                    f"mode={mode} {progress_str}"
+                    f"mode={mode} route_sim={'n/a' if route_similarity_now is None else f'{route_similarity_now:.3f}'} {progress_str}"
                 )
 
             if reached:
@@ -2764,6 +3555,11 @@ def main():
             for rec in plan_audit_records
             if "prediction_error" in rec
         ]
+        pred_error_commit_records = [
+            rec["prediction_error_after_commitment"]
+            for rec in plan_audit_records
+            if "prediction_error_after_commitment" in rec
+        ]
         collision_error_records = [
             rec["prediction_error"]
             for rec in plan_audit_records
@@ -2791,6 +3587,14 @@ def main():
                 "proj_mse": _mean_key(pred_error_records, "proj_mse"),
                 "proj_l2": _mean_key(pred_error_records, "proj_l2"),
                 "proj_cosine": _mean_key(pred_error_records, "proj_cosine"),
+            },
+            "prediction_error_after_commitment_mean": {
+                "raw_mse": _mean_key(pred_error_commit_records, "raw_mse"),
+                "raw_l2": _mean_key(pred_error_commit_records, "raw_l2"),
+                "raw_cosine": _mean_key(pred_error_commit_records, "raw_cosine"),
+                "proj_mse": _mean_key(pred_error_commit_records, "proj_mse"),
+                "proj_l2": _mean_key(pred_error_commit_records, "proj_l2"),
+                "proj_cosine": _mean_key(pred_error_commit_records, "proj_cosine"),
             },
             "prediction_error_collision": {
                 "count": len(collision_error_records),
@@ -2836,11 +3640,19 @@ def main():
             "elite_frac": args.elite_frac,
             "mpc_execute_k": args.mpc_execute,
             "macro_action_repeat": args.macro_action_repeat,
+            "history_context_len": history_context_len,
             "latent_space": "proj",
             "objective": (
                 f"safety_plus_novelty_{args.exploration_bonus_mode}"
+                + (
+                    f"_plus_goal_{args.goal_cost_mode}"
+                    if target_beacon is not None and args.goal_cost_mode != "off" and planner_heads.goal_weight > 0.0
+                    else ""
+                )
                 + ("_plus_coverage_gain" if planner_heads.coverage_gain_head is not None and planner_heads.coverage_gain_weight > 0.0 else "")
+                + ("_plus_escape_frontier" if planner_heads.escape_frontier_head is not None and planner_heads.escape_frontier_weight > 0.0 else "")
                 + ("_plus_displacement_head" if planner_heads.displacement_head is not None and planner_heads.displacement_weight > 0.0 else "")
+                + ("_plus_keyframe_route" if args.memory_router_mode != "off" and args.route_progress_weight > 0.0 else "")
                 + ("_plus_terminal_displacement" if args.terminal_displacement_weight > 0.0 else "")
                 + ("_plus_safety_gated_novelty" if args.exploration_safety_gate_threshold is not None else "")
             ),
@@ -2849,21 +3661,51 @@ def main():
             "world_model_command_representation": str(wm_meta["command_representation"]),
             "world_model_command_block_size": int(wm_meta["command_block_size"]),
             "world_model_command_latency": int(wm_meta["command_latency"]),
+            "planner_action_space": args.planner_action_space,
+            "primitive_library_size": (
+                None if args.planner_action_space != "primitives" else int(args.primitive_library_size)
+            ),
+            "primitive_jitter_scale": (
+                None if args.planner_action_space != "primitives" else float(args.primitive_jitter_scale)
+            ),
             "action_penalty_weight": args.action_penalty_weight,
             "success_goal_sim_threshold": args.success_goal_sim_threshold,
             "success_goal_raw_sim_threshold": args.success_goal_raw_sim_threshold,
             "success_hold_steps": args.success_hold_steps,
             "goal_activation_step": goal_activation_step,
             "uses_safety_head": planner_heads.safety_head is not None,
-            "uses_goal_head": False,
+            "uses_goal_head": bool(
+                planner_heads.goal_head is not None
+                and target_beacon is not None
+                and args.goal_cost_mode == "head"
+                and planner_heads.goal_weight > 0.0
+            ),
             "goal_head_present_ckpt": planner_heads.goal_head is not None,
+            "goal_cost_mode": args.goal_cost_mode,
+            "goal_weight": planner_heads.goal_weight,
             "uses_exploration": planner_heads.exploration is not None,
             "exploration_weight": planner_heads.exploration_weight,
             "uses_coverage_gain_head": planner_heads.coverage_gain_head is not None,
             "coverage_gain_weight": planner_heads.coverage_gain_weight,
             "coverage_gain_hops": planner_heads.coverage_gain_hops,
+            "uses_escape_frontier_head": planner_heads.escape_frontier_head is not None,
+            "escape_frontier_weight": planner_heads.escape_frontier_weight,
+            "escape_frontier_hops": planner_heads.escape_frontier_hops,
             "uses_displacement_head": planner_heads.displacement_head is not None,
             "displacement_weight": planner_heads.displacement_weight,
+            "memory_router_mode": args.memory_router_mode,
+            "route_cost_mode": args.route_cost_mode,
+            "route_progress_weight": args.route_progress_weight,
+            "stall_plateau_steps": args.stall_plateau_steps,
+            "subgoal_budget_steps": args.subgoal_budget_steps,
+            "subgoal_min_age_steps": args.subgoal_min_age_steps,
+            "subgoal_frontier_window_steps": args.subgoal_frontier_window_steps,
+            "subgoal_cooldown_steps": args.subgoal_cooldown_steps,
+            "route_min_hops": args.route_min_hops,
+            "keyframe_sim_threshold": args.keyframe_sim_threshold,
+            "keyframe_match_radius_m": args.keyframe_match_radius_m,
+            "keyframe_min_step_gap": args.keyframe_min_step_gap,
+            "keyframe_add_interval": args.keyframe_add_interval,
             "exploration_bonus_mode": args.exploration_bonus_mode,
             "visited_nn_k": args.visited_nn_k,
             "visited_nn_margin": args.visited_nn_margin,
@@ -2875,13 +3717,14 @@ def main():
             "audit_topk": args.audit_topk,
             "coverage_gain_weight_override": args.coverage_gain_weight,
             "displacement_weight_override": args.displacement_weight,
+            "escape_frontier_weight_override": args.escape_frontier_weight,
+            "goal_weight_override": args.goal_weight,
             "terminal_displacement_weight": args.terminal_displacement_weight,
             "exploration_safety_gate_threshold": args.exploration_safety_gate_threshold,
             "exploration_safety_gate_sharpness": args.exploration_safety_gate_sharpness,
             "rnd_online_lr": args.rnd_online_lr,
             "ignored_goal_weight_ckpt": planner_heads.goal_weight,
             "ignored_recent_latent_window": args.recent_latent_window,
-            "ignored_revisit_penalty_weight": args.revisit_penalty_weight,
             "ignored_forward_bonus_weight": args.forward_bonus_weight,
             "ignored_forward_bonus_safety_threshold": args.forward_bonus_safety_threshold,
             "ignored_current_safety_brake_threshold": args.current_safety_brake_threshold,
@@ -2900,6 +3743,14 @@ def main():
         "goal_similarity_raw": goal_similarity_raw_log,
         "commands": cmds_log,
         "costs": costs_log,
+        "route_events": route_events,
+        "keyframe_graph": {
+            "n_nodes": len(keyframe_nodes),
+            "n_edges": int(sum(len(nbrs) for nbrs in keyframe_neighbors) // 2),
+            "active_route_kind": active_route_kind,
+            "active_route_target_idx": active_route_target_idx,
+            "active_route_remaining_hops": len(active_route_path),
+        },
         "plan_audit": {
             "enabled": bool(args.audit_plan),
             "records": len(plan_audit_records),

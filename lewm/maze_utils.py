@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -819,7 +819,8 @@ def generate_enclosed_maze(
     n_beacons: int = 2,
     beacon_identities: Optional[List[str]] = None,
     n_distractors: int = 0,
-) -> Tuple[ObstacleLayout, BeaconLayout, Tuple[int, int]]:
+    return_metadata: bool = False,
+) -> Tuple[ObstacleLayout, BeaconLayout, Tuple[int, int]] | Tuple[ObstacleLayout, BeaconLayout, Tuple[int, int], dict[str, Any]]:
     """Generate a fully-enclosed grid maze using recursive backtracking.
 
     Every cell is reachable.  Beacons are placed at the dead-end cells
@@ -839,7 +840,9 @@ def generate_enclosed_maze(
     Returns:
         ``(obstacle_layout, beacon_layout, start_cell)`` where
         ``start_cell`` is the (row, col) of the cell nearest the origin
-        (good default robot spawn location).
+        (good default robot spawn location). When ``return_metadata`` is
+        true, a fourth ``maze_meta`` dictionary is returned with cell centres,
+        adjacency, dead-end cells, beacon cells, and world-frame bounds.
     """
     from .beacon_utils import (
         BEACON_FAMILIES,
@@ -1027,12 +1030,32 @@ def generate_enclosed_maze(
                 dead_ends.append((dist_map[r][c], r, c))
     dead_ends.sort(key=lambda x: -x[0])
 
+    adjacency: dict[str, list[list[int]]] = {}
+    cell_centers: dict[str, list[float]] = {}
+    dist_lookup: dict[str, int] = {}
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            key = f"{r},{c}"
+            cell_centers[key] = [float(v) for v in _cell_world_xy(r, c)]
+            dist_lookup[key] = int(dist_map[r][c])
+            nbrs: list[list[int]] = []
+            if r > 0 and not h_walls[r][c]:
+                nbrs.append([r - 1, c])
+            if r < grid_rows - 1 and not h_walls[r + 1][c]:
+                nbrs.append([r + 1, c])
+            if c > 0 and not v_walls[r][c]:
+                nbrs.append([r, c - 1])
+            if c < grid_cols - 1 and not v_walls[r][c + 1]:
+                nbrs.append([r, c + 1])
+            adjacency[key] = nbrs
+
     # ---- 4. Place beacons at dead-end wall faces ----
     if beacon_identities is None:
         all_ids = list(BEACON_FAMILIES.keys())
         beacon_identities = list(rng.choice(all_ids, size=min(n_beacons, len(all_ids)), replace=False))
 
     beacon_specs: List[BeaconSpec] = []
+    beacon_cells: dict[str, list[int]] = {}
     used_cells: set[Tuple[int, int]] = set()
     for i in range(n_beacons):
         if i >= len(dead_ends):
@@ -1049,6 +1072,7 @@ def generate_enclosed_maze(
         )
         b = make_beacon_panel(wall_pos, wall_normal, identity, rng)
         beacon_specs.append(b)
+        beacon_cells[identity] = [int(br), int(bc)]
 
     # Optional distractor patches
     distractors: List[ObstacleSpec] = []
@@ -1063,7 +1087,30 @@ def generate_enclosed_maze(
             distractors.append(make_distractor_patch(pos, rng, near_identity=near))
 
     beacon_layout = BL(beacons=beacon_specs, distractors=distractors)
-    return obstacle_layout, beacon_layout, start_cell
+    if not return_metadata:
+        return obstacle_layout, beacon_layout, start_cell
+
+    maze_meta = {
+        "grid_rows": int(grid_rows),
+        "grid_cols": int(grid_cols),
+        "cell_size": float(cell_size),
+        "wall_thickness": float(wall_thickness),
+        "step": float(step),
+        "origin_xy": [float(ox), float(oy)],
+        "start_cell": [int(start_cell[0]), int(start_cell[1])],
+        "cell_centers_xy": cell_centers,
+        "adjacency": adjacency,
+        "dead_end_cells": [[int(r), int(c)] for _dist, r, c in dead_ends],
+        "dead_end_distances": dist_lookup,
+        "beacon_cells": beacon_cells,
+        "world_bounds_xy": [
+            float(ox - step / 2.0),
+            float(ox + (grid_cols - 1) * step + step / 2.0),
+            float(oy - step / 2.0),
+            float(oy + (grid_rows - 1) * step + step / 2.0),
+        ],
+    }
+    return obstacle_layout, beacon_layout, start_cell, maze_meta
 
 
 def _emit_h_wall(

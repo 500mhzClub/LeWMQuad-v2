@@ -44,7 +44,7 @@ For pure-perception navigation, the current recommended regime is:
 - `window_stride=5`
 - `command_representation=active_block`
 - no `--use_proprio`
-- `macro_action_repeat=5` and `mpc_execute=5` at inference
+- `macro_action_repeat=5` and `mpc_execute=1` at inference
 
 This matches the paper much more closely than the old contiguous setup:
 
@@ -83,8 +83,31 @@ Recommendation:
 ### 1. Optional: collect fresh physics trajectories
 
 ```bash
-python3 scripts/1_physics_rollout.py --ckpt <ppo_ckpt> --steps 1000 --chunks 5
+python3 scripts/1_physics_rollout.py \
+  --ckpt <ppo_ckpt> \
+  --steps 1000 \
+  --chunks 200 \
+  --scene_distribution mixed
 ```
+
+Important:
+
+- `--chunks 5` is only a smoke-test scale
+- for any serious generalization claim, collect many more chunk seeds so the
+  dataset contains many more distinct scenes, not just more frames from the
+  same few layouts
+- `--scene_distribution mixed` now injects enclosed mazes into training data so
+  rollout collection better matches the deployment task instead of relying only
+  on the older local composite scenes
+- if you want a pure deployment-like curriculum, use
+  `--scene_distribution enclosed`
+- `--command_policy mixed` is now the recommended collector mode for serious
+  maze training: it preserves some open-loop diversity but also injects
+  privileged closed-loop maze-teacher trajectories that actually traverse to
+  beacons and dead ends
+- rollout collection now uses topology-aware respawns by default (`--respawn_strategy auto`),
+  so enclosed-maze episodes start near the designated maze start region instead
+  of silently respawning outside the perimeter or at unrelated locations
 
 ### 2. Optional: render egocentric RGB with anti-clipping protections
 
@@ -148,6 +171,8 @@ This is the main world-model run to build on:
   five-step command block, not an averaged surrogate
 - checkpoints save command metadata (`cmd_dim`, representation, latency, block
   size), and downstream scripts read that metadata automatically
+- base LeWM training now performs held-out scene evaluation by default, so the
+  core world model is no longer judged only by in-training loss
 
 Older mixed-state or averaged-command runs should be treated as baselines or
 compatibility checkpoints, not the preferred starting point.
@@ -157,11 +182,15 @@ compatibility checkpoints, not the preferred starting point.
 The current recommended planning stack for pure-perception exploration uses two
 learned components on top of frozen LeWM latents:
 
-- `LatentEnergyHead`: dense proximity-style safety energy
-- `ExplorationBonus`: RND-style novelty bonus
+- `LatentEnergyHead`: dense safety / mobility energy
+- `ExplorationBonus`: novelty bonus
+- `CoverageGainHead`: short sequence-level local frontier gain
+- `EscapeFrontierHead`: longer-horizon "leave the basin and open frontier" value
 
-Goal and progress heads remain available as optional experiments, but they are
-not part of the active default runtime path.
+The direct goal term at inference is still the rollout-space breadcrumb
+similarity (`--goal_cost_mode terminal_cosine`). Goal and progress heads remain
+available as optional experiments, but they are not required by the active
+runtime path.
 
 The planning heads must use the **same temporal abstraction and command
 representation** as the world-model checkpoint they consume.
@@ -173,6 +202,8 @@ checkpoint and will fail fast on explicit mismatches. In particular:
   command representation, and command latency are resolved from the checkpoint
 - scorer checkpoints now carry temporal / encoder metadata
 - inference validates that scorer metadata matches the loaded world model
+- held-out evaluation now defaults to `scene`-level splitting rather than
+  per-env episode splitting so train/eval do not share the same chunk geometry
 
 Important: the base world model does **not** use beacon labels, so it can still
 be trained on `jepa_final_v3`. The planning heads should use the LOS-corrected
@@ -184,6 +215,7 @@ Recommended command:
 ```bash
 python3 scripts/4_train_energy_head.py \
   --data_dir jepa_final_v3_los \
+  --raw_data_dir jepa_raw_data \
   --checkpoint lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
   --device cuda \
   --seq_len 4 \
@@ -199,6 +231,9 @@ python3 scripts/4_train_energy_head.py \
   --skip_goal \
   --skip_progress \
   --exploration_epochs 5 \
+  --coverage_gain_weight 0.5 \
+  --escape_frontier_weight 1.0 \
+  --eval_split_group scene \
   --exploration_weight 1.0
 ```
 
@@ -213,8 +248,18 @@ Inference must use the same macro-timescale as training:
 - planner horizon in latent steps
 - `macro_action_repeat=5` so one planner step corresponds to one executed
   five-command block
-- `mpc_execute=5` to match the paper-style cadence of executing the optimized
-  block sequence before replanning
+- the planner now defaults to replanning every macro step (`mpc_execute=1`)
+  because long open-loop execution was too brittle in collision-rich mazes
+- the planner can condition on recent latent history, which better matches the
+  training-time predictor context than single-frame planning
+- the planner can search over a library of supported command-block primitives
+  instead of unconstrained continuous 15D command blocks
+- when a target beacon exists, the planner now includes a rollout-space goal
+  term by default (`--goal_cost_mode terminal_cosine`) rather than treating
+  target similarity as evaluation-only
+- the planner can also use a perception-only keyframe graph when local progress
+  stalls, which gives it longer-horizon memory without adding proprio or a
+  privileged map
 
 Recommended command:
 
@@ -226,8 +271,11 @@ python3 scripts/6_infer_pure_wm.py \
   --seed 42 \
   --steps 200 \
   --macro_action_repeat 5 \
-  --mpc_execute 5 \
+  --mpc_execute 1 \
   --cem_iters 10 \
+  --planner_action_space primitives \
+  --memory_router_mode keyframe \
+  --route_progress_weight 7.0 \
   --rnd_online_lr 1e-3 \
   --out_dir inference_runs/perception_only_stride5_block15_vision_s42
 ```
@@ -236,9 +284,20 @@ Notes:
 
 - Omit `--target_beacon` unless you know that beacon exists for the chosen
   random seed. If you pass an invalid beacon identity, the script will error.
-- The active planner now uses learned safety + learned novelty + action penalty.
-  Beacon similarity is still logged and checked for success, but it is not used
-  as a planner cost.
+- The active planner now uses goal attraction + learned safety + learned
+  novelty + sequence-level frontier value + action penalty. If you want pure
+  exploration, set
+  `--goal_cost_mode off`.
+- `--goal_cost_mode terminal_cosine` is the default because it compares rollout
+  projected latents directly to the breadcrumb latent in the planner scoring
+  space. `--goal_cost_mode head` is available only when the scorer checkpoint
+  includes a trained goal head.
+- `--memory_router_mode keyframe` is the recommended default for unseen mazes.
+  It activates a persistent perception-only keyframe graph and temporarily
+  routes toward remembered frontier waypoints when local planning plateaus.
+- `--history_context_len` defaults to the world-model `max_seq_len`, so the
+  planner rollout conditions on recent latent history unless you explicitly set
+  it to `1`
 - The script now rejects proprio-enabled world models by default. To run an old
   mixed-state checkpoint for comparison, pass `--allow_mixed_latent_wm`.
 
@@ -253,11 +312,16 @@ for seed in 42 43 44; do
     --seed "$seed" \
     --steps 200 \
     --macro_action_repeat 5 \
-    --mpc_execute 5 \
+    --mpc_execute 1 \
     --cem_iters 10 \
+    --planner_action_space primitives \
     --rnd_online_lr 1e-3 \
     --out_dir "inference_runs/perception_only_stride5_block15_vision_s${seed}"
 done
+
+python3 scripts/7_aggregate_inference_runs.py \
+  --glob "inference_runs/perception_only_stride5_block15_vision_s*" \
+  --out inference_runs/perception_only_stride5_block15_vision_aggregate.json
 ```
 
 ## Validation scripts
@@ -274,16 +338,14 @@ python3 scripts/demo_data_quality.py --ckpt <ppo_ckpt>
 
 ### Active objective
 
-The active inference path is intentionally narrow:
+The active inference path is now:
 
 - learned safety cost
 - learned novelty bonus
+- direct rollout-space goal term
+- learned sequence-level frontier / escape value
+- perception-only keyframe routing when local progress stalls
 - small action penalty
-
-The planner no longer uses goal energy, learned progress, keyframe routing,
-prototype-bank frontier density, or other route-level heuristics in the control
-loop. Beacon similarity is still encoded and logged, but it is treated as an
-evaluation / success signal rather than a planning reward.
 
 ### Pure-perception guard
 

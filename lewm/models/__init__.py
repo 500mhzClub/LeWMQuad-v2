@@ -10,6 +10,7 @@ from .energy_head import (
     PlaceSnippetHead,
     DisplacementHead,
     CoverageGainHead,
+    EscapeFrontierHead,
     TrajectoryScorer,
     composite_energy_target,
     composite_safety_target,
