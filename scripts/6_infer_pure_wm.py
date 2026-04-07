@@ -184,6 +184,7 @@ class PureCEMPlanner:
         heads: PlannerHeads | None = None,
         exploration_bonus_mode: str = "terminal",
         terminal_displacement_weight: float = 0.0,
+        rollout_prefix_novelty_weight: float = 0.0,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
@@ -267,6 +268,29 @@ class PureCEMPlanner:
                 costs -= terminal_displacement_weight * terminal_displacement
                 metrics["terminal_displacement_bonus"] = terminal_displacement
 
+            if rollout_prefix_novelty_weight > 0.0:
+                if z0_proj is None:
+                    raise ValueError(
+                        "rollout_prefix_novelty_weight > 0 requires z_start_proj.",
+                    )
+                # Reward predicted trajectories that keep making new latent progress
+                # instead of revisiting their own imagined prefix.
+                seq_proj = torch.cat(
+                    [z0_proj.expand(self.n_candidates, -1).unsqueeze(1), z_rollouts_proj],
+                    dim=1,
+                )
+                seq_proj = F.normalize(seq_proj, dim=-1)
+                prefix_bonus_terms: list[torch.Tensor] = []
+                for t in range(1, self.horizon + 1):
+                    sim_to_prefix = (
+                        seq_proj[:, t, :].unsqueeze(1) * seq_proj[:, :t, :]
+                    ).sum(dim=-1)
+                    max_sim = sim_to_prefix.max(dim=1).values
+                    prefix_bonus_terms.append((1.0 - max_sim).clamp_min(0.0))
+                rollout_prefix_bonus = torch.stack(prefix_bonus_terms, dim=1).sum(dim=1)
+                costs -= rollout_prefix_novelty_weight * rollout_prefix_bonus
+                metrics["rollout_prefix_novelty_bonus"] = rollout_prefix_bonus
+
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -344,6 +368,8 @@ def parse_args() -> argparse.Namespace:
                    help="How to score learned novelty over predicted rollout latents.")
     p.add_argument("--terminal_displacement_weight", type=float, default=0.0,
                    help="Optional bonus on predicted terminal latent displacement from the current observation.")
+    p.add_argument("--rollout_prefix_novelty_weight", type=float, default=0.0,
+                   help="Optional bonus for imagined rollout states that stay novel relative to their own predicted prefix.")
     p.add_argument("--rnd_online_lr", type=float, default=1e-3,
                    help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
     p.add_argument("--recent_latent_window", type=int, default=128,
@@ -1840,6 +1866,7 @@ def main():
     objective_name = (
         f"safety+novelty[{args.exploration_bonus_mode}]"
         + ("+terminal_disp" if args.terminal_displacement_weight > 0.0 else "")
+        + ("+prefix_nov" if args.rollout_prefix_novelty_weight > 0.0 else "")
     )
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
@@ -1849,6 +1876,7 @@ def main():
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
           f"ExploreMode={args.exploration_bonus_mode}, "
           f"DispW={args.terminal_displacement_weight:.3f}, "
+          f"PrefixW={args.rollout_prefix_novelty_weight:.3f}, "
           f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
@@ -1973,6 +2001,7 @@ def main():
                     heads=planner_heads,
                     exploration_bonus_mode=args.exploration_bonus_mode,
                     terminal_displacement_weight=args.terminal_displacement_weight,
+                    rollout_prefix_novelty_weight=args.rollout_prefix_novelty_weight,
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
@@ -2113,6 +2142,8 @@ def main():
                 ]
                 if "terminal_displacement_bonus" in plan_metrics_last:
                     progress_parts.append(f"d={plan_metrics_last['terminal_displacement_bonus']:.3f}")
+                if "rollout_prefix_novelty_bonus" in plan_metrics_last:
+                    progress_parts.append(f"p={plan_metrics_last['rollout_prefix_novelty_bonus']:.3f}")
                 progress_str = " ".join(progress_parts)
                 goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
                 if goal_sim_now is None:
@@ -2203,6 +2234,7 @@ def main():
             "objective": (
                 f"safety_plus_novelty_{args.exploration_bonus_mode}"
                 + ("_plus_terminal_displacement" if args.terminal_displacement_weight > 0.0 else "")
+                + ("_plus_rollout_prefix_novelty" if args.rollout_prefix_novelty_weight > 0.0 else "")
             ),
             "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
             "world_model_cmd_dim": int(wm_meta["cmd_dim"]),
@@ -2221,6 +2253,7 @@ def main():
             "exploration_weight": planner_heads.exploration_weight,
             "exploration_bonus_mode": args.exploration_bonus_mode,
             "terminal_displacement_weight": args.terminal_displacement_weight,
+            "rollout_prefix_novelty_weight": args.rollout_prefix_novelty_weight,
             "rnd_online_lr": args.rnd_online_lr,
             "ignored_goal_weight_ckpt": planner_heads.goal_weight,
             "ignored_recent_latent_window": args.recent_latent_window,
