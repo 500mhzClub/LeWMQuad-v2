@@ -162,6 +162,15 @@ def parse_args() -> argparse.Namespace:
                    help="If rollout pose is available, positives come from the same episode within this XY radius (m).")
     p.add_argument("--place_negative_gap_m", type=float, default=0.75,
                    help="If rollout pose is available, same-episode negatives must be at least this XY distance away (m).")
+    # Held-out evaluation
+    p.add_argument("--skip_eval", action="store_true",
+                   help="Skip held-out episode evaluation for safety/place heads.")
+    p.add_argument("--eval_holdout_fraction", type=float, default=0.10,
+                   help="Fraction of rollout episodes held out from training for validation.")
+    p.add_argument("--eval_seed", type=int, default=42)
+    p.add_argument("--eval_batch_size", type=int, default=8192)
+    p.add_argument("--eval_place_max_queries", type=int, default=4096,
+                   help="Cap the number of held-out snippet queries used for place retrieval evaluation.")
     # TrajectoryScorer weights
     p.add_argument("--goal_weight", type=float, default=1.0)
     p.add_argument("--progress_weight", type=float, default=1.0)
@@ -688,6 +697,238 @@ def load_cached_latents(cache_dir: str):
             "robot_yaw": rollout_yaw,
         },
     }
+
+
+def build_rollout_holdout_masks(
+    episode_id: torch.Tensor,
+    holdout_fraction: float,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]] | None:
+    """Split rollout samples by episode id so evaluation uses unseen episodes."""
+    if holdout_fraction <= 0.0:
+        return None
+    valid = episode_id >= 0
+    if not torch.any(valid):
+        return None
+
+    unique_eps = torch.unique(episode_id[valid], sorted=True)
+    n_eps = int(unique_eps.numel())
+    if n_eps < 2:
+        return None
+
+    n_eval_eps = max(1, int(round(float(holdout_fraction) * n_eps)))
+    n_eval_eps = min(n_eval_eps, n_eps - 1)
+    if n_eval_eps <= 0:
+        return None
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(n_eps, generator=generator)
+    eval_eps = unique_eps[perm[:n_eval_eps]]
+    eval_mask = valid & torch.isin(episode_id, eval_eps)
+    train_mask = valid & (~eval_mask)
+
+    if not torch.any(train_mask) or not torch.any(eval_mask):
+        return None
+
+    return train_mask, eval_mask, {
+        "n_episodes": n_eps,
+        "n_train_episodes": int(torch.unique(episode_id[train_mask]).numel()),
+        "n_eval_episodes": int(torch.unique(episode_id[eval_mask]).numel()),
+        "n_train_samples": int(train_mask.sum().item()),
+        "n_eval_samples": int(eval_mask.sum().item()),
+    }
+
+
+def pearson_corrcoef(x: torch.Tensor, y: torch.Tensor) -> float:
+    x64 = x.to(dtype=torch.float64)
+    y64 = y.to(dtype=torch.float64)
+    x_center = x64 - x64.mean()
+    y_center = y64 - y64.mean()
+    denom = torch.sqrt((x_center.square().mean()) * (y_center.square().mean()))
+    if float(denom.item()) <= 1e-12:
+        return float("nan")
+    return float((x_center * y_center).mean().div(denom).item())
+
+
+def binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    labels = labels.to(dtype=torch.bool)
+    n_pos = int(labels.sum().item())
+    n_neg = int((~labels).sum().item())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    scores64 = scores.to(dtype=torch.float64)
+    order = torch.argsort(scores64, stable=True)
+    ranks = torch.empty_like(scores64, dtype=torch.float64)
+    ranks[order] = torch.arange(1, len(scores64) + 1, dtype=torch.float64)
+    pos_rank_sum = ranks[labels].sum()
+    auc = (pos_rank_sum - (n_pos * (n_pos + 1) / 2.0)) / float(n_pos * n_neg)
+    return float(auc.item())
+
+
+def evaluate_safety_head(
+    args,
+    head: nn.Module,
+    z_eval: torch.Tensor,
+    target_eval: torch.Tensor,
+    collisions_eval: torch.Tensor,
+    device,
+) -> dict[str, float] | None:
+    if z_eval.numel() == 0:
+        return None
+
+    dataset = TensorDataset(z_eval, target_eval, collisions_eval)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.eval_batch_size)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    preds_all: list[torch.Tensor] = []
+    target_all: list[torch.Tensor] = []
+    coll_all: list[torch.Tensor] = []
+    head.eval()
+    with torch.inference_mode():
+        for z_batch, target_batch, coll_batch in dataloader:
+            z_batch = z_batch.to(device, non_blocking=True)
+            pred = head(z_batch).float().cpu()
+            preds_all.append(pred)
+            target_all.append(target_batch.float().cpu())
+            coll_all.append(coll_batch.float().cpu())
+
+    pred = torch.cat(preds_all)
+    target = torch.cat(target_all)
+    coll = torch.cat(coll_all)
+    mse = float((pred - target).square().mean().item())
+    metrics = {
+        "mse": mse,
+        "rmse": math.sqrt(max(0.0, mse)),
+        "mae": float((pred - target).abs().mean().item()),
+        "pearson": pearson_corrcoef(pred, target),
+        "collision_rate": float(coll.mean().item()),
+        "collision_auc": binary_auc(pred, coll > 0.5),
+        "pred_mean_collision": float(pred[coll > 0.5].mean().item()) if torch.any(coll > 0.5) else float("nan"),
+        "pred_mean_no_collision": float(pred[coll <= 0.5].mean().item()) if torch.any(coll <= 0.5) else float("nan"),
+        "target_mean": float(target.mean().item()),
+        "pred_mean": float(pred.mean().item()),
+        "n_eval": int(pred.numel()),
+    }
+    print(
+        "  Held-out safety | "
+        f"n={metrics['n_eval']:,} "
+        f"rmse={metrics['rmse']:.4f} "
+        f"mae={metrics['mae']:.4f} "
+        f"pearson={metrics['pearson']:.3f} "
+        f"collision_auc={metrics['collision_auc']:.3f} "
+        f"pred(coll)={metrics['pred_mean_collision']:.3f} "
+        f"pred(no-coll)={metrics['pred_mean_no_collision']:.3f}"
+    )
+    return metrics
+
+
+def evaluate_place_head(
+    args,
+    head: nn.Module,
+    rollout_snippets: torch.Tensor,
+    snippet_episode_id: torch.Tensor,
+    snippet_xy: torch.Tensor,
+    device,
+) -> dict[str, float] | None:
+    if rollout_snippets.numel() == 0 or snippet_episode_id.numel() == 0:
+        return None
+    if not torch.isfinite(snippet_xy).all():
+        return None
+
+    dataset = TensorDataset(rollout_snippets)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.eval_batch_size)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    emb_all: list[torch.Tensor] = []
+    head.eval()
+    with torch.inference_mode():
+        for (snippet_batch,) in dataloader:
+            snippet_batch = snippet_batch.to(device, non_blocking=True)
+            emb_all.append(head(snippet_batch).float().cpu())
+    emb = torch.cat(emb_all)
+
+    by_episode: dict[int, torch.Tensor] = {}
+    for ep in snippet_episode_id.unique(sorted=True).tolist():
+        ep_int = int(ep)
+        if ep_int < 0:
+            continue
+        by_episode[ep_int] = torch.nonzero(snippet_episode_id == ep_int, as_tuple=False).squeeze(1)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(args.eval_seed) + 17)
+    query_budget = max(1, int(args.eval_place_max_queries))
+    queried = 0
+    recall1 = 0
+    recall5 = 0
+    d_pos_all: list[float] = []
+    d_neg_all: list[float] = []
+
+    for ep in sorted(by_episode.keys()):
+        ep_idx = by_episode[ep]
+        if int(ep_idx.numel()) < 2:
+            continue
+        ep_emb = emb[ep_idx]
+        ep_xy = snippet_xy[ep_idx]
+        xy_d = torch.cdist(ep_xy, ep_xy)
+        emb_d = torch.cdist(ep_emb, ep_emb)
+        emb_d.fill_diagonal_(float("inf"))
+        positive_mask = (xy_d > 0.0) & (xy_d <= float(args.place_positive_radius_m))
+        negative_mask = xy_d >= float(args.place_negative_gap_m)
+        valid_queries = torch.nonzero(positive_mask.any(dim=1), as_tuple=False).squeeze(1)
+        if valid_queries.numel() == 0:
+            continue
+        if queried >= query_budget:
+            break
+        remaining = query_budget - queried
+        if valid_queries.numel() > remaining:
+            take = torch.randperm(valid_queries.numel(), generator=generator)[:remaining]
+            valid_queries = valid_queries[take]
+
+        for q in valid_queries.tolist():
+            ranking = torch.argsort(emb_d[q])
+            top1 = ranking[:1]
+            top5 = ranking[: min(5, ranking.numel())]
+            recall1 += int(bool(positive_mask[q, top1].any().item()))
+            recall5 += int(bool(positive_mask[q, top5].any().item()))
+            d_pos_all.append(float(emb_d[q][positive_mask[q]].min().item()))
+            if bool(negative_mask[q].any().item()):
+                d_neg_all.append(float(emb_d[q][negative_mask[q]].min().item()))
+        queried += int(valid_queries.numel())
+
+    if queried == 0:
+        return None
+
+    d_pos_mean = float(sum(d_pos_all) / max(1, len(d_pos_all)))
+    d_neg_mean = float(sum(d_neg_all) / max(1, len(d_neg_all))) if d_neg_all else float("nan")
+    metrics = {
+        "n_queries": queried,
+        "recall_at_1": recall1 / float(queried),
+        "recall_at_5": recall5 / float(queried),
+        "nearest_positive_dist": d_pos_mean,
+        "nearest_negative_dist": d_neg_mean,
+        "distance_gap": d_neg_mean - d_pos_mean if math.isfinite(d_neg_mean) else float("nan"),
+    }
+    print(
+        "  Held-out place | "
+        f"queries={metrics['n_queries']:,} "
+        f"R@1={metrics['recall_at_1']:.3f} "
+        f"R@5={metrics['recall_at_5']:.3f} "
+        f"d_pos={metrics['nearest_positive_dist']:.3f} "
+        f"d_neg={metrics['nearest_negative_dist']:.3f}"
+    )
+    return metrics
 
 
 def build_goal_latent_pools(
@@ -1597,6 +1838,7 @@ def train(args):
     beacon_range_enc = latent_views["encoder"]["beacon_range"]
     z_rollout = latent_views["rollout"]["z"]
     safety_target_rollout = latent_views["rollout"]["safety_target"]
+    rollout_collisions = latent_views["rollout"]["collisions"]
     rollout_episode_id = latent_views["rollout"]["episode_id"]
     rollout_obs_step = latent_views["rollout"]["obs_step"]
     rollout_robot_xy = latent_views["rollout"]["robot_xy"]
@@ -1605,8 +1847,58 @@ def train(args):
         f"encoder-view latents for goal/progress: {tuple(z_enc.shape)}"
     )
 
+    holdout_metrics: dict[str, dict[str, float]] = {}
+    z_rollout_train = z_rollout
+    safety_target_train = safety_target_rollout
+    rollout_collisions_eval = torch.empty((0,), dtype=torch.float32)
+    z_rollout_eval = torch.empty((0, z_rollout.shape[-1]), dtype=z_rollout.dtype)
+    safety_target_eval = torch.empty((0,), dtype=safety_target_rollout.dtype)
+    rollout_episode_id_train = rollout_episode_id
+    rollout_obs_step_train = rollout_obs_step
+    rollout_robot_xy_train = rollout_robot_xy
+    rollout_episode_id_eval = torch.empty((0,), dtype=rollout_episode_id.dtype)
+    rollout_obs_step_eval = torch.empty((0,), dtype=rollout_obs_step.dtype)
+    rollout_robot_xy_eval = torch.empty((0, 2), dtype=rollout_robot_xy.dtype)
+    if not args.skip_eval:
+        split = build_rollout_holdout_masks(
+            rollout_episode_id,
+            holdout_fraction=float(args.eval_holdout_fraction),
+            seed=int(args.eval_seed),
+        )
+        if split is None:
+            print("Held-out eval: disabled (not enough valid rollout episodes for a split).")
+        else:
+            train_mask, eval_mask, split_info = split
+            z_rollout_train = z_rollout[train_mask]
+            safety_target_train = safety_target_rollout[train_mask]
+            rollout_episode_id_train = rollout_episode_id[train_mask]
+            rollout_obs_step_train = rollout_obs_step[train_mask]
+            rollout_robot_xy_train = rollout_robot_xy[train_mask]
+            z_rollout_eval = z_rollout[eval_mask]
+            safety_target_eval = safety_target_rollout[eval_mask]
+            rollout_collisions_eval = rollout_collisions[eval_mask]
+            rollout_episode_id_eval = rollout_episode_id[eval_mask]
+            rollout_obs_step_eval = rollout_obs_step[eval_mask]
+            rollout_robot_xy_eval = rollout_robot_xy[eval_mask]
+            print(
+                "Held-out eval split: "
+                f"episodes train/eval={split_info['n_train_episodes']}/{split_info['n_eval_episodes']} "
+                f"samples train/eval={split_info['n_train_samples']:,}/{split_info['n_eval_samples']:,}"
+            )
+
     # Phase 2: safety head
-    safety_head = train_safety_head(args, z_rollout, safety_target_rollout, device)
+    safety_head = train_safety_head(args, z_rollout_train, safety_target_train, device)
+    if z_rollout_eval.numel() > 0:
+        metrics = evaluate_safety_head(
+            args,
+            safety_head,
+            z_rollout_eval,
+            safety_target_eval,
+            rollout_collisions_eval,
+            device,
+        )
+        if metrics is not None:
+            holdout_metrics["safety"] = metrics
 
     # Phase 3: goal head
     goal_head = None
@@ -1622,7 +1914,7 @@ def train(args):
     # Phase 5: exploration bonus
     exploration = None
     if not args.skip_exploration:
-        exploration = train_exploration(args, z_rollout, device)
+        exploration = train_exploration(args, z_rollout_train, device)
 
     # Phase 6: place head
     place_head = None
@@ -1631,12 +1923,12 @@ def train(args):
     )
     if not args.skip_place:
         rollout_snippets, snippet_episode_id, snippet_start, snippet_xy = build_rollout_snippet_bank(
-            z_rollout,
-            rollout_episode_id,
-            rollout_obs_step,
+            z_rollout_train,
+            rollout_episode_id_train,
+            rollout_obs_step_train,
             snippet_len=place_snippet_len,
             temporal_stride=args.temporal_stride,
-            robot_xy=rollout_robot_xy,
+            robot_xy=rollout_robot_xy_train,
         )
         place_head = train_place_head(
             args,
@@ -1646,6 +1938,29 @@ def train(args):
             snippet_xy,
             device,
         )
+        if rollout_episode_id_eval.numel() > 0:
+            try:
+                eval_snippets, eval_snippet_epid, _eval_snippet_start, eval_snippet_xy = build_rollout_snippet_bank(
+                    z_rollout_eval,
+                    rollout_episode_id_eval,
+                    rollout_obs_step_eval,
+                    snippet_len=place_snippet_len,
+                    temporal_stride=args.temporal_stride,
+                    robot_xy=rollout_robot_xy_eval,
+                )
+            except ValueError:
+                eval_snippets = None
+            if eval_snippets is not None:
+                metrics = evaluate_place_head(
+                    args,
+                    place_head,
+                    eval_snippets,
+                    eval_snippet_epid,
+                    eval_snippet_xy,
+                    device,
+                )
+                if metrics is not None:
+                    holdout_metrics["place"] = metrics
 
     # Save combined TrajectoryScorer checkpoint
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
@@ -1676,6 +1991,7 @@ def train(args):
         "goal_latent_source": "enc_projector",
         "progress_latent_source": "enc_projector",
         "cache_version": CACHE_VERSION,
+        "holdout_metrics": holdout_metrics,
         "seq_len": args.seq_len,
         "temporal_stride": args.temporal_stride,
         "action_block_size": action_block_size,
@@ -1689,6 +2005,8 @@ def train(args):
         "max_seq_len": int(encoder_meta["max_seq_len"]),
     }
     torch.save(scorer_data, scorer_path)
+    if holdout_metrics:
+        torch.save(holdout_metrics, os.path.join(args.out_dir, "heldout_metrics.pt"))
     print(f"\nTrajectoryScorer checkpoint saved: {scorer_path}")
     print("All training complete.")
 
