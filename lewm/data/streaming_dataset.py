@@ -59,6 +59,7 @@ class StreamingJEPADataset(IterableDataset):
     def __init__(
         self,
         data_dir: str,
+        raw_data_dir: str | None = None,
         seq_len: int = 4,
         temporal_stride: int = 1,
         action_block_size: int | None = None,
@@ -70,6 +71,7 @@ class StreamingJEPADataset(IterableDataset):
         require_no_collision: bool = True,
         num_workers: int = 1,
         load_labels: bool = True,
+        load_pose: bool = False,
     ):
         super().__init__()
         self.files: List[str] = self._discover_files(data_dir)
@@ -103,9 +105,13 @@ class StreamingJEPADataset(IterableDataset):
         self.require_no_collision = require_no_collision
         self._num_workers = max(1, num_workers)
         self.load_labels = load_labels
+        self.load_pose = bool(load_pose)
         self.vision_shape, self.proprio_dim = self._inspect_schema()
         self.raw_span = (self.seq_len - 1) * self.temporal_stride + self.action_block_size
         self._episode_ids: dict[tuple[str, int], int] = {}
+        self._raw_files: dict[str, str] = (
+            self._resolve_raw_files(raw_data_dir) if self.load_pose else {}
+        )
 
         # Pre-build index table: list of (file_path, env_idx, t0)
         # Scans dones/collisions at init (small arrays, ~10 MB total).
@@ -152,6 +158,36 @@ class StreamingJEPADataset(IterableDataset):
                     files.append(path)
                     seen.add(path)
         return files
+
+    @staticmethod
+    def _raw_chunk_name(h5_path: str) -> str:
+        base = os.path.basename(h5_path)
+        if base.endswith("_rgb.h5"):
+            return base[: -len("_rgb.h5")] + ".npz"
+        if base.endswith(".h5"):
+            return base[: -len(".h5")] + ".npz"
+        raise ValueError(f"Unsupported rendered chunk filename: {h5_path}")
+
+    def _resolve_raw_files(self, raw_data_dir: str | None) -> dict[str, str]:
+        if raw_data_dir is None:
+            raise ValueError("load_pose=True requires raw_data_dir to locate raw rollout chunks.")
+        mapping: dict[str, str] = {}
+        missing: list[str] = []
+        for h5_path in self.files:
+            raw_name = self._raw_chunk_name(h5_path)
+            raw_path = os.path.join(raw_data_dir, raw_name)
+            if not os.path.isfile(raw_path):
+                missing.append(raw_path)
+                continue
+            mapping[h5_path] = raw_path
+        if missing:
+            preview = ", ".join(missing[:3])
+            suffix = " ..." if len(missing) > 3 else ""
+            raise FileNotFoundError(
+                "Could not locate raw rollout chunks for pose supervision. "
+                f"Missing: {preview}{suffix}"
+            )
+        return mapping
 
     def _inspect_schema(self) -> Tuple[Tuple[int, ...], int]:
         with h5py.File(self.files[0], "r") as h5f:
@@ -243,6 +279,7 @@ class StreamingJEPADataset(IterableDataset):
 
         # Keep file handles open for the lifetime of this worker's iteration
         open_files: dict = {}
+        raw_arrays: dict = {}
         try:
             for b0 in range(0, len(indices), self.batch_size):
                 batch_idx = indices[b0 : b0 + self.batch_size]
@@ -264,6 +301,9 @@ class StreamingJEPADataset(IterableDataset):
                         label_arrays[field] = arr
                 episode_ids = np.empty((B, self.seq_len), dtype=np.int64)
                 obs_steps = np.empty((B, self.seq_len), dtype=np.int64)
+                if self.load_pose:
+                    robot_xy = np.empty((B, self.seq_len, 2), dtype=np.float32)
+                    robot_yaw = np.empty((B, self.seq_len), dtype=np.float32)
 
                 for i, (fpath, e, t0) in enumerate(batch_idx):
                     if fpath not in open_files:
@@ -288,9 +328,34 @@ class StreamingJEPADataset(IterableDataset):
                         active_cmds_chunk = self._reconstruct_active_commands(
                             cmd_source, prefix_start, t0, raw_end,
                         )
+                    if self.load_pose:
+                        if fpath not in raw_arrays:
+                            raw_npz = np.load(self._raw_files[fpath], allow_pickle=True)
+                            base_pos = np.asarray(raw_npz["base_pos"], dtype=np.float32)
+                            base_quat = np.asarray(raw_npz["base_quat"], dtype=np.float32)
+                            if base_pos.shape[:2] != h5f["vision"].shape[:2]:
+                                raise ValueError(
+                                    "Raw/HDF5 shape mismatch for pose supervision: "
+                                    f"{self._raw_files[fpath]} {base_pos.shape[:2]} vs "
+                                    f"{fpath} {h5f['vision'].shape[:2]}"
+                                )
+                            w = base_quat[..., 0]
+                            x = base_quat[..., 1]
+                            y = base_quat[..., 2]
+                            z = base_quat[..., 3]
+                            yaw = np.arctan2(
+                                2.0 * (w * z + x * y),
+                                1.0 - 2.0 * (y * y + z * z),
+                            ).astype(np.float32)
+                            raw_arrays[fpath] = {"base_pos": base_pos, "yaw": yaw}
+                            raw_npz.close()
+                        pose_data = raw_arrays[fpath]
 
                     vis[i] = vis_chunk[obs_offsets]
                     prop[i] = prop_chunk[obs_offsets]
+                    if self.load_pose:
+                        robot_xy[i] = pose_data["base_pos"][e, t0:raw_end, :2][obs_offsets]
+                        robot_yaw[i] = pose_data["yaw"][e, t0:raw_end][obs_offsets]
 
                     for step_idx, offset in enumerate(obs_offsets.tolist()):
                         block = slice(offset, offset + self.action_block_size)
@@ -319,6 +384,9 @@ class StreamingJEPADataset(IterableDataset):
                         labels[field] = torch.from_numpy(arr)
                 labels["episode_id"] = torch.from_numpy(episode_ids)
                 labels["obs_step"] = torch.from_numpy(obs_steps)
+                if self.load_pose:
+                    labels["robot_xy"] = torch.from_numpy(robot_xy)
+                    labels["robot_yaw"] = torch.from_numpy(robot_yaw)
 
                 yield (
                     torch.from_numpy(vis),

@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train planning heads on frozen LeWM latents")
     # Data / encoder
     p.add_argument("--data_dir", type=str, default="jepa_final_dataset")
+    p.add_argument("--raw_data_dir", type=str, default=None,
+                   help="Optional directory with raw chunk_*.npz rollouts for pose-supervised place training.")
     p.add_argument("--checkpoint", type=str, required=True,
                    help="Path to trained LeWM checkpoint.")
     p.add_argument("--device", type=str, default="cuda")
@@ -156,6 +158,10 @@ def parse_args() -> argparse.Namespace:
                    help="Positive snippets come from the same episode within this many snippet starts.")
     p.add_argument("--place_negative_gap", type=int, default=6,
                    help="Same-episode negatives must be at least this many snippet starts away.")
+    p.add_argument("--place_positive_radius_m", type=float, default=0.25,
+                   help="If rollout pose is available, positives come from the same episode within this XY radius (m).")
+    p.add_argument("--place_negative_gap_m", type=float, default=0.75,
+                   help="If rollout pose is available, same-episode negatives must be at least this XY distance away (m).")
     # TrajectoryScorer weights
     p.add_argument("--goal_weight", type=float, default=1.0)
     p.add_argument("--progress_weight", type=float, default=1.0)
@@ -270,8 +276,8 @@ def load_frozen_encoder(args, device):
 # Phase 1: Extract latents + labels to disk
 # --------------------------------------------------------------------- #
 
-SHARD_SAMPLES = 500_000    # v7 stores rollout metadata for place-head training
-CACHE_VERSION = 7          # v7: add rollout episode/step metadata
+SHARD_SAMPLES = 500_000    # v8 stores rollout pose metadata for place-head training
+CACHE_VERSION = 8          # v8: add rollout XY/yaw metadata
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -324,6 +330,7 @@ def extract_latents(args, device) -> str:
     )
     cache_dir = args.cache_dir or os.path.join(args.out_dir, cache_name)
     manifest_path = os.path.join(cache_dir, "manifest.pt")
+    require_rollout_pose = bool(args.raw_data_dir)
 
     if os.path.exists(manifest_path):
         info = torch.load(manifest_path, map_location="cpu")
@@ -347,6 +354,7 @@ def extract_latents(args, device) -> str:
             info.get("version", 1) >= CACHE_VERSION
             and info.get("temporal_cfg") == expected_cfg
             and info.get("encoder_cfg") == expected_encoder_cfg
+            and (not require_rollout_pose or bool(info.get("rollout_pose_supervision", False)))
         ):
             print(
                 "Latent cache found: "
@@ -365,6 +373,7 @@ def extract_latents(args, device) -> str:
     num_workers = max(1, int(args.num_workers))
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
+        raw_data_dir=args.raw_data_dir,
         seq_len=args.seq_len,
         temporal_stride=args.temporal_stride,
         action_block_size=args.action_block_size,
@@ -376,6 +385,7 @@ def extract_latents(args, device) -> str:
         require_no_collision=False,
         num_workers=num_workers,
         load_labels=True,
+        load_pose=bool(args.raw_data_dir),
     )
     channels, height, width = dataset.vision_shape
     if int(height) != int(args.image_size):
@@ -398,6 +408,8 @@ def extract_latents(args, device) -> str:
     coll_rollout_buf: list[torch.Tensor] = []
     epid_rollout_buf: list[torch.Tensor] = []
     step_rollout_buf: list[torch.Tensor] = []
+    xy_rollout_buf: list[torch.Tensor] = []
+    yaw_rollout_buf: list[torch.Tensor] = []
     buf_encoder_samples = 0
     buf_rollout_samples = 0
     shard_idx = 0
@@ -408,7 +420,7 @@ def extract_latents(args, device) -> str:
     def flush_shard():
         nonlocal z_enc_buf, bid_enc_buf, br_enc_buf
         nonlocal z_rollout_buf, st_rollout_buf, bid_rollout_buf, br_rollout_buf, coll_rollout_buf
-        nonlocal epid_rollout_buf, step_rollout_buf
+        nonlocal epid_rollout_buf, step_rollout_buf, xy_rollout_buf, yaw_rollout_buf
         nonlocal buf_encoder_samples, buf_rollout_samples
         nonlocal shard_idx, total_encoder_samples, total_rollout_samples
         if not z_enc_buf:
@@ -437,6 +449,12 @@ def extract_latents(args, device) -> str:
             "obs_step_rollout": (
                 torch.cat(step_rollout_buf) if step_rollout_buf else torch.empty((0,), dtype=torch.long)
             ),
+            "robot_xy_rollout": (
+                torch.cat(xy_rollout_buf) if xy_rollout_buf else torch.empty((0, 2), dtype=torch.float32)
+            ),
+            "robot_yaw_rollout": (
+                torch.cat(yaw_rollout_buf) if yaw_rollout_buf else torch.empty((0,), dtype=torch.float32)
+            ),
         }, shard_path)
         total_encoder_samples += buf_encoder_samples
         total_rollout_samples += buf_rollout_samples
@@ -449,6 +467,7 @@ def extract_latents(args, device) -> str:
         z_rollout_buf, st_rollout_buf = [], []
         bid_rollout_buf, br_rollout_buf, coll_rollout_buf = [], [], []
         epid_rollout_buf, step_rollout_buf = [], []
+        xy_rollout_buf, yaw_rollout_buf = [], []
         buf_encoder_samples = 0
         buf_rollout_samples = 0
         shard_idx += 1
@@ -467,6 +486,8 @@ def extract_latents(args, device) -> str:
             beacon_identity = labels.get("beacon_identity")
             episode_id = labels.get("episode_id")
             obs_step = labels.get("obs_step")
+            robot_xy = labels.get("robot_xy")
+            robot_yaw = labels.get("robot_yaw")
 
             vision = vision.to(device, non_blocking=True).float().div_(255.0)
             proprio = proprio.to(device, non_blocking=True)
@@ -536,6 +557,14 @@ def extract_latents(args, device) -> str:
                     step_rollout_flat = obs_step.long()[:, 1:].reshape(B * (T - 1))
                 else:
                     step_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
+                if robot_xy is not None:
+                    xy_rollout_flat = robot_xy.float()[:, 1:, :].reshape(B * (T - 1), 2)
+                else:
+                    xy_rollout_flat = torch.full((B * (T - 1), 2), float("nan"), dtype=torch.float32)
+                if robot_yaw is not None:
+                    yaw_rollout_flat = robot_yaw.float()[:, 1:].reshape(B * (T - 1))
+                else:
+                    yaw_rollout_flat = torch.full((B * (T - 1),), float("nan"), dtype=torch.float32)
 
                 z_rollout_buf.append(z_rollout_flat)
                 st_rollout_buf.append(safety_rollout)
@@ -544,6 +573,8 @@ def extract_latents(args, device) -> str:
                 coll_rollout_buf.append(coll_rollout_flat)
                 epid_rollout_buf.append(epid_rollout_flat)
                 step_rollout_buf.append(step_rollout_flat)
+                xy_rollout_buf.append(xy_rollout_flat)
+                yaw_rollout_buf.append(yaw_rollout_flat)
                 buf_rollout_samples += B * (T - 1)
 
             if buf_encoder_samples >= SHARD_SAMPLES:
@@ -580,6 +611,7 @@ def extract_latents(args, device) -> str:
             "encoder": "enc_projector(z_obs_t)",
             "rollout": "pred_projector(predictor(z_obs_t, cmd_t)) aligned to labels[t+1]",
         },
+        "rollout_pose_supervision": bool(args.raw_data_dir),
     }, manifest_path)
     print(
         f"Extraction complete: enc={total_encoder_samples:,} rollout={total_rollout_samples:,} "
@@ -598,6 +630,7 @@ def load_cached_latents(cache_dir: str):
     z_rollout_all, st_rollout_all = [], []
     bid_rollout_all, br_rollout_all, coll_rollout_all = [], [], []
     epid_rollout_all, step_rollout_all = [], []
+    xy_rollout_all, yaw_rollout_all = [], []
     for i in range(manifest["n_shards"]):
         shard = torch.load(os.path.join(cache_dir, f"shard_{i:04d}.pt"), map_location="cpu")
         z_enc_all.append(shard["z_enc"])
@@ -610,6 +643,8 @@ def load_cached_latents(cache_dir: str):
         coll_rollout_all.append(shard["collisions_rollout"])
         epid_rollout_all.append(shard.get("episode_id_rollout", torch.empty((0,), dtype=torch.long)))
         step_rollout_all.append(shard.get("obs_step_rollout", torch.empty((0,), dtype=torch.long)))
+        xy_rollout_all.append(shard.get("robot_xy_rollout", torch.empty((0, 2), dtype=torch.float32)))
+        yaw_rollout_all.append(shard.get("robot_yaw_rollout", torch.empty((0,), dtype=torch.float32)))
         print(
             f"  Loaded shard {i}: enc={shard['z_enc'].shape[0]:,} "
             f"rollout={shard['z_rollout'].shape[0]:,} samples"
@@ -625,6 +660,8 @@ def load_cached_latents(cache_dir: str):
     rollout_coll = torch.cat(coll_rollout_all)
     rollout_epid = torch.cat(epid_rollout_all)
     rollout_step = torch.cat(step_rollout_all)
+    rollout_xy = torch.cat(xy_rollout_all)
+    rollout_yaw = torch.cat(yaw_rollout_all)
 
     print(f"Encoder view: {enc_z.shape[0]:,} samples, z={enc_z.shape}")
     print(f"Rollout view: {rollout_z.shape[0]:,} samples, z={rollout_z.shape}")
@@ -647,6 +684,8 @@ def load_cached_latents(cache_dir: str):
             "collisions": rollout_coll,
             "episode_id": rollout_epid,
             "obs_step": rollout_step,
+            "robot_xy": rollout_xy,
+            "robot_yaw": rollout_yaw,
         },
     }
 
@@ -1229,12 +1268,16 @@ def build_rollout_snippet_bank(
     obs_step: torch.Tensor,
     snippet_len: int,
     temporal_stride: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    robot_xy: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Deduplicate rollout states and assemble contiguous snippet windows."""
     if snippet_len <= 0:
         raise ValueError(f"snippet_len must be positive, got {snippet_len}")
 
     per_episode: dict[int, dict[int, tuple[torch.Tensor, int]]] = {}
+    per_episode_xy: dict[int, dict[int, tuple[torch.Tensor, int]]] | None = (
+        {} if robot_xy is not None else None
+    )
     for idx in range(int(z_rollout.shape[0])):
         ep = int(episode_id[idx].item())
         step = int(obs_step[idx].item())
@@ -1246,10 +1289,20 @@ def build_rollout_snippet_bank(
         else:
             accum, count = episode_map[step]
             episode_map[step] = (accum + z_rollout[idx], count + 1)
+        if per_episode_xy is not None:
+            xy = robot_xy[idx]
+            if torch.isfinite(xy).all():
+                xy_map = per_episode_xy.setdefault(ep, {})
+                if step not in xy_map:
+                    xy_map[step] = (xy.clone(), 1)
+                else:
+                    xy_accum, xy_count = xy_map[step]
+                    xy_map[step] = (xy_accum + xy, xy_count + 1)
 
     snippets: list[torch.Tensor] = []
     snippet_epids: list[int] = []
     snippet_starts: list[int] = []
+    snippet_xy: list[torch.Tensor] = []
     stride = int(temporal_stride)
     for ep, step_map in per_episode.items():
         ordered_steps = sorted(step_map.keys())
@@ -1259,6 +1312,12 @@ def build_rollout_snippet_bank(
             step: accum / float(count)
             for step, (accum, count) in step_map.items()
         }
+        dedup_xy = None
+        if per_episode_xy is not None and ep in per_episode_xy:
+            dedup_xy = {
+                step: accum / float(count)
+                for step, (accum, count) in per_episode_xy[ep].items()
+            }
         for start_idx in range(len(ordered_steps) - snippet_len + 1):
             window_steps = ordered_steps[start_idx:start_idx + snippet_len]
             if any((b - a) != stride for a, b in zip(window_steps[:-1], window_steps[1:])):
@@ -1266,6 +1325,15 @@ def build_rollout_snippet_bank(
             snippets.append(torch.stack([dedup_latents[step] for step in window_steps], dim=0))
             snippet_epids.append(ep)
             snippet_starts.append(window_steps[0])
+            if dedup_xy is not None:
+                center_step = window_steps[snippet_len // 2]
+                center_xy = dedup_xy.get(center_step)
+                if center_xy is None:
+                    snippet_xy.append(torch.full((2,), float("nan"), dtype=torch.float32))
+                else:
+                    snippet_xy.append(center_xy.clone().to(dtype=torch.float32))
+            else:
+                snippet_xy.append(torch.full((2,), float("nan"), dtype=torch.float32))
 
     if not snippets:
         raise ValueError("No contiguous rollout snippets could be built from the cached rollout bank.")
@@ -1274,6 +1342,7 @@ def build_rollout_snippet_bank(
         torch.stack(snippets, dim=0),
         torch.tensor(snippet_epids, dtype=torch.long),
         torch.tensor(snippet_starts, dtype=torch.long),
+        torch.stack(snippet_xy, dim=0),
     )
 
 
@@ -1282,6 +1351,7 @@ def train_place_head(
     rollout_snippets: torch.Tensor,
     snippet_episode_id: torch.Tensor,
     snippet_start: torch.Tensor,
+    snippet_xy: torch.Tensor | None,
     device,
 ):
     print("\n" + "=" * 60)
@@ -1305,6 +1375,21 @@ def train_place_head(
         f"  Snippet-start stride={start_stride} raw steps "
         f"(positive<= {positive_radius_raw}, negative>= {negative_gap_raw})"
     )
+    use_pose_supervision = bool(
+        snippet_xy is not None
+        and snippet_xy.numel() > 0
+        and torch.isfinite(snippet_xy).all()
+        and float(args.place_positive_radius_m) > 0.0
+        and float(args.place_negative_gap_m) > float(args.place_positive_radius_m)
+    )
+    if use_pose_supervision:
+        print(
+            "  Place supervision: pose_xy_same_episode "
+            f"(positive<= {float(args.place_positive_radius_m):.3f}m, "
+            f"negative>= {float(args.place_negative_gap_m):.3f}m)"
+        )
+    else:
+        print("  Place supervision: temporal proxy fallback")
 
     head = PlaceSnippetHead(
         latent_dim=args.latent_dim,
@@ -1324,6 +1409,7 @@ def train_place_head(
     snippets_cpu = rollout_snippets
     ep_cpu = snippet_episode_id.long()
     start_cpu = snippet_start.long()
+    xy_cpu = snippet_xy.float() if snippet_xy is not None else None
     all_indices = torch.arange(n_snippets, dtype=torch.long)
 
     by_episode: dict[int, torch.Tensor] = {}
@@ -1353,16 +1439,24 @@ def train_place_head(
 
                 for idx in anchor_idx.tolist():
                     ep = int(ep_cpu[idx].item())
-                    step = int(start_cpu[idx].item())
                     same_ep = by_episode[ep]
-                    same_steps = start_cpu[same_ep]
-                    delta_raw = (same_steps - step).abs()
+                    if use_pose_supervision:
+                        anchor_xy = xy_cpu[idx]
+                        same_xy = xy_cpu[same_ep]
+                        delta_xy = (same_xy - anchor_xy.unsqueeze(0)).square().sum(dim=-1).sqrt()
+                        pos_candidates = same_ep[(delta_xy > 0.0) & (delta_xy <= float(args.place_positive_radius_m))]
+                        if pos_candidates.numel() == 0:
+                            continue
+                        far_same = same_ep[delta_xy >= float(args.place_negative_gap_m)]
+                    else:
+                        step = int(start_cpu[idx].item())
+                        same_steps = start_cpu[same_ep]
+                        delta_raw = (same_steps - step).abs()
+                        pos_candidates = same_ep[(delta_raw > 0) & (delta_raw <= positive_radius_raw)]
+                        if pos_candidates.numel() == 0:
+                            continue
+                        far_same = same_ep[delta_raw >= negative_gap_raw]
 
-                    pos_candidates = same_ep[(delta_raw > 0) & (delta_raw <= positive_radius_raw)]
-                    if pos_candidates.numel() == 0:
-                        continue
-
-                    far_same = same_ep[delta_raw >= negative_gap_raw]
                     if far_same.numel() > 0 and torch.rand(()).item() < 0.5:
                         neg_candidate_pool = far_same
                     else:
@@ -1505,6 +1599,7 @@ def train(args):
     safety_target_rollout = latent_views["rollout"]["safety_target"]
     rollout_episode_id = latent_views["rollout"]["episode_id"]
     rollout_obs_step = latent_views["rollout"]["obs_step"]
+    rollout_robot_xy = latent_views["rollout"]["robot_xy"]
     print(
         f"Using rollout-view latents for safety/exploration: {tuple(z_rollout.shape)} | "
         f"encoder-view latents for goal/progress: {tuple(z_enc.shape)}"
@@ -1535,18 +1630,20 @@ def train(args):
         args.place_snippet_len if args.place_snippet_len is not None else max(1, args.seq_len - 1)
     )
     if not args.skip_place:
-        rollout_snippets, snippet_episode_id, snippet_start = build_rollout_snippet_bank(
+        rollout_snippets, snippet_episode_id, snippet_start, snippet_xy = build_rollout_snippet_bank(
             z_rollout,
             rollout_episode_id,
             rollout_obs_step,
             snippet_len=place_snippet_len,
             temporal_stride=args.temporal_stride,
+            robot_xy=rollout_robot_xy,
         )
         place_head = train_place_head(
             args,
             rollout_snippets,
             snippet_episode_id,
             snippet_start,
+            snippet_xy,
             device,
         )
 
@@ -1571,6 +1668,11 @@ def train(args):
         "safety_latent_source": "pred_projector_teacher_forced",
         "exploration_latent_source": "pred_projector_teacher_forced",
         "place_latent_source": "pred_projector_teacher_forced_snippet",
+        "place_supervision": (
+            "pose_xy_same_episode"
+            if args.raw_data_dir is not None
+            else "temporal_proxy"
+        ),
         "goal_latent_source": "enc_projector",
         "progress_latent_source": "enc_projector",
         "cache_version": CACHE_VERSION,

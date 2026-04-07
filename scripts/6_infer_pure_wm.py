@@ -2007,6 +2007,8 @@ def main():
                 f"place={scorer_meta.get('place_latent_source', 'unknown')} "
                 f"goal={scorer_meta.get('goal_latent_source', 'unknown')}"
             )
+        if scorer_meta.get("has_place_head", False) and scorer_meta.get("place_supervision") is not None:
+            print(f"Place supervision: {scorer_meta.get('place_supervision')}")
         if scorer_meta.get("has_goal_head", False):
             print("Ignoring goal head in scorer checkpoint; the active planner optimizes safety + novelty only.")
     if args.score_space != "proj":
