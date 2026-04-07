@@ -245,12 +245,11 @@ class PureCEMPlanner:
                     if exploration_bonus_mode == "terminal":
                         bonus = terminal_bonus
                     elif exploration_bonus_mode == "gain":
-                        if z0_proj is None:
-                            raise ValueError(
-                                "exploration_bonus_mode='gain' requires z_start_proj.",
-                            )
-                        start_bonus = heads.exploration(z0_proj).reshape(1).expand(n_cand)
-                        bonus = (terminal_bonus - start_bonus).clamp_min(0.0)
+                        # Compare rollout endpoints in the same predicted-latent
+                        # space. Using the encoder-view current observation as
+                        # the gain anchor reintroduces an enc-vs-pred mismatch.
+                        first_bonus = heads.exploration(z_rollouts_proj[:, 0, :])
+                        bonus = (terminal_bonus - first_bonus).clamp_min(0.0)
                     else:
                         raise ValueError(
                             f"Unsupported exploration_bonus_mode={exploration_bonus_mode!r}",
@@ -917,6 +916,26 @@ def estimate_current_safety_energy(
         return None
     value = heads.safety_head(z_proj.to(next(heads.safety_head.parameters()).device))
     return float(value.reshape(-1)[0].item())
+
+
+@torch.no_grad()
+def teacher_forced_rollout_latent(
+    world_model: LeWorldModel,
+    z_start_raw: torch.Tensor,
+    command: torch.Tensor,
+) -> torch.Tensor:
+    """Project one executed command into the rollout latent space."""
+    if command.ndim == 1:
+        action_seq = command.unsqueeze(0).unsqueeze(0)
+    elif command.ndim == 2:
+        action_seq = command.unsqueeze(0)
+    else:
+        action_seq = command
+    z_pred_proj = world_model.plan_rollout(
+        z_start_raw,
+        action_seq.to(z_start_raw.device),
+    )
+    return z_pred_proj[:, -1, :].detach()
 
 
 def choose_redundant_prototype(
@@ -2014,6 +2033,17 @@ def main():
             cmd_vals = [float(v) for v in nominal_cmd.cpu().tolist()]
             cmd_display = format_command_for_log(cmd_vals, wm_meta)
             cmds_log.append(cmd_vals)
+            rnd_update_proj = None
+            if (
+                args.rnd_online_lr > 0.0
+                and planner_heads.exploration is not None
+                and planner_heads.exploration_weight > 0.0
+            ):
+                rnd_update_proj = teacher_forced_rollout_latent(
+                    world_model,
+                    obs["z_raw"],
+                    nominal_cmd.to(planning_device),
+                )
 
             _, actions = execute_command(
                 physics_scene, physics_robot, policy,
@@ -2056,13 +2086,9 @@ def main():
                 frame_substitution_count += 1
             else:
                 last_clean_frame = obs["frame_hwc"].copy()
-                if (
-                    args.rnd_online_lr > 0.0
-                    and planner_heads.exploration is not None
-                    and planner_heads.exploration_weight > 0.0
-                ):
+                if rnd_update_proj is not None:
                     planner_heads.exploration.online_update(
-                        obs["z_proj"].to(planning_device),
+                        rnd_update_proj,
                         lr=args.rnd_online_lr,
                     )
 
