@@ -9,6 +9,7 @@ from .energy_head import (
     ExplorationBonus,
     PlaceSnippetHead,
     DisplacementHead,
+    CoverageGainHead,
     TrajectoryScorer,
     composite_energy_target,
     composite_safety_target,

@@ -56,6 +56,7 @@ from lewm.models import (
     ExplorationBonus,
     PlaceSnippetHead,
     DisplacementHead,
+    CoverageGainHead,
     TrajectoryScorer,
     composite_safety_target,
     consequence_safety_target,
@@ -174,6 +175,22 @@ def parse_args() -> argparse.Namespace:
                    help="Train displacement targets between obs_t and obs_{t+hops}. Should usually match the planner horizon in model steps.")
     p.add_argument("--displacement_weight", type=float, default=0.0,
                    help="Optional planner bonus weight for the displacement head. Kept at 0 by default for audit-first evaluation.")
+    # Coverage-gain head
+    p.add_argument("--skip_coverage_gain", action="store_true",
+                   help="Skip sequence-level coverage-gain head training.")
+    p.add_argument("--coverage_gain_epochs", type=int, default=5)
+    p.add_argument("--coverage_gain_lr", type=float, default=3e-4)
+    p.add_argument("--coverage_gain_batch_size", type=int, default=4096)
+    p.add_argument("--coverage_gain_hops", type=int, default=5,
+                   help="Number of future model steps in the rollout snippet scored by the coverage-gain head.")
+    p.add_argument("--coverage_gain_context_hops", type=int, default=10,
+                   help="Number of recent model steps used to define already-visited local context for coverage-gain targets.")
+    p.add_argument("--coverage_gain_radius_m", type=float, default=0.18,
+                   help="Radius used when converting novel path length into a local coverage-area gain proxy.")
+    p.add_argument("--coverage_gain_densify_step_m", type=float, default=0.04,
+                   help="Interpolation step for pose-based local coverage-gain targets.")
+    p.add_argument("--coverage_gain_weight", type=float, default=0.0,
+                   help="Optional planner bonus weight for the coverage-gain head. Kept at 0 by default for audit-first evaluation.")
     # Held-out evaluation
     p.add_argument("--skip_eval", action="store_true",
                    help="Skip held-out episode evaluation for safety/place heads.")
@@ -995,6 +1012,116 @@ def evaluate_place_head(
     return metrics
 
 
+def dedup_pose_latent_bank(
+    z_bank: torch.Tensor,
+    episode_id: torch.Tensor,
+    obs_step: torch.Tensor,
+    robot_xy: torch.Tensor,
+) -> dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]:
+    """Average duplicate entries keyed by (episode_id, obs_step)."""
+    per_episode: dict[int, dict[int, tuple[torch.Tensor, int, torch.Tensor, int]]] = {}
+    for idx in range(int(z_bank.shape[0])):
+        ep = int(episode_id[idx].item())
+        step = int(obs_step[idx].item())
+        if ep < 0 or step < 0:
+            continue
+        xy = robot_xy[idx]
+        if xy.numel() != 2 or not torch.isfinite(xy).all():
+            continue
+        ep_map = per_episode.setdefault(ep, {})
+        if step not in ep_map:
+            ep_map[step] = (z_bank[idx].clone(), 1, xy.clone(), 1)
+        else:
+            z_accum, z_count, xy_accum, xy_count = ep_map[step]
+            ep_map[step] = (
+                z_accum + z_bank[idx],
+                z_count + 1,
+                xy_accum + xy,
+                xy_count + 1,
+            )
+
+    dedup: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+    for ep, step_map in per_episode.items():
+        dedup[ep] = {
+            step: (
+                z_accum / float(z_count),
+                xy_accum / float(xy_count),
+            )
+            for step, (z_accum, z_count, xy_accum, xy_count) in step_map.items()
+        }
+    return dedup
+
+
+def densify_xy_path(
+    xy_seq: torch.Tensor,
+    step_m: float,
+) -> torch.Tensor:
+    """Return a densely sampled polyline for XY path inputs."""
+    if xy_seq.ndim != 2 or xy_seq.shape[-1] != 2:
+        raise ValueError(f"Expected xy_seq shape (N, 2), got {tuple(xy_seq.shape)}")
+    if xy_seq.shape[0] == 0:
+        return xy_seq
+    if xy_seq.shape[0] == 1:
+        return xy_seq.clone()
+
+    pts: list[torch.Tensor] = [xy_seq[0].to(dtype=torch.float32)]
+    step_m = max(1e-3, float(step_m))
+    for start, end in zip(xy_seq[:-1], xy_seq[1:]):
+        delta = (end - start).to(dtype=torch.float32)
+        dist = float(torch.linalg.vector_norm(delta, ord=2).item())
+        if dist < 1e-6:
+            continue
+        n_steps = max(1, int(math.ceil(dist / step_m)))
+        for idx in range(1, n_steps + 1):
+            alpha = float(idx) / float(n_steps)
+            pts.append(start.to(dtype=torch.float32) + alpha * delta)
+    return torch.stack(pts, dim=0)
+
+
+def novel_path_area_gain_proxy(
+    context_xy_seq: torch.Tensor,
+    future_xy_seq: torch.Tensor,
+    radius_m: float,
+    densify_step_m: float,
+) -> float:
+    """Approximate local coverage gain from a future path beyond recent context.
+
+    The target is a pose-supervised local area proxy:
+
+    - densify the recent context path and the future path
+    - walk forward along the future path
+    - count only arc-length that leaves a radius-``radius_m`` neighborhood of
+      all previously covered points
+    - convert that novel path length into a swept-area proxy by multiplying by
+      ``2 * radius_m``
+
+    This remains a coverage-gain target rather than a raw endpoint-displacement
+    target, while staying cheap enough to build over the cached latent bank.
+    """
+    if context_xy_seq.shape[0] == 0 or future_xy_seq.shape[0] == 0:
+        return 0.0
+    context_dense = densify_xy_path(context_xy_seq, densify_step_m)
+    chained_future = torch.cat(
+        [context_xy_seq[-1:].to(dtype=torch.float32), future_xy_seq.to(dtype=torch.float32)],
+        dim=0,
+    )
+    future_dense = densify_xy_path(chained_future, densify_step_m)
+    if future_dense.shape[0] <= 1:
+        return 0.0
+    future_dense = future_dense[1:]
+
+    support = context_dense
+    novel_length_m = 0.0
+    radius_m = float(radius_m)
+    densify_step_m = float(densify_step_m)
+    for point in future_dense:
+        d_min = float(torch.cdist(point.view(1, 2), support).amin().item())
+        if d_min > radius_m:
+            novel_length_m += densify_step_m
+        support = torch.cat([support, point.view(1, 2)], dim=0)
+    return novel_length_m * (2.0 * radius_m)
+
+
 def build_displacement_pairs(
     z_enc: torch.Tensor,
     enc_episode_id: torch.Tensor,
@@ -1017,46 +1144,8 @@ def build_displacement_pairs(
     if displacement_hops <= 0:
         raise ValueError(f"displacement_hops must be positive, got {displacement_hops}")
 
-    def _dedup_bank(
-        z_bank: torch.Tensor,
-        episode_id: torch.Tensor,
-        obs_step: torch.Tensor,
-        robot_xy: torch.Tensor,
-    ) -> dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]:
-        per_episode: dict[int, dict[int, tuple[torch.Tensor, int, torch.Tensor, int]]] = {}
-        for idx in range(int(z_bank.shape[0])):
-            ep = int(episode_id[idx].item())
-            step = int(obs_step[idx].item())
-            if ep < 0 or step < 0:
-                continue
-            xy = robot_xy[idx]
-            if xy.numel() != 2 or not torch.isfinite(xy).all():
-                continue
-            ep_map = per_episode.setdefault(ep, {})
-            if step not in ep_map:
-                ep_map[step] = (z_bank[idx].clone(), 1, xy.clone(), 1)
-            else:
-                z_accum, z_count, xy_accum, xy_count = ep_map[step]
-                ep_map[step] = (
-                    z_accum + z_bank[idx],
-                    z_count + 1,
-                    xy_accum + xy,
-                    xy_count + 1,
-                )
-
-        dedup: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
-        for ep, step_map in per_episode.items():
-            dedup[ep] = {
-                step: (
-                    z_accum / float(z_count),
-                    xy_accum / float(xy_count),
-                )
-                for step, (z_accum, z_count, xy_accum, xy_count) in step_map.items()
-            }
-        return dedup
-
-    current_bank = _dedup_bank(z_enc, enc_episode_id, enc_obs_step, enc_robot_xy)
-    future_bank = _dedup_bank(z_rollout, rollout_episode_id, rollout_obs_step, rollout_robot_xy)
+    current_bank = dedup_pose_latent_bank(z_enc, enc_episode_id, enc_obs_step, enc_robot_xy)
+    future_bank = dedup_pose_latent_bank(z_rollout, rollout_episode_id, rollout_obs_step, rollout_robot_xy)
     raw_step_delta = int(displacement_hops) * int(temporal_stride)
 
     z_now_pairs: list[torch.Tensor] = []
@@ -1087,6 +1176,94 @@ def build_displacement_pairs(
         torch.stack(z_now_pairs, dim=0),
         torch.stack(z_future_pairs, dim=0),
         torch.cat(target_disp_pairs, dim=0),
+    )
+
+
+def build_coverage_gain_pairs(
+    z_enc: torch.Tensor,
+    enc_episode_id: torch.Tensor,
+    enc_obs_step: torch.Tensor,
+    enc_robot_xy: torch.Tensor,
+    z_rollout: torch.Tensor,
+    rollout_episode_id: torch.Tensor,
+    rollout_obs_step: torch.Tensor,
+    rollout_robot_xy: torch.Tensor,
+    coverage_gain_hops: int,
+    coverage_gain_context_hops: int,
+    temporal_stride: int,
+    coverage_gain_radius_m: float,
+    coverage_gain_densify_step_m: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build current-latent / rollout-snippet pairs with future coverage-gain targets."""
+    if coverage_gain_hops <= 0:
+        raise ValueError(f"coverage_gain_hops must be positive, got {coverage_gain_hops}")
+    if coverage_gain_context_hops < 0:
+        raise ValueError(
+            f"coverage_gain_context_hops must be non-negative, got {coverage_gain_context_hops}",
+        )
+
+    current_bank = dedup_pose_latent_bank(z_enc, enc_episode_id, enc_obs_step, enc_robot_xy)
+    future_bank = dedup_pose_latent_bank(z_rollout, rollout_episode_id, rollout_obs_step, rollout_robot_xy)
+    raw_stride = int(temporal_stride)
+
+    z_now_pairs: list[torch.Tensor] = []
+    z_future_seq_pairs: list[torch.Tensor] = []
+    target_gain_pairs: list[torch.Tensor] = []
+
+    for ep, cur_steps in current_bank.items():
+        fut_steps = future_bank.get(ep)
+        if not fut_steps:
+            continue
+        for cur_step, (z_now, xy_now) in cur_steps.items():
+            future_steps = [cur_step + raw_stride * i for i in range(1, int(coverage_gain_hops) + 1)]
+            if any(step not in fut_steps for step in future_steps):
+                continue
+
+            context_steps = [cur_step]
+            for hop in range(int(coverage_gain_context_hops), 0, -1):
+                prev_step = cur_step - raw_stride * hop
+                if prev_step in cur_steps:
+                    context_steps.insert(-1 if context_steps else 0, prev_step)
+            context_steps = sorted(set(context_steps))
+
+            context_xy_seq = torch.stack(
+                [cur_steps[step][1].to(dtype=torch.float32) for step in context_steps],
+                dim=0,
+            )
+            if context_xy_seq.shape[0] == 0:
+                context_xy_seq = xy_now.view(1, 2).to(dtype=torch.float32)
+
+            future_pairs = [fut_steps[step] for step in future_steps]
+            future_latents = torch.stack(
+                [z_future.to(dtype=torch.float32) for z_future, _xy in future_pairs],
+                dim=0,
+            )
+            future_xy_seq = torch.stack(
+                [xy_future.to(dtype=torch.float32) for _z_future, xy_future in future_pairs],
+                dim=0,
+            )
+            gain_m2 = novel_path_area_gain_proxy(
+                context_xy_seq,
+                future_xy_seq,
+                radius_m=float(coverage_gain_radius_m),
+                densify_step_m=float(coverage_gain_densify_step_m),
+            )
+
+            z_now_pairs.append(z_now.to(dtype=torch.float32))
+            z_future_seq_pairs.append(future_latents)
+            target_gain_pairs.append(torch.tensor([gain_m2], dtype=torch.float32))
+
+    if not z_now_pairs:
+        raise ValueError(
+            "No valid current->future rollout coverage-gain pairs were found. "
+            "Check that pose metadata exists and coverage_gain_hops is compatible "
+            "with the cached temporal stride."
+        )
+
+    return (
+        torch.stack(z_now_pairs, dim=0),
+        torch.stack(z_future_seq_pairs, dim=0),
+        torch.cat(target_gain_pairs, dim=0),
     )
 
 
@@ -1246,6 +1423,169 @@ def evaluate_displacement_head(
         f"pearson={metrics['pearson']:.3f} "
         f"pred={metrics['pred_mean_m']:.3f}m "
         f"target={metrics['target_mean_m']:.3f}m"
+    )
+    return metrics
+
+
+def train_coverage_gain_head(
+    args,
+    z_now_pairs: torch.Tensor,
+    z_future_seq_pairs: torch.Tensor,
+    target_gain_pairs: torch.Tensor,
+    device,
+):
+    print("\n" + "=" * 60)
+    print("Phase 8: Training CoverageGainHead (sequence-level coverage value)")
+    print("=" * 60)
+    print(
+        f"  Pairs: {int(target_gain_pairs.numel()):,} | "
+        f"hops={int(args.coverage_gain_hops)} | "
+        f"context={int(args.coverage_gain_context_hops)} | "
+        f"target_mean={float(target_gain_pairs.mean().item()):.4f}m^2"
+    )
+
+    dataset = TensorDataset(
+        z_now_pairs.to(dtype=torch.float32),
+        z_future_seq_pairs.to(dtype=torch.float32),
+        target_gain_pairs.to(dtype=torch.float32),
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.coverage_gain_batch_size)),
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+    )
+    print(f"  {len(dataloader)} batches of {max(1, int(args.coverage_gain_batch_size))}")
+
+    head = CoverageGainHead(
+        latent_dim=args.latent_dim,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+    ).to(device)
+    head = torch.compile(head)
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=args.coverage_gain_lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.coverage_gain_epochs)
+
+    csv_path = os.path.join(args.log_dir, "coverage_gain_head_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow([
+                "step", "epoch", "loss", "pred_mean_m2", "target_mean_m2", "lr",
+            ])
+
+    global_step = 0
+    for epoch in range(args.coverage_gain_epochs):
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+        head.train()
+
+        with make_progress(args, dataloader, desc=f"  CovGain {epoch + 1}/{args.coverage_gain_epochs}") as pbar:
+            for z_now_batch, z_future_seq_batch, target_batch in pbar:
+                z_now_batch = z_now_batch.to(device, non_blocking=True)
+                z_future_seq_batch = z_future_seq_batch.to(device, non_blocking=True)
+                target_batch = target_batch.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                pred = head(z_now_batch, z_future_seq_batch)
+                loss = F.mse_loss(pred, target_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(head.parameters(), max_norm=args.grad_clip)
+                optimizer.step()
+
+                global_step += 1
+                loss_val = float(loss.item())
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step,
+                        epoch + 1,
+                        f"{loss_val:.6f}",
+                        f"{pred.detach().mean().item():.6f}",
+                        f"{target_batch.detach().mean().item():.6f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        pred=f"{pred.detach().mean().item():.4f}",
+                        target=f"{target_batch.detach().mean().item():.4f}",
+                    )
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.6f} | time={time.time() - t0:.0f}s")
+
+    torch.save(
+        {"coverage_gain_head_state_dict": head.state_dict(), "epoch": args.coverage_gain_epochs},
+        os.path.join(args.out_dir, "coverage_gain_head.pt"),
+    )
+    print("  Coverage-gain head training complete.")
+    return head
+
+
+def evaluate_coverage_gain_head(
+    args,
+    head: nn.Module,
+    z_now_pairs: torch.Tensor,
+    z_future_seq_pairs: torch.Tensor,
+    target_gain_pairs: torch.Tensor,
+    device,
+) -> dict[str, float] | None:
+    if target_gain_pairs.numel() == 0:
+        return None
+
+    dataset = TensorDataset(z_now_pairs, z_future_seq_pairs, target_gain_pairs)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.eval_batch_size)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    preds_all: list[torch.Tensor] = []
+    target_all: list[torch.Tensor] = []
+    head.eval()
+    with torch.inference_mode():
+        for z_now_batch, z_future_seq_batch, target_batch in dataloader:
+            z_now_batch = z_now_batch.to(device, non_blocking=True)
+            z_future_seq_batch = z_future_seq_batch.to(device, non_blocking=True)
+            pred = head(z_now_batch, z_future_seq_batch).float().cpu()
+            preds_all.append(pred)
+            target_all.append(target_batch.float().cpu())
+
+    pred = torch.cat(preds_all)
+    target = torch.cat(target_all)
+    mse = float((pred - target).square().mean().item())
+    metrics = {
+        "mse": mse,
+        "rmse": math.sqrt(max(0.0, mse)),
+        "mae": float((pred - target).abs().mean().item()),
+        "pearson": pearson_corrcoef(pred, target),
+        "pred_mean_m2": float(pred.mean().item()),
+        "target_mean_m2": float(target.mean().item()),
+        "n_eval": int(target.numel()),
+    }
+    print(
+        "  Held-out coverage gain | "
+        f"n={metrics['n_eval']:,} "
+        f"rmse={metrics['rmse']:.4f}m^2 "
+        f"mae={metrics['mae']:.4f}m^2 "
+        f"pearson={metrics['pearson']:.3f} "
+        f"pred={metrics['pred_mean_m2']:.4f}m^2 "
+        f"target={metrics['target_mean_m2']:.4f}m^2"
     )
     return metrics
 
@@ -2361,6 +2701,66 @@ def train(args):
                     if metrics is not None:
                         holdout_metrics["displacement"] = metrics
 
+    # Phase 8: sequence-level coverage-gain head
+    coverage_gain_head = None
+    if not args.skip_coverage_gain:
+        try:
+            z_now_cov_train, z_future_cov_train, target_cov_train = build_coverage_gain_pairs(
+                z_enc_train,
+                enc_episode_id_train,
+                enc_obs_step_train,
+                enc_robot_xy_train,
+                z_rollout_train,
+                rollout_episode_id_train,
+                rollout_obs_step_train,
+                rollout_robot_xy_train,
+                coverage_gain_hops=int(args.coverage_gain_hops),
+                coverage_gain_context_hops=int(args.coverage_gain_context_hops),
+                temporal_stride=int(args.temporal_stride),
+                coverage_gain_radius_m=float(args.coverage_gain_radius_m),
+                coverage_gain_densify_step_m=float(args.coverage_gain_densify_step_m),
+            )
+        except ValueError as exc:
+            print(f"  Skipping coverage-gain head: {exc}")
+        else:
+            coverage_gain_head = train_coverage_gain_head(
+                args,
+                z_now_cov_train,
+                z_future_cov_train,
+                target_cov_train,
+                device,
+            )
+            if z_enc_eval.numel() > 0 and z_rollout_eval.numel() > 0:
+                try:
+                    z_now_cov_eval, z_future_cov_eval, target_cov_eval = build_coverage_gain_pairs(
+                        z_enc_eval,
+                        enc_episode_id_eval,
+                        enc_obs_step_eval,
+                        enc_robot_xy_eval,
+                        z_rollout_eval,
+                        rollout_episode_id_eval,
+                        rollout_obs_step_eval,
+                        rollout_robot_xy_eval,
+                        coverage_gain_hops=int(args.coverage_gain_hops),
+                        coverage_gain_context_hops=int(args.coverage_gain_context_hops),
+                        temporal_stride=int(args.temporal_stride),
+                        coverage_gain_radius_m=float(args.coverage_gain_radius_m),
+                        coverage_gain_densify_step_m=float(args.coverage_gain_densify_step_m),
+                    )
+                except ValueError:
+                    z_now_cov_eval = None
+                if z_now_cov_eval is not None:
+                    metrics = evaluate_coverage_gain_head(
+                        args,
+                        coverage_gain_head,
+                        z_now_cov_eval,
+                        z_future_cov_eval,
+                        target_cov_eval,
+                        device,
+                    )
+                    if metrics is not None:
+                        holdout_metrics["coverage_gain"] = metrics
+
     # Save combined TrajectoryScorer checkpoint
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
     scorer_data = {
@@ -2370,11 +2770,16 @@ def train(args):
         "exploration": exploration.state_dict() if exploration is not None else None,
         "place_head": place_head.state_dict() if place_head is not None else None,
         "displacement_head": displacement_head.state_dict() if displacement_head is not None else None,
+        "coverage_gain_head": coverage_gain_head.state_dict() if coverage_gain_head is not None else None,
         "goal_weight": args.goal_weight,
         "progress_weight": args.progress_weight,
         "exploration_weight": args.exploration_weight,
         "displacement_weight": args.displacement_weight,
+        "coverage_gain_weight": args.coverage_gain_weight,
         "displacement_hops": args.displacement_hops,
+        "coverage_gain_hops": args.coverage_gain_hops,
+        "coverage_gain_context_hops": args.coverage_gain_context_hops,
+        "coverage_gain_radius_m": args.coverage_gain_radius_m,
         "latent_dim": args.latent_dim,
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
@@ -2386,6 +2791,7 @@ def train(args):
         "exploration_latent_source": "pred_projector_teacher_forced",
         "place_latent_source": "pred_projector_teacher_forced_snippet",
         "displacement_latent_source": "enc_projector_to_pred_projector_teacher_forced",
+        "coverage_gain_latent_source": "enc_projector_to_pred_projector_teacher_forced_snippet",
         "place_supervision": (
             "pose_xy_same_episode"
             if args.raw_data_dir is not None
@@ -2393,6 +2799,11 @@ def train(args):
         ),
         "displacement_supervision": (
             "pose_xy_delta_same_episode"
+            if args.raw_data_dir is not None
+            else None
+        ),
+        "coverage_gain_supervision": (
+            "pose_xy_novel_path_area_proxy_same_episode"
             if args.raw_data_dir is not None
             else None
         ),

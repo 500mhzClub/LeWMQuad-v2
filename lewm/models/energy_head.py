@@ -491,6 +491,84 @@ class DisplacementHead(nn.Module):
 
 
 # --------------------------------------------------------------------- #
+# Sequence-level coverage-gain head
+# --------------------------------------------------------------------- #
+
+class CoverageGainHead(nn.Module):
+    """Predicts future coverage gain from the current latent and a rollout snippet.
+
+    This head is sequence-level rather than endpoint-level. It consumes the
+    current projected latent together with the full predicted rollout snippet
+    and predicts a non-negative scalar gain in square meters.
+
+    The sequence encoder is permutation-sensitive via explicit terminal and
+    pooled features, while still supporting variable snippet lengths at
+    inference time.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 192,
+        hidden_dim: int = 512,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        token_in_dim = latent_dim * 4
+        self.token_net = nn.Sequential(
+            nn.Linear(token_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus(),
+        )
+
+    def forward(self, z_now: torch.Tensor, z_future_seq: torch.Tensor) -> torch.Tensor:
+        if z_now.ndim != 2:
+            raise ValueError(f"Expected z_now shape (B, D), got {tuple(z_now.shape)}")
+        if z_future_seq.ndim != 3:
+            raise ValueError(
+                f"Expected z_future_seq shape (B, H, D), got {tuple(z_future_seq.shape)}",
+            )
+        if z_now.shape[0] != z_future_seq.shape[0] or z_now.shape[1] != z_future_seq.shape[2]:
+            raise ValueError(
+                f"Incompatible shapes for coverage gain head: "
+                f"{tuple(z_now.shape)} vs {tuple(z_future_seq.shape)}",
+            )
+
+        z_now_exp = z_now.unsqueeze(1).expand(-1, z_future_seq.shape[1], -1)
+        token_in = torch.cat(
+            [
+                z_now_exp,
+                z_future_seq,
+                z_future_seq - z_now_exp,
+                z_future_seq * z_now_exp,
+            ],
+            dim=-1,
+        )
+        token_feat = self.token_net(token_in)
+        pooled_mean = token_feat.mean(dim=1)
+        pooled_max = token_feat.amax(dim=1)
+        terminal = token_feat[:, -1, :]
+        x = torch.cat([pooled_mean, pooled_max, terminal], dim=-1)
+        return self.head(x).squeeze(-1)
+
+
+# --------------------------------------------------------------------- #
 # Combined trajectory scorer for CEM / MPC planning
 # --------------------------------------------------------------------- #
 
