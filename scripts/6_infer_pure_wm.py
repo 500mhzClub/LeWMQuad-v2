@@ -269,24 +269,37 @@ class PureCEMPlanner:
                 if exploration_bonus_mode == "visited_nn":
                     tail_steps = min(max(1, int(visited_rollout_tail_steps)), horizon)
                     tail_z = z_rollouts_proj[:, -tail_steps:, :]
+                    has_visited_reference = False
                     if tail_steps > 1:
-                        tail_dist = visited_rollout_snippet_novelty(
-                            tail_z,
-                            prepared_visited_snippets,
-                            k=visited_rollout_knn_k,
-                            place_head=heads.place_head if heads is not None else None,
-                            visited_bank_emb=prepared_visited_snippet_emb,
-                        )
+                        if prepared_visited_snippets is not None:
+                            has_visited_reference = True
+                            tail_dist = visited_rollout_snippet_novelty(
+                                tail_z,
+                                prepared_visited_snippets,
+                                k=visited_rollout_knn_k,
+                                place_head=heads.place_head if heads is not None else None,
+                                visited_bank_emb=prepared_visited_snippet_emb,
+                            )
+                        else:
+                            tail_dist = torch.zeros(self.n_candidates, device=self.device)
                     else:
-                        tail_dist = visited_rollout_bank_novelty(
-                            tail_z[:, -1, :],
-                            visited_rollout_bank,
-                            k=visited_rollout_knn_k,
-                        )
-                    tail_margin = tail_dist - float(visited_rollout_margin)
-                    bonus = tail_margin.clamp_min(0.0)
+                        if visited_rollout_bank:
+                            has_visited_reference = True
+                            tail_dist = visited_rollout_bank_novelty(
+                                tail_z[:, -1, :],
+                                visited_rollout_bank,
+                                k=visited_rollout_knn_k,
+                            )
+                        else:
+                            tail_dist = torch.zeros(self.n_candidates, device=self.device)
+                    if has_visited_reference:
+                        tail_margin = tail_dist - float(visited_rollout_margin)
+                        bonus = tail_margin.clamp_min(0.0)
+                    else:
+                        tail_margin = torch.zeros_like(tail_dist)
+                        bonus = torch.zeros_like(tail_dist)
                     metrics["visited_nn_distance"] = tail_dist
-                    if visited_revisit_penalty_weight > 0.0:
+                    if visited_revisit_penalty_weight > 0.0 and has_visited_reference:
                         revisit_penalty = (-tail_margin).clamp_min(0.0)
                         costs += visited_revisit_penalty_weight * revisit_penalty
                         metrics["revisit_penalty"] = revisit_penalty
