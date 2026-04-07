@@ -53,6 +53,7 @@ from lewm.models import (
     GoalEnergyHead,
     ProgressEnergyHead,
     ExplorationBonus,
+    PlaceSnippetHead,
     TrajectoryScorer,
     composite_safety_target,
     consequence_safety_target,
@@ -141,6 +142,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exploration_epochs", type=int, default=5)
     p.add_argument("--exploration_lr", type=float, default=1e-3)
     p.add_argument("--exploration_feature_dim", type=int, default=128)
+    # Place head
+    p.add_argument("--skip_place", action="store_true",
+                   help="Skip rollout-snippet place embedding training.")
+    p.add_argument("--place_epochs", type=int, default=5)
+    p.add_argument("--place_lr", type=float, default=3e-4)
+    p.add_argument("--place_batch_size", type=int, default=1024)
+    p.add_argument("--place_snippet_len", type=int, default=None,
+                   help="Rollout snippet length for place head. Defaults to seq_len-1.")
+    p.add_argument("--place_embedding_dim", type=int, default=64)
+    p.add_argument("--place_triplet_margin", type=float, default=0.2)
+    p.add_argument("--place_positive_radius", type=int, default=1,
+                   help="Positive snippets come from the same episode within this many snippet starts.")
+    p.add_argument("--place_negative_gap", type=int, default=6,
+                   help="Same-episode negatives must be at least this many snippet starts away.")
     # TrajectoryScorer weights
     p.add_argument("--goal_weight", type=float, default=1.0)
     p.add_argument("--progress_weight", type=float, default=1.0)
@@ -255,8 +270,8 @@ def load_frozen_encoder(args, device):
 # Phase 1: Extract latents + labels to disk
 # --------------------------------------------------------------------- #
 
-SHARD_SAMPLES = 500_000    # v6 stores both encoder-view and rollout-view latents per shard
-CACHE_VERSION = 6          # v6: separate encoder-view and teacher-forced rollout-view caches
+SHARD_SAMPLES = 500_000    # v7 stores rollout metadata for place-head training
+CACHE_VERSION = 7          # v7: add rollout episode/step metadata
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -381,6 +396,8 @@ def extract_latents(args, device) -> str:
     bid_rollout_buf: list[torch.Tensor] = []
     br_rollout_buf: list[torch.Tensor] = []
     coll_rollout_buf: list[torch.Tensor] = []
+    epid_rollout_buf: list[torch.Tensor] = []
+    step_rollout_buf: list[torch.Tensor] = []
     buf_encoder_samples = 0
     buf_rollout_samples = 0
     shard_idx = 0
@@ -391,6 +408,7 @@ def extract_latents(args, device) -> str:
     def flush_shard():
         nonlocal z_enc_buf, bid_enc_buf, br_enc_buf
         nonlocal z_rollout_buf, st_rollout_buf, bid_rollout_buf, br_rollout_buf, coll_rollout_buf
+        nonlocal epid_rollout_buf, step_rollout_buf
         nonlocal buf_encoder_samples, buf_rollout_samples
         nonlocal shard_idx, total_encoder_samples, total_rollout_samples
         if not z_enc_buf:
@@ -413,6 +431,12 @@ def extract_latents(args, device) -> str:
             "collisions_rollout": (
                 torch.cat(coll_rollout_buf) if coll_rollout_buf else torch.empty((0,), dtype=torch.float32)
             ),
+            "episode_id_rollout": (
+                torch.cat(epid_rollout_buf) if epid_rollout_buf else torch.empty((0,), dtype=torch.long)
+            ),
+            "obs_step_rollout": (
+                torch.cat(step_rollout_buf) if step_rollout_buf else torch.empty((0,), dtype=torch.long)
+            ),
         }, shard_path)
         total_encoder_samples += buf_encoder_samples
         total_rollout_samples += buf_rollout_samples
@@ -424,6 +448,7 @@ def extract_latents(args, device) -> str:
         z_enc_buf, bid_enc_buf, br_enc_buf = [], [], []
         z_rollout_buf, st_rollout_buf = [], []
         bid_rollout_buf, br_rollout_buf, coll_rollout_buf = [], [], []
+        epid_rollout_buf, step_rollout_buf = [], []
         buf_encoder_samples = 0
         buf_rollout_samples = 0
         shard_idx += 1
@@ -440,6 +465,8 @@ def extract_latents(args, device) -> str:
 
             beacon_range = labels.get("beacon_range")
             beacon_identity = labels.get("beacon_identity")
+            episode_id = labels.get("episode_id")
+            obs_step = labels.get("obs_step")
 
             vision = vision.to(device, non_blocking=True).float().div_(255.0)
             proprio = proprio.to(device, non_blocking=True)
@@ -501,12 +528,22 @@ def extract_latents(args, device) -> str:
                     bid_rollout_flat = beacon_identity.long()[:, 1:].reshape(B * (T - 1))
                 else:
                     bid_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
+                if episode_id is not None:
+                    epid_rollout_flat = episode_id.long()[:, 1:].reshape(B * (T - 1))
+                else:
+                    epid_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
+                if obs_step is not None:
+                    step_rollout_flat = obs_step.long()[:, 1:].reshape(B * (T - 1))
+                else:
+                    step_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
 
                 z_rollout_buf.append(z_rollout_flat)
                 st_rollout_buf.append(safety_rollout)
                 bid_rollout_buf.append(bid_rollout_flat)
                 br_rollout_buf.append(br_rollout_flat)
                 coll_rollout_buf.append(coll_rollout_flat)
+                epid_rollout_buf.append(epid_rollout_flat)
+                step_rollout_buf.append(step_rollout_flat)
                 buf_rollout_samples += B * (T - 1)
 
             if buf_encoder_samples >= SHARD_SAMPLES:
@@ -560,6 +597,7 @@ def load_cached_latents(cache_dir: str):
     z_enc_all, bid_enc_all, br_enc_all = [], [], []
     z_rollout_all, st_rollout_all = [], []
     bid_rollout_all, br_rollout_all, coll_rollout_all = [], [], []
+    epid_rollout_all, step_rollout_all = [], []
     for i in range(manifest["n_shards"]):
         shard = torch.load(os.path.join(cache_dir, f"shard_{i:04d}.pt"), map_location="cpu")
         z_enc_all.append(shard["z_enc"])
@@ -570,6 +608,8 @@ def load_cached_latents(cache_dir: str):
         bid_rollout_all.append(shard["beacon_identity_rollout"])
         br_rollout_all.append(shard["beacon_range_rollout"])
         coll_rollout_all.append(shard["collisions_rollout"])
+        epid_rollout_all.append(shard.get("episode_id_rollout", torch.empty((0,), dtype=torch.long)))
+        step_rollout_all.append(shard.get("obs_step_rollout", torch.empty((0,), dtype=torch.long)))
         print(
             f"  Loaded shard {i}: enc={shard['z_enc'].shape[0]:,} "
             f"rollout={shard['z_rollout'].shape[0]:,} samples"
@@ -583,6 +623,8 @@ def load_cached_latents(cache_dir: str):
     rollout_bid = torch.cat(bid_rollout_all)
     rollout_br = torch.cat(br_rollout_all)
     rollout_coll = torch.cat(coll_rollout_all)
+    rollout_epid = torch.cat(epid_rollout_all)
+    rollout_step = torch.cat(step_rollout_all)
 
     print(f"Encoder view: {enc_z.shape[0]:,} samples, z={enc_z.shape}")
     print(f"Rollout view: {rollout_z.shape[0]:,} samples, z={rollout_z.shape}")
@@ -603,6 +645,8 @@ def load_cached_latents(cache_dir: str):
             "beacon_identity": rollout_bid,
             "beacon_range": rollout_br,
             "collisions": rollout_coll,
+            "episode_id": rollout_epid,
+            "obs_step": rollout_step,
         },
     }
 
@@ -1176,6 +1220,213 @@ def train_exploration(args, z_all, device):
 
 
 # --------------------------------------------------------------------- #
+# Phase 6: Train PlaceSnippetHead (rollout snippet metric)
+# --------------------------------------------------------------------- #
+
+def build_rollout_snippet_bank(
+    z_rollout: torch.Tensor,
+    episode_id: torch.Tensor,
+    obs_step: torch.Tensor,
+    snippet_len: int,
+    temporal_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deduplicate rollout states and assemble contiguous snippet windows."""
+    if snippet_len <= 0:
+        raise ValueError(f"snippet_len must be positive, got {snippet_len}")
+
+    per_episode: dict[int, dict[int, tuple[torch.Tensor, int]]] = {}
+    for idx in range(int(z_rollout.shape[0])):
+        ep = int(episode_id[idx].item())
+        step = int(obs_step[idx].item())
+        if ep < 0 or step < 0:
+            continue
+        episode_map = per_episode.setdefault(ep, {})
+        if step not in episode_map:
+            episode_map[step] = (z_rollout[idx].clone(), 1)
+        else:
+            accum, count = episode_map[step]
+            episode_map[step] = (accum + z_rollout[idx], count + 1)
+
+    snippets: list[torch.Tensor] = []
+    snippet_epids: list[int] = []
+    snippet_starts: list[int] = []
+    stride = int(temporal_stride)
+    for ep, step_map in per_episode.items():
+        ordered_steps = sorted(step_map.keys())
+        if len(ordered_steps) < snippet_len:
+            continue
+        dedup_latents = {
+            step: accum / float(count)
+            for step, (accum, count) in step_map.items()
+        }
+        for start_idx in range(len(ordered_steps) - snippet_len + 1):
+            window_steps = ordered_steps[start_idx:start_idx + snippet_len]
+            if any((b - a) != stride for a, b in zip(window_steps[:-1], window_steps[1:])):
+                continue
+            snippets.append(torch.stack([dedup_latents[step] for step in window_steps], dim=0))
+            snippet_epids.append(ep)
+            snippet_starts.append(window_steps[0])
+
+    if not snippets:
+        raise ValueError("No contiguous rollout snippets could be built from the cached rollout bank.")
+
+    return (
+        torch.stack(snippets, dim=0),
+        torch.tensor(snippet_epids, dtype=torch.long),
+        torch.tensor(snippet_starts, dtype=torch.long),
+    )
+
+
+def train_place_head(
+    args,
+    rollout_snippets: torch.Tensor,
+    snippet_episode_id: torch.Tensor,
+    snippet_start: torch.Tensor,
+    device,
+):
+    print("\n" + "=" * 60)
+    print("Phase 6: Training PlaceSnippetHead (rollout snippet metric)")
+    print("=" * 60)
+
+    n_snippets = int(rollout_snippets.shape[0])
+    if n_snippets < 2:
+        print("  Skipping: not enough rollout snippets for place training.")
+        return None
+
+    snippet_len = int(rollout_snippets.shape[1])
+    print(
+        f"  Snippets: {n_snippets:,} | len={snippet_len} | "
+        f"positive_radius={args.place_positive_radius} | negative_gap={args.place_negative_gap}"
+    )
+
+    head = PlaceSnippetHead(
+        latent_dim=args.latent_dim,
+        snippet_len=snippet_len,
+        hidden_dim=args.hidden_dim,
+        embedding_dim=args.place_embedding_dim,
+        dropout=args.dropout,
+    ).to(device)
+    head = torch.compile(head)
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(
+        head.parameters(), lr=args.place_lr, weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.place_epochs)
+
+    snippets_cpu = rollout_snippets
+    ep_cpu = snippet_episode_id.long()
+    start_cpu = snippet_start.long()
+    all_indices = torch.arange(n_snippets, dtype=torch.long)
+
+    by_episode: dict[int, torch.Tensor] = {}
+    for ep in ep_cpu.unique(sorted=True).tolist():
+        by_episode[int(ep)] = torch.nonzero(ep_cpu == int(ep), as_tuple=False).squeeze(1)
+
+    csv_path = os.path.join(args.log_dir, "place_head_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow(["step", "epoch", "loss", "d_ap", "d_an", "lr"])
+
+    global_step = 0
+    n_batches = max(1, math.ceil(n_snippets / max(1, args.place_batch_size)))
+    for epoch in range(args.place_epochs):
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+        head.train()
+
+        with make_progress(args, range(n_batches), desc=f"  Place {epoch + 1}/{args.place_epochs}") as pbar:
+            for _ in pbar:
+                anchor_idx = torch.randint(0, n_snippets, (args.place_batch_size,), dtype=torch.long)
+                pos_idx: list[int] = []
+                neg_idx: list[int] = []
+                valid_anchor: list[int] = []
+
+                for idx in anchor_idx.tolist():
+                    ep = int(ep_cpu[idx].item())
+                    step = int(start_cpu[idx].item())
+                    same_ep = by_episode[ep]
+                    same_steps = start_cpu[same_ep]
+                    delta = (same_steps - step).abs()
+
+                    pos_candidates = same_ep[(delta > 0) & (delta <= int(args.place_positive_radius))]
+                    if pos_candidates.numel() == 0:
+                        continue
+
+                    far_same = same_ep[delta >= int(args.place_negative_gap)]
+                    if far_same.numel() > 0 and torch.rand(()).item() < 0.5:
+                        neg_candidate_pool = far_same
+                    else:
+                        neg_candidate_pool = all_indices[ep_cpu != ep]
+                        if neg_candidate_pool.numel() == 0:
+                            continue
+
+                    pos_choice = int(pos_candidates[torch.randint(0, pos_candidates.numel(), (1,))].item())
+                    neg_choice = int(neg_candidate_pool[torch.randint(0, neg_candidate_pool.numel(), (1,))].item())
+                    valid_anchor.append(idx)
+                    pos_idx.append(pos_choice)
+                    neg_idx.append(neg_choice)
+
+                if not valid_anchor:
+                    continue
+
+                anchor = snippets_cpu[torch.tensor(valid_anchor, dtype=torch.long)].to(device, non_blocking=True)
+                positive = snippets_cpu[torch.tensor(pos_idx, dtype=torch.long)].to(device, non_blocking=True)
+                negative = snippets_cpu[torch.tensor(neg_idx, dtype=torch.long)].to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                z_anchor = head(anchor)
+                z_positive = head(positive)
+                z_negative = head(negative)
+
+                d_ap = (z_anchor - z_positive).square().sum(dim=-1)
+                d_an = (z_anchor - z_negative).square().sum(dim=-1)
+                loss = torch.relu(d_ap - d_an + float(args.place_triplet_margin)).mean()
+                loss = loss + 0.1 * d_ap.mean()
+                loss.backward()
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(head.parameters(), max_norm=args.grad_clip).item()
+                if not torch.isfinite(loss) or not math.isfinite(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                optimizer.step()
+                global_step += 1
+                loss_val = float(loss.item())
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step,
+                        epoch + 1,
+                        f"{loss_val:.6f}",
+                        f"{d_ap.detach().mean().item():.6f}",
+                        f"{d_an.detach().mean().item():.6f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        d_ap=f"{d_ap.detach().mean().item():.3f}",
+                        d_an=f"{d_an.detach().mean().item():.3f}",
+                    )
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.6f} | time={time.time() - t0:.0f}s")
+
+    torch.save(
+        {"place_head_state_dict": head.state_dict(), "epoch": args.place_epochs},
+        os.path.join(args.out_dir, "place_head.pt"),
+    )
+    print("  Place head training complete.")
+    return head
+
+
+# --------------------------------------------------------------------- #
 # Main orchestrator
 # --------------------------------------------------------------------- #
 
@@ -1233,6 +1484,8 @@ def train(args):
     beacon_range_enc = latent_views["encoder"]["beacon_range"]
     z_rollout = latent_views["rollout"]["z"]
     safety_target_rollout = latent_views["rollout"]["safety_target"]
+    rollout_episode_id = latent_views["rollout"]["episode_id"]
+    rollout_obs_step = latent_views["rollout"]["obs_step"]
     print(
         f"Using rollout-view latents for safety/exploration: {tuple(z_rollout.shape)} | "
         f"encoder-view latents for goal/progress: {tuple(z_enc.shape)}"
@@ -1257,6 +1510,27 @@ def train(args):
     if not args.skip_exploration:
         exploration = train_exploration(args, z_rollout, device)
 
+    # Phase 6: place head
+    place_head = None
+    place_snippet_len = int(
+        args.place_snippet_len if args.place_snippet_len is not None else max(1, args.seq_len - 1)
+    )
+    if not args.skip_place:
+        rollout_snippets, snippet_episode_id, snippet_start = build_rollout_snippet_bank(
+            z_rollout,
+            rollout_episode_id,
+            rollout_obs_step,
+            snippet_len=place_snippet_len,
+            temporal_stride=args.temporal_stride,
+        )
+        place_head = train_place_head(
+            args,
+            rollout_snippets,
+            snippet_episode_id,
+            snippet_start,
+            device,
+        )
+
     # Save combined TrajectoryScorer checkpoint
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
     scorer_data = {
@@ -1264,6 +1538,7 @@ def train(args):
         "goal_head": goal_head.state_dict() if goal_head is not None else None,
         "progress_head": progress_head.state_dict() if progress_head is not None else None,
         "exploration": exploration.state_dict() if exploration is not None else None,
+        "place_head": place_head.state_dict() if place_head is not None else None,
         "goal_weight": args.goal_weight,
         "progress_weight": args.progress_weight,
         "exploration_weight": args.exploration_weight,
@@ -1271,9 +1546,12 @@ def train(args):
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
         "exploration_feature_dim": args.exploration_feature_dim,
+        "place_embedding_dim": args.place_embedding_dim,
+        "place_snippet_len": place_snippet_len,
         "safety_mode": args.safety_mode,
         "safety_latent_source": "pred_projector_teacher_forced",
         "exploration_latent_source": "pred_projector_teacher_forced",
+        "place_latent_source": "pred_projector_teacher_forced_snippet",
         "goal_latent_source": "enc_projector",
         "progress_latent_source": "enc_projector",
         "cache_version": CACHE_VERSION,

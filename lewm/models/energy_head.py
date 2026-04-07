@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class GoalEnergyHead(nn.Module):
@@ -387,6 +388,64 @@ class ExplorationBonus(nn.Module):
             p.requires_grad_(False)
 
         return bonus_before
+
+
+# --------------------------------------------------------------------- #
+# Place-aware rollout snippet embedding
+# --------------------------------------------------------------------- #
+
+class PlaceSnippetHead(nn.Module):
+    """Embeds rollout snippets into a place-aware metric space.
+
+    The input is a short sequence of rollout latents with fixed length
+    ``snippet_len``. The output embedding is L2-normalized so Euclidean
+    distance can be used directly for nearest-neighbor novelty.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 192,
+        snippet_len: int = 3,
+        hidden_dim: int = 512,
+        embedding_dim: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.snippet_len = int(snippet_len)
+        self.embedding_dim = int(embedding_dim)
+        in_dim = self.latent_dim * self.snippet_len
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, embedding_dim),
+        )
+
+    def forward(self, z_seq: torch.Tensor) -> torch.Tensor:
+        if z_seq.ndim == 2:
+            flat = z_seq
+            expected = self.latent_dim * self.snippet_len
+            if int(flat.shape[-1]) != expected:
+                raise ValueError(
+                    f"Expected flattened snippet dim {expected}, got {tuple(flat.shape)}",
+                )
+        elif z_seq.ndim == 3:
+            if int(z_seq.shape[1]) != self.snippet_len or int(z_seq.shape[2]) != self.latent_dim:
+                raise ValueError(
+                    "Expected snippet tensor shape "
+                    f"(B, {self.snippet_len}, {self.latent_dim}), got {tuple(z_seq.shape)}",
+                )
+            flat = z_seq.reshape(z_seq.shape[0], -1)
+        else:
+            raise ValueError(f"Expected 2D or 3D snippet tensor, got {tuple(z_seq.shape)}")
+        emb = self.net(flat)
+        return F.normalize(emb, dim=-1)
 
 
 # --------------------------------------------------------------------- #

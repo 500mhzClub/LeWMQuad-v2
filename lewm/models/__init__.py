@@ -7,6 +7,7 @@ from .energy_head import (
     ProgressEnergyHead,
     LatentEnergyHead,
     ExplorationBonus,
+    PlaceSnippetHead,
     TrajectoryScorer,
     composite_energy_target,
     composite_safety_target,

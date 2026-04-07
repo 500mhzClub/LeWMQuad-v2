@@ -58,6 +58,7 @@ from lewm.models import (
     GoalEnergyHead,
     LatentEnergyHead,
     LeWorldModel,
+    PlaceSnippetHead,
 )
 from lewm.obstacle_utils import add_obstacles_to_scene, detect_collisions
 
@@ -124,6 +125,7 @@ class PlannerHeads:
     safety_head: LatentEnergyHead | None = None
     goal_head: GoalEnergyHead | None = None
     exploration: ExplorationBonus | None = None
+    place_head: PlaceSnippetHead | None = None
     goal_weight: float = 0.0
     exploration_weight: float = 0.0
     safety_weight: float = 1.0
@@ -212,6 +214,26 @@ class PureCEMPlanner:
         best_seq = mean.clone()
         best_cost = float("inf")
         best_metrics: dict[str, float] = {}
+        prepared_visited_snippets = None
+        prepared_visited_snippet_emb = None
+        if (
+            exploration_bonus_mode == "visited_nn"
+            and visited_rollout_bank
+            and int(max(1, visited_rollout_tail_steps)) > 1
+        ):
+            prepared_visited_snippets = prepare_visited_rollout_snippet_bank(
+                visited_rollout_bank,
+                int(max(1, visited_rollout_tail_steps)),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if (
+                prepared_visited_snippets is not None
+                and heads is not None
+                and heads.place_head is not None
+                and int(max(1, visited_rollout_tail_steps)) == int(heads.place_head.snippet_len)
+            ):
+                prepared_visited_snippet_emb = heads.place_head(prepared_visited_snippets)
 
         for _ in range(self.cem_iters):
             noise = torch.randn(
@@ -250,8 +272,10 @@ class PureCEMPlanner:
                     if tail_steps > 1:
                         tail_dist = visited_rollout_snippet_novelty(
                             tail_z,
-                            visited_rollout_bank,
+                            prepared_visited_snippets,
                             k=visited_rollout_knn_k,
+                            place_head=heads.place_head if heads is not None else None,
+                            visited_bank_emb=prepared_visited_snippet_emb,
                         )
                     else:
                         tail_dist = visited_rollout_bank_novelty(
@@ -655,6 +679,8 @@ def load_planner_heads(
     dropout = float(ckpt.get("dropout", 0.0))
     latent_dim = int(wm_meta["latent_dim"])
     exploration_dim = int(ckpt.get("exploration_feature_dim", 128))
+    place_embedding_dim = int(ckpt.get("place_embedding_dim", 64))
+    place_snippet_len = int(ckpt.get("place_snippet_len", 1))
 
     if ckpt.get("safety_head") is not None:
         safety = LatentEnergyHead(latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
@@ -677,6 +703,18 @@ def load_planner_heads(
         exploration.eval()
         heads.exploration = exploration
 
+    if ckpt.get("place_head") is not None:
+        place_head = PlaceSnippetHead(
+            latent_dim=latent_dim,
+            snippet_len=place_snippet_len,
+            hidden_dim=hidden_dim,
+            embedding_dim=place_embedding_dim,
+            dropout=dropout,
+        ).to(device)
+        clean_load_state(place_head, ckpt["place_head"])
+        place_head.eval()
+        heads.place_head = place_head
+
     heads.goal_weight = float(ckpt.get("goal_weight", 0.0))
     heads.exploration_weight = float(ckpt.get("exploration_weight", 0.0))
     heads.safety_weight = 1.0
@@ -684,6 +722,7 @@ def load_planner_heads(
         "has_safety_head": heads.safety_head is not None,
         "has_goal_head": heads.goal_head is not None,
         "has_exploration": heads.exploration is not None,
+        "has_place_head": heads.place_head is not None,
         "has_progress_head_ckpt": ckpt.get("progress_head") is not None,
         "goal_weight": heads.goal_weight,
         "exploration_weight": heads.exploration_weight,
@@ -695,8 +734,11 @@ def load_planner_heads(
         "use_proprio": ckpt.get("use_proprio"),
         "safety_latent_source": ckpt.get("safety_latent_source"),
         "exploration_latent_source": ckpt.get("exploration_latent_source"),
+        "place_latent_source": ckpt.get("place_latent_source"),
         "goal_latent_source": ckpt.get("goal_latent_source"),
         "progress_latent_source": ckpt.get("progress_latent_source"),
+        "place_snippet_len": ckpt.get("place_snippet_len"),
+        "place_embedding_dim": ckpt.get("place_embedding_dim"),
     }
     return heads, meta
 
@@ -1000,35 +1042,54 @@ def visited_rollout_bank_novelty(
 
 
 @torch.no_grad()
+def prepare_visited_rollout_snippet_bank(
+    visited_bank: list[torch.Tensor] | None,
+    tail_steps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if not visited_bank:
+        return None
+    if len(visited_bank) < int(tail_steps):
+        return None
+    bank = torch.stack(
+        [z.reshape(-1) for z in visited_bank],
+        dim=0,
+    ).to(device=device, dtype=dtype)
+    return bank.unfold(0, int(tail_steps), 1).permute(0, 2, 1).contiguous()
+
+
+@torch.no_grad()
 def visited_rollout_snippet_novelty(
     query_seq: torch.Tensor,
-    visited_bank: list[torch.Tensor] | None,
+    visited_bank_seq: torch.Tensor | None,
     k: int = 8,
+    place_head: PlaceSnippetHead | None = None,
+    visited_bank_emb: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Novelty from kNN distance against executed rollout snippets.
 
     Args:
         query_seq: (B, T, D) rollout tail snippets.
-        visited_bank: list of executed rollout latents, each (D,).
+        visited_bank_seq: (N, T, D) executed rollout snippets.
         k: number of nearest snippets to average.
 
     Returns:
         (B,) mean squared distance to the k nearest executed snippets.
     """
-    if not visited_bank:
+    if visited_bank_seq is None or visited_bank_seq.numel() == 0:
         return torch.zeros(query_seq.shape[0], device=query_seq.device, dtype=query_seq.dtype)
 
-    tail_steps = int(query_seq.shape[1])
-    if len(visited_bank) < tail_steps:
-        return torch.zeros(query_seq.shape[0], device=query_seq.device, dtype=query_seq.dtype)
-
-    bank = torch.stack(
-        [z.reshape(-1) for z in visited_bank],
-        dim=0,
-    ).to(device=query_seq.device, dtype=query_seq.dtype)
-    bank_seq = bank.unfold(0, tail_steps, 1).permute(0, 2, 1).contiguous()
-    dists = (query_seq.unsqueeze(1) - bank_seq.unsqueeze(0)).square().mean(dim=(2, 3))
-    k_eff = min(max(1, int(k)), int(bank_seq.shape[0]))
+    if visited_bank_emb is not None:
+        query_emb = place_head(query_seq) if place_head is not None else query_seq.reshape(query_seq.shape[0], -1)
+        dists = (query_emb.unsqueeze(1) - visited_bank_emb.unsqueeze(0)).square().mean(dim=-1)
+    elif place_head is not None and int(query_seq.shape[1]) == int(place_head.snippet_len):
+        query_emb = place_head(query_seq)
+        bank_emb = place_head(visited_bank_seq)
+        dists = (query_emb.unsqueeze(1) - bank_emb.unsqueeze(0)).square().mean(dim=-1)
+    else:
+        dists = (query_seq.unsqueeze(1) - visited_bank_seq.unsqueeze(0)).square().mean(dim=(2, 3))
+    k_eff = min(max(1, int(k)), int(visited_bank_seq.shape[0]))
     return torch.topk(dists, k=k_eff, largest=False, dim=1).values.mean(dim=1)
 
 
@@ -1915,16 +1976,22 @@ def main():
             f"safety={scorer_meta.get('has_safety_head', False)} "
             f"goal={scorer_meta.get('has_goal_head', False)} "
             f"exploration={scorer_meta.get('has_exploration', False)} "
+            f"place={scorer_meta.get('has_place_head', False)} "
             f"(seq={scorer_meta.get('seq_len')}, "
             f"stride={scorer_meta.get('temporal_stride')}, "
             f"block={scorer_meta.get('action_block_size')}, "
             f"use_proprio={scorer_meta.get('use_proprio')})"
         )
-        if scorer_meta.get("safety_latent_source") or scorer_meta.get("exploration_latent_source"):
+        if (
+            scorer_meta.get("safety_latent_source")
+            or scorer_meta.get("exploration_latent_source")
+            or scorer_meta.get("place_latent_source")
+        ):
             print(
                 "Scorer latent sources: "
                 f"safety={scorer_meta.get('safety_latent_source', 'unknown')} "
                 f"exploration={scorer_meta.get('exploration_latent_source', 'unknown')} "
+                f"place={scorer_meta.get('place_latent_source', 'unknown')} "
                 f"goal={scorer_meta.get('goal_latent_source', 'unknown')}"
             )
         if scorer_meta.get("has_goal_head", False):
@@ -1984,12 +2051,19 @@ def main():
     )
     visited_nn_desc = ""
     if args.exploration_bonus_mode == "visited_nn":
+        place_desc = ""
+        if scorer_meta.get("has_place_head", False):
+            place_desc = (
+                f", PlaceSnippet={scorer_meta.get('place_snippet_len', '?')}"
+                f", PlaceDim={scorer_meta.get('place_embedding_dim', '?')}"
+            )
         visited_nn_desc = (
             f", VisitK={args.visited_nn_k}, "
             f"VisitMargin={args.visited_nn_margin:.3f}, "
             f"VisitTail={args.visited_nn_tail_steps}, "
             f"VisitBank={args.visited_bank_size}, "
             f"RevisitW={args.revisit_penalty_weight:.3f}"
+            f"{place_desc}"
         )
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "

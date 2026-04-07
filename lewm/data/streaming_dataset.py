@@ -105,6 +105,7 @@ class StreamingJEPADataset(IterableDataset):
         self.load_labels = load_labels
         self.vision_shape, self.proprio_dim = self._inspect_schema()
         self.raw_span = (self.seq_len - 1) * self.temporal_stride + self.action_block_size
+        self._episode_ids: dict[tuple[str, int], int] = {}
 
         # Pre-build index table: list of (file_path, env_idx, t0)
         # Scans dones/collisions at init (small arrays, ~10 MB total).
@@ -174,6 +175,7 @@ class StreamingJEPADataset(IterableDataset):
 
     def _precompute_indices(self) -> List[Tuple[str, int, int]]:
         indices = []
+        next_episode_id = 0
         for fpath in self.files:
             with h5py.File(fpath, "r") as h5f:
                 n_envs, T = h5f["vision"].shape[:2]
@@ -188,6 +190,10 @@ class StreamingJEPADataset(IterableDataset):
                     else None
                 )
                 for e in range(n_envs):
+                    key = (fpath, e)
+                    if key not in self._episode_ids:
+                        self._episode_ids[key] = next_episode_id
+                        next_episode_id += 1
                     for t0 in range(0, T - self.raw_span + 1, self.window_stride):
                         t1 = t0 + self.raw_span
                         if dones is not None and np.any(dones[e, t0:t1]):
@@ -256,6 +262,8 @@ class StreamingJEPADataset(IterableDataset):
                     for field, (dtype, default) in self.LABEL_FIELDS.items():
                         arr = np.full((B, self.seq_len), default, dtype=dtype)
                         label_arrays[field] = arr
+                episode_ids = np.empty((B, self.seq_len), dtype=np.int64)
+                obs_steps = np.empty((B, self.seq_len), dtype=np.int64)
 
                 for i, (fpath, e, t0) in enumerate(batch_idx):
                     if fpath not in open_files:
@@ -263,6 +271,8 @@ class StreamingJEPADataset(IterableDataset):
                     h5f = open_files[fpath]
                     raw_end = t0 + self.raw_span
                     obs_offsets = np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
+                    episode_ids[i].fill(self._episode_ids[(fpath, e)])
+                    obs_steps[i] = t0 + obs_offsets
 
                     vis_chunk = h5f["vision"][e, t0:raw_end]
                     prop_chunk = h5f["proprio"][e, t0:raw_end]
@@ -307,6 +317,8 @@ class StreamingJEPADataset(IterableDataset):
                 if self.load_labels:
                     for field, arr in label_arrays.items():
                         labels[field] = torch.from_numpy(arr)
+                labels["episode_id"] = torch.from_numpy(episode_ids)
+                labels["obs_step"] = torch.from_numpy(obs_steps)
 
                 yield (
                     torch.from_numpy(vis),
