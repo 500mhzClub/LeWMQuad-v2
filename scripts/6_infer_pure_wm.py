@@ -181,6 +181,8 @@ class PureCEMPlanner:
         self,
         z_start_raw: torch.Tensor,
         heads: PlannerHeads | None = None,
+        episodic_memory_proj: torch.Tensor | None = None,
+        episodic_novelty_weight: float = 0.0,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
@@ -231,6 +233,22 @@ class PureCEMPlanner:
                 ).reshape(n_cand, horizon).sum(dim=-1)
                 costs -= heads.exploration_weight * bonus
                 metrics["exploration_bonus"] = bonus
+
+            if (
+                episodic_memory_proj is not None
+                and episodic_memory_proj.numel() > 0
+                and episodic_novelty_weight > 0.0
+            ):
+                final_proj = F.normalize(z_rollouts_proj[:, -1, :], dim=-1)
+                memory_proj = F.normalize(
+                    episodic_memory_proj.to(device=self.device, dtype=torch.float32),
+                    dim=-1,
+                )
+                sim_to_memory = final_proj @ memory_proj.transpose(0, 1)
+                max_sim = sim_to_memory.max(dim=1).values
+                episodic_bonus = (1.0 - max_sim).clamp_min(0.0)
+                costs -= episodic_novelty_weight * episodic_bonus
+                metrics["episodic_bonus"] = episodic_bonus
 
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
@@ -304,6 +322,10 @@ def parse_args() -> argparse.Namespace:
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--exploration_weight", type=float, default=None,
                    help="Override learned RND exploration weight from the scorer checkpoint.")
+    p.add_argument("--episodic_novelty_weight", type=float, default=0.0,
+                   help="Extra pure-perception novelty bonus on the rollout terminal latent relative to visited episode latents.")
+    p.add_argument("--episodic_memory_size", type=int, default=1024,
+                   help="Maximum number of visited projected latents to retain for episodic novelty.")
     p.add_argument("--rnd_online_lr", type=float, default=1e-3,
                    help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
     p.add_argument("--recent_latent_window", type=int, default=128,
@@ -358,9 +380,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--goal_route_improve_margin", type=float, default=0.03,
                    help="Require a route target to improve breadcrumb similarity by at least this margin before treating it as goal-directed.")
     p.add_argument("--success_goal_sim_threshold", type=float, default=0.90,
-                   help="Perception-only success threshold on current breadcrumb similarity.")
+                   help="Projected-latent success threshold on current breadcrumb similarity.")
+    p.add_argument("--success_goal_raw_sim_threshold", type=float, default=0.95,
+                   help="Raw-latent success threshold on current breadcrumb similarity.")
     p.add_argument("--success_hold_steps", type=int, default=6,
-                   help="Require this many consecutive high-similarity frames before declaring success.")
+                   help="Require this many consecutive high-similarity frames before declaring perceptual goal detection.")
     p.add_argument("--stuck_window_steps", type=int, default=12,
                    help="Window for stuck detection using odometry and latent displacement.")
     p.add_argument("--stuck_cmd_threshold", type=float, default=0.25,
@@ -1689,6 +1713,19 @@ def has_line_of_sight(a_xy, b_xy, obstacle_layout, step_size=0.03, margin=0.05):
     return True
 
 
+def append_episodic_memory(
+    memory: list[torch.Tensor],
+    z_proj: torch.Tensor,
+    max_size: int,
+) -> None:
+    """Append the current projected latent to the episodic novelty memory."""
+    if max_size <= 0:
+        return
+    memory.append(z_proj.squeeze(0).detach().to(dtype=torch.float32).clone())
+    if len(memory) > max_size:
+        del memory[: len(memory) - max_size]
+
+
 # ---- Main ---------------------------------------------------------------- #
 
 def main():
@@ -1796,12 +1833,18 @@ def main():
     print(f"Maze: {args.grid_rows}x{args.grid_cols}, spawn=({spawn_xy[0]:.2f}, {spawn_xy[1]:.2f})")
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
+    objective_name = (
+        "safety+novelty+episodic"
+        if args.episodic_novelty_weight > 0.0
+        else "safety+novelty"
+    )
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
           f"Cmd={wm_meta['command_representation']}:{wm_meta['cmd_dim']}, "
-          f"Latent=proj, Objective=safety+novelty, "
-          f"GoalSucc={args.success_goal_sim_threshold:.2f}, "
+          f"Latent=proj, Objective={objective_name}, "
+          f"GoalSucc={args.success_goal_sim_threshold:.2f}/{args.success_goal_raw_sim_threshold:.2f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
+          f"EpisW={args.episodic_novelty_weight:.3f}, "
           f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
@@ -1816,16 +1859,20 @@ def main():
     cmds_log: List[List[float]] = []
     mode_log: List[str] = []
     goal_similarity_log: List[float | None] = []
+    goal_similarity_raw_log: List[float | None] = []
     terminate_reason = "max_steps"
     collision_count = 0
     frame_substitution_count = 0
     first_collision_step: int | None = None
     success_hold_count = 0
+    perceptual_goal_detected = False
+    perceptual_goal_detected_step: int | None = None
     oracle_goal_reached = False
     min_goal_dist_m = float("inf")
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
     goal_activation_step: int | None = None
+    episodic_memory_proj: list[torch.Tensor] = []
 
     try:
         import genesis as gs
@@ -1845,6 +1892,7 @@ def main():
             args.third_person_res, args.third_person_fov, 0.01,
         )
 
+        z_breadcrumb_raw_ref = None
         z_breadcrumb_proj_ref = None
         if target_beacon is not None:
             z_breadcrumb_raw, z_breadcrumb_proj = encode_breadcrumb(
@@ -1852,6 +1900,7 @@ def main():
                 target_beacon, args.breadcrumb_view_dist,
                 planning_device, q0, gs, torch,
             )
+            z_breadcrumb_raw_ref = z_breadcrumb_raw.detach().clone()
             z_breadcrumb_proj_ref = z_breadcrumb_proj.detach().clone()
             print(
                 f"Goal latents encoded: ||z_raw||={float(z_breadcrumb_raw.norm()):.3f} "
@@ -1901,6 +1950,11 @@ def main():
         path_xy.append(start_xy)
         oracle_path_xy.append(start_xy.copy())
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
+        append_episodic_memory(
+            episodic_memory_proj,
+            obs["z_proj"].to(planning_device),
+            args.episodic_memory_size,
+        )
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1916,9 +1970,16 @@ def main():
 
             need_replan = plan_seq is None or plan_step_idx >= args.mpc_execute
             if need_replan:
+                episodic_memory_t = (
+                    torch.stack(episodic_memory_proj, dim=0)
+                    if episodic_memory_proj
+                    else None
+                )
                 plan_seq, cost, plan_metrics_last = planner.plan(
                     obs["z_raw"],
                     heads=planner_heads,
+                    episodic_memory_proj=episodic_memory_t,
+                    episodic_novelty_weight=args.episodic_novelty_weight,
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
@@ -1947,10 +2008,16 @@ def main():
                 q0, prev_action, last_clean_frame,
             )
             goal_sim_now = None
+            goal_sim_raw_now = None
             if z_breadcrumb_proj_ref is not None:
                 goal_sim_now = cosine_similarity_scalar(
                     obs["z_proj"].squeeze(0),
                     z_breadcrumb_proj_ref,
+                )
+            if z_breadcrumb_raw_ref is not None:
+                goal_sim_raw_now = cosine_similarity_scalar(
+                    obs["z_raw"].squeeze(0),
+                    z_breadcrumb_raw_ref,
                 )
 
             cur_xy = [float(obs["pos_np"][0]), float(obs["pos_np"][1])]
@@ -1964,6 +2031,11 @@ def main():
                 frame_substitution_count += 1
             else:
                 last_clean_frame = obs["frame_hwc"].copy()
+                append_episodic_memory(
+                    episodic_memory_proj,
+                    obs["z_proj"].to(planning_device),
+                    args.episodic_memory_size,
+                )
                 if (
                     args.rnd_online_lr > 0.0
                     and planner_heads.exploration is not None
@@ -2000,13 +2072,28 @@ def main():
                 break
 
             reached = False
-            if goal_sim_now is not None and goal_sim_now >= args.success_goal_sim_threshold:
+            detected = False
+            proj_ok = (
+                goal_sim_now is not None
+                and goal_sim_now >= args.success_goal_sim_threshold
+            )
+            raw_ok = (
+                goal_sim_raw_now is not None
+                and goal_sim_raw_now >= args.success_goal_raw_sim_threshold
+            )
+            if proj_ok and raw_ok:
                 success_hold_count += 1
             else:
                 success_hold_count = 0
             goal_similarity_log.append(None if goal_sim_now is None else float(goal_sim_now))
+            goal_similarity_raw_log.append(
+                None if goal_sim_raw_now is None else float(goal_sim_raw_now)
+            )
             if success_hold_count >= args.success_hold_steps:
-                reached = True
+                detected = True
+                if not perceptual_goal_detected:
+                    perceptual_goal_detected = True
+                    perceptual_goal_detected_step = step
 
             dist_claim = None
             if target_beacon is not None and target_claim_xy is not None:
@@ -2026,17 +2113,26 @@ def main():
                 oracle_goal_reached = oracle_goal_reached or (
                     dist_claim <= args.success_range and los and frontness > 0
                 )
+                reached = oracle_goal_reached
 
-            if step % 20 == 0 or reached:
+            if step % 20 == 0 or reached or detected:
                 cov_area = coverage_tracker_metrics(coverage_tracker)["soft_coverage_area_m2"]
                 cov_delta = cov_area - last_logged_coverage_area_m2
                 last_logged_coverage_area_m2 = cov_area
-                progress_str = (
+                progress_parts = [
                     f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
                     f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f}"
-                )
+                ]
+                if "episodic_bonus" in plan_metrics_last:
+                    progress_parts.append(f"e={plan_metrics_last['episodic_bonus']:.3f}")
+                progress_str = " ".join(progress_parts)
                 goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
-                goal_sim_str = "n/a" if goal_sim_now is None else f"{goal_sim_now:.3f}"
+                if goal_sim_now is None:
+                    goal_sim_str = "n/a"
+                elif goal_sim_raw_now is None:
+                    goal_sim_str = f"{goal_sim_now:.3f}"
+                else:
+                    goal_sim_str = f"{goal_sim_now:.3f}/{goal_sim_raw_now:.3f}"
                 print(
                     f"Step {step:03d} | pos=({cur_xy[0]:+.2f}, {cur_xy[1]:+.2f}) "
                     f"cmd={cmd_display} "
@@ -2049,6 +2145,10 @@ def main():
             if reached:
                 terminate_reason = "goal_reached"
                 print(f"Step {step:03d} | REACHED {target_beacon.identity if target_beacon else 'goal'}")
+                break
+            if detected:
+                terminate_reason = "goal_detected"
+                print(f"Step {step:03d} | DETECTED {target_beacon.identity if target_beacon else 'goal'}")
                 break
 
     finally:
@@ -2087,6 +2187,8 @@ def main():
         "grid": f"{args.grid_rows}x{args.grid_cols}",
         "target": target_beacon.identity if target_beacon else None,
         "result": terminate_reason,
+        "perceptual_goal_detected": perceptual_goal_detected,
+        "perceptual_goal_detected_step": perceptual_goal_detected_step,
         "oracle_goal_reached": oracle_goal_reached,
         "steps": len(cmds_log),
         "low_level_control_steps": len(cmds_log) * (
@@ -2110,7 +2212,11 @@ def main():
             "mpc_execute_k": args.mpc_execute,
             "macro_action_repeat": args.macro_action_repeat,
             "latent_space": "proj",
-            "objective": "safety_plus_novelty",
+            "objective": (
+                "safety_plus_novelty_plus_episodic"
+                if args.episodic_novelty_weight > 0.0
+                else "safety_plus_novelty"
+            ),
             "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
             "world_model_cmd_dim": int(wm_meta["cmd_dim"]),
             "world_model_command_representation": str(wm_meta["command_representation"]),
@@ -2118,6 +2224,7 @@ def main():
             "world_model_command_latency": int(wm_meta["command_latency"]),
             "action_penalty_weight": args.action_penalty_weight,
             "success_goal_sim_threshold": args.success_goal_sim_threshold,
+            "success_goal_raw_sim_threshold": args.success_goal_raw_sim_threshold,
             "success_hold_steps": args.success_hold_steps,
             "goal_activation_step": goal_activation_step,
             "uses_safety_head": planner_heads.safety_head is not None,
@@ -2125,6 +2232,8 @@ def main():
             "goal_head_present_ckpt": planner_heads.goal_head is not None,
             "uses_exploration": planner_heads.exploration is not None,
             "exploration_weight": planner_heads.exploration_weight,
+            "episodic_novelty_weight": args.episodic_novelty_weight,
+            "episodic_memory_size": args.episodic_memory_size,
             "rnd_online_lr": args.rnd_online_lr,
             "ignored_goal_weight_ckpt": planner_heads.goal_weight,
             "ignored_recent_latent_window": args.recent_latent_window,
@@ -2144,6 +2253,7 @@ def main():
         "oracle_path_xy": oracle_path_xy,
         "modes": mode_log,
         "goal_similarity": goal_similarity_log,
+        "goal_similarity_raw": goal_similarity_raw_log,
         "commands": cmds_log,
         "costs": costs_log,
     }
