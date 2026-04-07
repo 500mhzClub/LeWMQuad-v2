@@ -190,6 +190,7 @@ class PureCEMPlanner:
         visited_rollout_knn_k: int = 8,
         visited_rollout_margin: float = 0.0,
         visited_rollout_tail_steps: int = 1,
+        visited_revisit_penalty_weight: float = 0.0,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
@@ -246,15 +247,21 @@ class PureCEMPlanner:
                 if exploration_bonus_mode == "visited_nn":
                     tail_steps = min(max(1, int(visited_rollout_tail_steps)), horizon)
                     tail_z = z_rollouts_proj[:, -tail_steps:, :]
-                    tail_bonus = visited_rollout_bank_novelty(
+                    tail_dist = visited_rollout_bank_novelty(
                         tail_z.reshape(n_cand * tail_steps, latent_dim),
                         visited_rollout_bank,
                         k=visited_rollout_knn_k,
                     ).reshape(n_cand, tail_steps)
-                    tail_bonus = (tail_bonus - float(visited_rollout_margin)).clamp_min(0.0)
+                    tail_margin = tail_dist - float(visited_rollout_margin)
+                    tail_bonus = tail_margin.clamp_min(0.0)
                     # Require the rollout tail to stay novel, not just the
                     # final frame to spike on a slightly different local view.
                     bonus = tail_bonus.min(dim=1).values
+                    metrics["visited_nn_distance"] = tail_dist.mean(dim=1)
+                    if visited_revisit_penalty_weight > 0.0:
+                        revisit_penalty = (-tail_margin).clamp_min(0.0).mean(dim=1)
+                        costs += visited_revisit_penalty_weight * revisit_penalty
+                        metrics["revisit_penalty"] = revisit_penalty
                 elif exploration_bonus_mode == "sum":
                     bonus = heads.exploration(
                         z_rollouts_proj.reshape(n_cand * horizon, latent_dim),
@@ -388,8 +395,8 @@ def parse_args() -> argparse.Namespace:
                    help="Require novelty to persist over the last this many rollout steps when exploration_bonus_mode=visited_nn.")
     p.add_argument("--recent_latent_window", type=int, default=128,
                    help="Legacy routing-era flag. Ignored by the active planner.")
-    p.add_argument("--revisit_penalty_weight", type=float, default=0.35,
-                   help="Legacy routing-era flag. Ignored by the active planner.")
+    p.add_argument("--revisit_penalty_weight", type=float, default=0.0,
+                   help="Additional penalty for rollout-tail states that remain inside the visited_nn margin.")
     p.add_argument("--forward_bonus_weight", type=float, default=0.30,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--forward_bonus_safety_threshold", type=float, default=0.12,
@@ -1944,7 +1951,8 @@ def main():
             f", VisitK={args.visited_nn_k}, "
             f"VisitMargin={args.visited_nn_margin:.3f}, "
             f"VisitTail={args.visited_nn_tail_steps}, "
-            f"VisitBank={args.visited_bank_size}"
+            f"VisitBank={args.visited_bank_size}, "
+            f"RevisitW={args.revisit_penalty_weight:.3f}"
         )
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
@@ -2088,6 +2096,7 @@ def main():
                     visited_rollout_knn_k=args.visited_nn_k,
                     visited_rollout_margin=args.visited_nn_margin,
                     visited_rollout_tail_steps=args.visited_nn_tail_steps,
+                    visited_revisit_penalty_weight=args.revisit_penalty_weight,
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
@@ -2247,6 +2256,8 @@ def main():
                     f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
                     f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f}"
                 ]
+                if "revisit_penalty" in plan_metrics_last:
+                    progress_parts.append(f"r={plan_metrics_last['revisit_penalty']:.3f}")
                 if "terminal_displacement_bonus" in plan_metrics_last:
                     progress_parts.append(f"d={plan_metrics_last['terminal_displacement_bonus']:.3f}")
                 if "exploration_safety_gate" in plan_metrics_last:
@@ -2363,6 +2374,7 @@ def main():
             "visited_nn_margin": args.visited_nn_margin,
             "visited_nn_tail_steps": args.visited_nn_tail_steps,
             "visited_bank_size": args.visited_bank_size,
+            "revisit_penalty_weight": args.revisit_penalty_weight,
             "terminal_displacement_weight": args.terminal_displacement_weight,
             "exploration_safety_gate_threshold": args.exploration_safety_gate_threshold,
             "exploration_safety_gate_sharpness": args.exploration_safety_gate_sharpness,
