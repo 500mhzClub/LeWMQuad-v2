@@ -131,6 +131,16 @@ class PlannerHeads:
     safety_weight: float = 1.0
 
 
+def summarize_command_sequence(seq: torch.Tensor) -> dict[str, list[Any]]:
+    seq_cpu = seq.detach().to(dtype=torch.float32, device="cpu")
+    return {
+        "command_sequence": seq_cpu.tolist(),
+        "command_first": seq_cpu[0].tolist(),
+        "command_last": seq_cpu[-1].tolist(),
+        "command_mean": seq_cpu.mean(dim=0).tolist(),
+    }
+
+
 # ---- Pure CEM planner ---------------------------------------------------- #
 
 class PureCEMPlanner:
@@ -193,7 +203,9 @@ class PureCEMPlanner:
         visited_rollout_margin: float = 0.0,
         visited_rollout_tail_steps: int = 1,
         visited_revisit_penalty_weight: float = 0.0,
-    ) -> tuple[torch.Tensor, float, dict[str, float]]:
+        return_diagnostics: bool = False,
+        diagnostics_topk: int = 5,
+    ) -> tuple[torch.Tensor, float, dict[str, float], dict[str, Any] | None]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
             raise ValueError(f"Expected z_start_raw shape (1, D), got {tuple(z0.shape)}")
@@ -214,6 +226,7 @@ class PureCEMPlanner:
         best_seq = mean.clone()
         best_cost = float("inf")
         best_metrics: dict[str, float] = {}
+        diagnostics: dict[str, Any] | None = None
         prepared_visited_snippets = None
         prepared_visited_snippet_emb = None
         if (
@@ -359,6 +372,31 @@ class PureCEMPlanner:
                     for name, values in metrics.items()
                 }
 
+            if return_diagnostics:
+                topk = min(max(1, int(diagnostics_topk)), self.n_candidates)
+                top_idx = torch.topk(costs, k=topk, largest=False).indices.tolist()
+                final_iteration_topk = []
+                for rank, idx in enumerate(top_idx, start=1):
+                    seq = samples[idx]
+                    final_iteration_topk.append({
+                        "rank": rank,
+                        "candidate_index": int(idx),
+                        "cost": float(costs[idx].item()),
+                        "metrics": {
+                            name: float(values[idx].item())
+                            for name, values in metrics.items()
+                        },
+                        **summarize_command_sequence(seq),
+                    })
+                diagnostics = {
+                    "final_iteration_topk": final_iteration_topk,
+                    "final_iteration_best_cost": float(costs[top_idx[0]].item()),
+                    "final_iteration_best_metrics": {
+                        name: float(values[top_idx[0]].item())
+                        for name, values in metrics.items()
+                    },
+                }
+
             elite_idx = torch.topk(costs, k=self.n_elite, largest=False).indices
             elite = samples[elite_idx]
             mean = elite.mean(dim=0)
@@ -368,7 +406,18 @@ class PureCEMPlanner:
             [best_seq[1:], best_seq[-1:].clone()], dim=0,
         ).detach()
 
-        return best_seq, best_cost, best_metrics
+        if return_diagnostics:
+            diagnostics = dict(diagnostics or {})
+            diagnostics.update({
+                "selected_plan": {
+                    "source": "best_overall",
+                    "cost": float(best_cost),
+                    "metrics": dict(best_metrics),
+                    **summarize_command_sequence(best_seq),
+                },
+            })
+
+        return best_seq, best_cost, best_metrics, diagnostics
 
 
 # ---- Argument parsing ---------------------------------------------------- #
@@ -457,6 +506,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
     p.add_argument("--visited_bank_size", type=int, default=512,
                    help="Capacity of the executed rollout-latent bank used by visited_nn novelty.")
+    p.add_argument("--audit_plan", action="store_true",
+                   help="Log top-k planner candidates at each audited replan together with the actual outcome after executing the chosen first macro step.")
+    p.add_argument("--audit_every", type=int, default=1,
+                   help="Audit every nth replan event when --audit_plan is enabled.")
+    p.add_argument("--audit_topk", type=int, default=5,
+                   help="Number of lowest-cost candidates to store per audited replan.")
     p.add_argument("--prototype_sim_threshold", type=float, default=0.995,
                    help="Add a new prototype only when cosine similarity to the nearest stored prototype is below this threshold.")
     p.add_argument("--keyframe_sim_threshold", type=float, default=0.985,
@@ -2174,6 +2229,13 @@ def main():
         plan_step_idx = 0
         plan_metrics_last: dict[str, float] = {}
         visited_rollout_bank: list[torch.Tensor] = []
+        plan_audit_records: list[dict[str, Any]] = []
+        pending_plan_audit: dict[str, Any] | None = None
+        replan_count = 0
+        if args.audit_every < 1:
+            raise ValueError("--audit_every must be >= 1.")
+        if args.audit_topk < 1:
+            raise ValueError("--audit_topk must be >= 1.")
 
         obs = observe(
             physics_robot, physics_act_dofs,
@@ -2210,7 +2272,18 @@ def main():
 
             need_replan = plan_seq is None or plan_step_idx >= args.mpc_execute
             if need_replan:
-                plan_seq, cost, plan_metrics_last = planner.plan(
+                audit_this_plan = bool(args.audit_plan and (replan_count % args.audit_every == 0))
+                audit_start_cov_area = None
+                audit_start_goal_dist = None
+                if audit_this_plan:
+                    audit_start_cov_area = coverage_tracker_metrics(
+                        coverage_tracker,
+                    ).get("soft_coverage_area_m2")
+                    if target_claim_xy is not None:
+                        audit_start_goal_dist = float(np.linalg.norm(
+                            np.asarray(obs["pos_np"][:2], dtype=np.float32) - target_claim_xy,
+                        ))
+                plan_seq, cost, plan_metrics_last, plan_diagnostics = planner.plan(
                     obs["z_raw"],
                     z_start_proj=obs["z_proj"],
                     heads=planner_heads,
@@ -2223,9 +2296,31 @@ def main():
                     visited_rollout_margin=args.visited_nn_margin,
                     visited_rollout_tail_steps=args.visited_nn_tail_steps,
                     visited_revisit_penalty_weight=args.revisit_penalty_weight,
+                    return_diagnostics=audit_this_plan,
+                    diagnostics_topk=args.audit_topk,
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
+                if audit_this_plan:
+                    pending_plan_audit = {
+                        "audit_version": 1,
+                        "step": int(step),
+                        "replan_index": int(replan_count),
+                        "mode": mode,
+                        "state_before": {
+                            "pos_xy": [float(obs["pos_np"][0]), float(obs["pos_np"][1])],
+                            "yaw_rad": float(obs["yaw"]),
+                            "goal_dist_m": audit_start_goal_dist,
+                            "coverage_area_m2": (
+                                None if audit_start_cov_area is None else float(audit_start_cov_area)
+                            ),
+                            "visited_bank_size": int(len(visited_rollout_bank)),
+                        },
+                        "plan": plan_diagnostics,
+                    }
+                else:
+                    pending_plan_audit = None
+                replan_count += 1
 
             nominal_cmd = plan_seq[plan_step_idx]
             plan_step_idx += 1
@@ -2324,6 +2419,52 @@ def main():
                 collision_count += 1
                 if first_collision_step is None:
                     first_collision_step = step
+
+            if pending_plan_audit is not None:
+                audit_cov_area = coverage_tracker_metrics(
+                    coverage_tracker,
+                ).get("soft_coverage_area_m2")
+                audit_goal_dist = None
+                if target_claim_xy is not None:
+                    audit_goal_dist = float(np.linalg.norm(
+                        np.asarray(cur_xy, dtype=np.float32) - target_claim_xy,
+                    ))
+                start_state = pending_plan_audit["state_before"]
+                start_goal_dist = start_state["goal_dist_m"]
+                start_cov_area = start_state["coverage_area_m2"]
+                pending_plan_audit["actual_after_first_command"] = {
+                    "pos_xy": [float(cur_xy[0]), float(cur_xy[1])],
+                    "yaw_rad": float(obs["yaw"]),
+                    "xy_displacement_m": float(math.hypot(
+                        cur_xy[0] - start_state["pos_xy"][0],
+                        cur_xy[1] - start_state["pos_xy"][1],
+                    )),
+                    "goal_dist_m": audit_goal_dist,
+                    "goal_dist_delta_m": (
+                        None
+                        if start_goal_dist is None or audit_goal_dist is None
+                        else float(audit_goal_dist - start_goal_dist)
+                    ),
+                    "coverage_area_m2": (
+                        None if audit_cov_area is None else float(audit_cov_area)
+                    ),
+                    "coverage_gain_m2": (
+                        None
+                        if start_cov_area is None or audit_cov_area is None
+                        else float(audit_cov_area - start_cov_area)
+                    ),
+                    "collision": bool(collided),
+                    "collision_count": int(collision_count),
+                    "goal_similarity_proj": (
+                        None if goal_sim_now is None else float(goal_sim_now)
+                    ),
+                    "goal_similarity_raw": (
+                        None if goal_sim_raw_now is None else float(goal_sim_raw_now)
+                    ),
+                    "visited_bank_size_after": int(len(visited_rollout_bank)),
+                }
+                plan_audit_records.append(pending_plan_audit)
+                pending_plan_audit = None
 
             if float(obs["proprio"][0, 0].item()) < sim_cfg.min_z:
                 terminate_reason = "fallen"
@@ -2501,6 +2642,9 @@ def main():
             "visited_nn_tail_steps": args.visited_nn_tail_steps,
             "visited_bank_size": args.visited_bank_size,
             "revisit_penalty_weight": args.revisit_penalty_weight,
+            "audit_plan": bool(args.audit_plan),
+            "audit_every": args.audit_every,
+            "audit_topk": args.audit_topk,
             "terminal_displacement_weight": args.terminal_displacement_weight,
             "exploration_safety_gate_threshold": args.exploration_safety_gate_threshold,
             "exploration_safety_gate_sharpness": args.exploration_safety_gate_sharpness,
@@ -2526,9 +2670,18 @@ def main():
         "goal_similarity_raw": goal_similarity_raw_log,
         "commands": cmds_log,
         "costs": costs_log,
+        "plan_audit": {
+            "enabled": bool(args.audit_plan),
+            "records": len(plan_audit_records),
+            "file": "plan_audit.jsonl" if plan_audit_records else None,
+        },
     }
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+    if plan_audit_records:
+        with open(out_dir / "plan_audit.jsonl", "w") as f:
+            for record in plan_audit_records:
+                f.write(json.dumps(record) + "\n")
 
     if ego_frames_hwc:
         export_video(str(out_dir / "ego"), ego_frames_hwc, args.gif_stride, args.video_fps)
