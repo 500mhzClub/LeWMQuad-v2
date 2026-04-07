@@ -54,6 +54,7 @@ from lewm.models import (
     ProgressEnergyHead,
     ExplorationBonus,
     PlaceSnippetHead,
+    DisplacementHead,
     TrajectoryScorer,
     composite_safety_target,
     consequence_safety_target,
@@ -162,6 +163,16 @@ def parse_args() -> argparse.Namespace:
                    help="If rollout pose is available, positives come from the same episode within this XY radius (m).")
     p.add_argument("--place_negative_gap_m", type=float, default=0.75,
                    help="If rollout pose is available, same-episode negatives must be at least this XY distance away (m).")
+    # Displacement head
+    p.add_argument("--skip_displacement", action="store_true",
+                   help="Skip pose-supervised displacement head training.")
+    p.add_argument("--displacement_epochs", type=int, default=5)
+    p.add_argument("--displacement_lr", type=float, default=3e-4)
+    p.add_argument("--displacement_batch_size", type=int, default=4096)
+    p.add_argument("--displacement_hops", type=int, default=5,
+                   help="Train displacement targets between obs_t and obs_{t+hops}. Should usually match the planner horizon in model steps.")
+    p.add_argument("--displacement_weight", type=float, default=0.0,
+                   help="Optional planner bonus weight for the displacement head. Kept at 0 by default for audit-first evaluation.")
     # Held-out evaluation
     p.add_argument("--skip_eval", action="store_true",
                    help="Skip held-out episode evaluation for safety/place heads.")
@@ -285,8 +296,8 @@ def load_frozen_encoder(args, device):
 # Phase 1: Extract latents + labels to disk
 # --------------------------------------------------------------------- #
 
-SHARD_SAMPLES = 500_000    # v8 stores rollout pose metadata for place-head training
-CACHE_VERSION = 8          # v8: add rollout XY/yaw metadata
+SHARD_SAMPLES = 500_000    # v9 stores encoder + rollout pose metadata for displacement-head training
+CACHE_VERSION = 9          # v9: add encoder episode/step/XY/yaw metadata
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -410,6 +421,10 @@ def extract_latents(args, device) -> str:
     z_enc_buf: list[torch.Tensor] = []
     bid_enc_buf: list[torch.Tensor] = []
     br_enc_buf: list[torch.Tensor] = []
+    epid_enc_buf: list[torch.Tensor] = []
+    step_enc_buf: list[torch.Tensor] = []
+    xy_enc_buf: list[torch.Tensor] = []
+    yaw_enc_buf: list[torch.Tensor] = []
     z_rollout_buf: list[torch.Tensor] = []
     st_rollout_buf: list[torch.Tensor] = []
     bid_rollout_buf: list[torch.Tensor] = []
@@ -427,7 +442,7 @@ def extract_latents(args, device) -> str:
     pbar = None
 
     def flush_shard():
-        nonlocal z_enc_buf, bid_enc_buf, br_enc_buf
+        nonlocal z_enc_buf, bid_enc_buf, br_enc_buf, epid_enc_buf, step_enc_buf, xy_enc_buf, yaw_enc_buf
         nonlocal z_rollout_buf, st_rollout_buf, bid_rollout_buf, br_rollout_buf, coll_rollout_buf
         nonlocal epid_rollout_buf, step_rollout_buf, xy_rollout_buf, yaw_rollout_buf
         nonlocal buf_encoder_samples, buf_rollout_samples
@@ -439,6 +454,18 @@ def extract_latents(args, device) -> str:
             "z_enc": torch.cat(z_enc_buf),
             "beacon_identity_enc": torch.cat(bid_enc_buf),
             "beacon_range_enc": torch.cat(br_enc_buf),
+            "episode_id_enc": (
+                torch.cat(epid_enc_buf) if epid_enc_buf else torch.empty((0,), dtype=torch.long)
+            ),
+            "obs_step_enc": (
+                torch.cat(step_enc_buf) if step_enc_buf else torch.empty((0,), dtype=torch.long)
+            ),
+            "robot_xy_enc": (
+                torch.cat(xy_enc_buf) if xy_enc_buf else torch.empty((0, 2), dtype=torch.float32)
+            ),
+            "robot_yaw_enc": (
+                torch.cat(yaw_enc_buf) if yaw_enc_buf else torch.empty((0,), dtype=torch.float32)
+            ),
             "z_rollout": torch.cat(z_rollout_buf) if z_rollout_buf else torch.empty((0, args.latent_dim)),
             "safety_target_rollout": (
                 torch.cat(st_rollout_buf) if st_rollout_buf else torch.empty((0,), dtype=torch.float32)
@@ -473,6 +500,8 @@ def extract_latents(args, device) -> str:
             pbar,
         )
         z_enc_buf, bid_enc_buf, br_enc_buf = [], [], []
+        epid_enc_buf, step_enc_buf = [], []
+        xy_enc_buf, yaw_enc_buf = [], []
         z_rollout_buf, st_rollout_buf = [], []
         bid_rollout_buf, br_rollout_buf, coll_rollout_buf = [], [], []
         epid_rollout_buf, step_rollout_buf = [], []
@@ -520,10 +549,30 @@ def extract_latents(args, device) -> str:
                 bid_enc_flat = beacon_identity.long().reshape(B * T)
             else:
                 bid_enc_flat = torch.full((B * T,), -1, dtype=torch.long)
+            if episode_id is not None:
+                epid_enc_flat = episode_id.long().reshape(B * T)
+            else:
+                epid_enc_flat = torch.full((B * T,), -1, dtype=torch.long)
+            if obs_step is not None:
+                step_enc_flat = obs_step.long().reshape(B * T)
+            else:
+                step_enc_flat = torch.full((B * T,), -1, dtype=torch.long)
+            if robot_xy is not None:
+                xy_enc_flat = robot_xy.float().reshape(B * T, 2)
+            else:
+                xy_enc_flat = torch.full((B * T, 2), float("nan"), dtype=torch.float32)
+            if robot_yaw is not None:
+                yaw_enc_flat = robot_yaw.float().reshape(B * T)
+            else:
+                yaw_enc_flat = torch.full((B * T,), float("nan"), dtype=torch.float32)
 
             z_enc_buf.append(z_enc_flat)
             bid_enc_buf.append(bid_enc_flat)
             br_enc_buf.append(br_enc_flat)
+            epid_enc_buf.append(epid_enc_flat)
+            step_enc_buf.append(step_enc_flat)
+            xy_enc_buf.append(xy_enc_flat)
+            yaw_enc_buf.append(yaw_enc_flat)
             buf_encoder_samples += B * T
 
             if T > 1:
@@ -636,6 +685,8 @@ def load_cached_latents(cache_dir: str):
     """Load all shards and return encoder-view and rollout-view latent banks."""
     manifest = torch.load(os.path.join(cache_dir, "manifest.pt"), map_location="cpu")
     z_enc_all, bid_enc_all, br_enc_all = [], [], []
+    epid_enc_all, step_enc_all = [], []
+    xy_enc_all, yaw_enc_all = [], []
     z_rollout_all, st_rollout_all = [], []
     bid_rollout_all, br_rollout_all, coll_rollout_all = [], [], []
     epid_rollout_all, step_rollout_all = [], []
@@ -645,6 +696,10 @@ def load_cached_latents(cache_dir: str):
         z_enc_all.append(shard["z_enc"])
         bid_enc_all.append(shard["beacon_identity_enc"])
         br_enc_all.append(shard["beacon_range_enc"])
+        epid_enc_all.append(shard.get("episode_id_enc", torch.empty((0,), dtype=torch.long)))
+        step_enc_all.append(shard.get("obs_step_enc", torch.empty((0,), dtype=torch.long)))
+        xy_enc_all.append(shard.get("robot_xy_enc", torch.empty((0, 2), dtype=torch.float32)))
+        yaw_enc_all.append(shard.get("robot_yaw_enc", torch.empty((0,), dtype=torch.float32)))
         z_rollout_all.append(shard["z_rollout"])
         st_rollout_all.append(shard["safety_target_rollout"])
         bid_rollout_all.append(shard["beacon_identity_rollout"])
@@ -662,6 +717,10 @@ def load_cached_latents(cache_dir: str):
     enc_z = torch.cat(z_enc_all)
     enc_bid = torch.cat(bid_enc_all)
     enc_br = torch.cat(br_enc_all)
+    enc_epid = torch.cat(epid_enc_all)
+    enc_step = torch.cat(step_enc_all)
+    enc_xy = torch.cat(xy_enc_all)
+    enc_yaw = torch.cat(yaw_enc_all)
     rollout_z = torch.cat(z_rollout_all)
     rollout_st = torch.cat(st_rollout_all)
     rollout_bid = torch.cat(bid_rollout_all)
@@ -684,6 +743,10 @@ def load_cached_latents(cache_dir: str):
             "z": enc_z,
             "beacon_identity": enc_bid,
             "beacon_range": enc_br,
+            "episode_id": enc_epid,
+            "obs_step": enc_step,
+            "robot_xy": enc_xy,
+            "robot_yaw": enc_yaw,
         },
         "rollout": {
             "z": rollout_z,

@@ -449,6 +449,48 @@ class PlaceSnippetHead(nn.Module):
 
 
 # --------------------------------------------------------------------- #
+# Pose-supervised displacement head
+# --------------------------------------------------------------------- #
+
+class DisplacementHead(nn.Module):
+    """Predicts XY displacement magnitude from current/future latents.
+
+    The head is intentionally simple: it consumes the current observation
+    latent, a future/predicted latent, and their difference, then predicts a
+    non-negative scalar displacement in meters.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 192,
+        hidden_dim: int = 512,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        in_dim = latent_dim * 3
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus(),
+        )
+
+    def forward(self, z_now: torch.Tensor, z_future: torch.Tensor) -> torch.Tensor:
+        if z_now.shape != z_future.shape:
+            raise ValueError(
+                f"Expected z_now and z_future to share shape, got {tuple(z_now.shape)} vs {tuple(z_future.shape)}",
+            )
+        x = torch.cat([z_now, z_future, z_future - z_now], dim=-1)
+        return self.net(x).squeeze(-1)
+
+
+# --------------------------------------------------------------------- #
 # Combined trajectory scorer for CEM / MPC planning
 # --------------------------------------------------------------------- #
 
