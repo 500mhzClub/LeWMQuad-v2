@@ -498,6 +498,87 @@ Interpretation:
 - a reasonable planner weight will not materially change ranking
 - using a very large weight to force an effect would likely be unstable and not principled
 
+### 15. Sequence-level coverage-gain head
+
+#### Why
+
+After the audits, the working hypothesis was:
+
+- local scalar terms were too flat inside the basin
+- the planner needed a sequence-level value target
+- the target should reward realized future escape or coverage gain, not endpoint novelty
+
+The first implementation attempted the more informative of the two continuous variants:
+
+- input: current encoder latent plus a short future rollout snippet
+- target: realized future local coverage gain computed from pose-supervised XY paths
+
+The intent was to keep inference latent-only while using pose only offline for supervision.
+
+#### Change
+
+Implemented `CoverageGainHead` and added:
+
+- training-time pair construction from:
+  - current encoder latent
+  - rollout snippet of `coverage_gain_hops`
+- a pose-supervised local coverage-gain proxy target
+- held-out evaluation
+- checkpoint save/load and optional planner weight
+
+Two versions of the target were tried:
+
+1. `rolloutv10_covgain`
+   - target window matched the snippet horizon
+2. `rolloutv10_covgain_v2`
+   - target window extended to `coverage_gain_target_hops=20`
+   - intended to capture delayed realized gain rather than immediate local novelty
+
+#### Result
+
+Both versions collapsed.
+
+`rolloutv10_covgain`:
+
+- training target mean: `0.0000 m²`
+- held-out:
+  - `rmse=0.0037 m²`
+  - `mae=0.0037 m²`
+  - `pearson=nan`
+  - `pred=0.0037 m²`
+  - `target=0.0000 m²`
+
+`rolloutv10_covgain_v2`:
+
+- pairs: `146,187`
+- training target mean: `0.0000 m²`
+- held-out:
+  - `n=16,203`
+  - `rmse=0.0037 m²`
+  - `mae=0.0037 m²`
+  - `pearson=nan`
+  - `pred=0.0037 m²`
+  - `target=0.0000 m²`
+
+No inference run was performed from these checkpoints because the target itself was degenerate.
+
+#### Interpretation
+
+This is not a model-capacity failure. It is a target-construction failure.
+
+The pose-based local coverage-gain proxy was effectively zero on almost all training/eval pairs under this cached stride/block regime. So the head simply learned a tiny constant output.
+
+Most likely causes:
+
+- the recent-context suppression radius was too aggressive relative to the actual path geometry
+- the paired windows were too local and overlapping
+- the realized future path rarely produced nonzero local gain under this proxy, even over a longer target horizon
+
+The important conclusion is not just that this head failed, but why:
+
+- the sequence-level direction was correct
+- continuous local coverage-gain regression, as currently defined, was not a viable target on this dataset/cache
+
 ## What We Learned
 
 ### 1. The energy heads are not the main bottleneck anymore
@@ -578,7 +659,7 @@ Given the user’s constraint and the desire to avoid “heuristic hell,” this
 
 ## Recommended Next Steps
 
-### Primary recommendation: train a sequence-level escape / coverage-gain head
+### Primary recommendation: train a binary sequence-level escape head
 
 The current heads are all local scalar terms:
 
@@ -591,23 +672,18 @@ The observed failure is sequence-level:
 - the planner needs a signal for “this whole candidate rollout will actually get me out of the basin”
 - not “this endpoint is a bit novel” or “this endpoint might move slightly”
 
-The next clean experiment is therefore:
+The coverage-gain head has now been tried and failed because the current continuous local gain target collapses to almost all zeros. The next clean experiment is therefore:
 
-1. Train a `CoverageGainHead` or `EscapeHead`.
+1. Train an `EscapeHead`.
    - Inputs:
      - current latent
      - candidate rollout snippet or rollout tail
    - Targets:
-     - realized future coverage gain over a longer horizon, or
      - binary escape label such as “did this sequence leave the current local basin?”
    - Use pose only offline to build the labels.
 
 2. Evaluate it on held-out data before using it online.
-   - For coverage gain:
-     - correlation
-     - RMSE
-     - ranking agreement across candidate snippets
-   - For escape:
+   - Report:
      - AUC
      - precision/recall
      - ranking quality among candidates from the same local state
@@ -659,7 +735,7 @@ The strongest current evidence is:
 - collision prediction error is not dramatically worse than non-collision prediction error
 - but online, top-K candidates inside a local basin are almost indistinguishable under the current scalar objectives
 
-Therefore the next step should be a sequence-level value target that predicts realized escape or coverage gain, not another local novelty or displacement scalar.
+Therefore the next step should be a sequence-level value target that predicts realized escape, not another local novelty, displacement, or continuous local coverage-gain scalar.
 
 ## Appendix: Representative Online Results
 
