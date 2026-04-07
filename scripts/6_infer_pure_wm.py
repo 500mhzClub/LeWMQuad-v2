@@ -188,6 +188,8 @@ class PureCEMPlanner:
         exploration_safety_gate_sharpness: float = 5.0,
         visited_rollout_bank: list[torch.Tensor] | None = None,
         visited_rollout_knn_k: int = 8,
+        visited_rollout_margin: float = 0.0,
+        visited_rollout_tail_steps: int = 1,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
@@ -242,11 +244,17 @@ class PureCEMPlanner:
             ):
                 n_cand, horizon, latent_dim = z_rollouts_proj.shape
                 if exploration_bonus_mode == "visited_nn":
-                    bonus = visited_rollout_bank_novelty(
-                        z_rollouts_proj[:, -1, :],
+                    tail_steps = min(max(1, int(visited_rollout_tail_steps)), horizon)
+                    tail_z = z_rollouts_proj[:, -tail_steps:, :]
+                    tail_bonus = visited_rollout_bank_novelty(
+                        tail_z.reshape(n_cand * tail_steps, latent_dim),
                         visited_rollout_bank,
                         k=visited_rollout_knn_k,
-                    )
+                    ).reshape(n_cand, tail_steps)
+                    tail_bonus = (tail_bonus - float(visited_rollout_margin)).clamp_min(0.0)
+                    # Require the rollout tail to stay novel, not just the
+                    # final frame to spike on a slightly different local view.
+                    bonus = tail_bonus.min(dim=1).values
                 elif exploration_bonus_mode == "sum":
                     bonus = heads.exploration(
                         z_rollouts_proj.reshape(n_cand * horizon, latent_dim),
@@ -374,6 +382,10 @@ def parse_args() -> argparse.Namespace:
                    help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
     p.add_argument("--visited_nn_k", type=int, default=8,
                    help="Average the k nearest rollout-bank distances when exploration_bonus_mode=visited_nn.")
+    p.add_argument("--visited_nn_margin", type=float, default=0.0,
+                   help="Only visited_nn distance above this margin counts as novelty.")
+    p.add_argument("--visited_nn_tail_steps", type=int, default=1,
+                   help="Require novelty to persist over the last this many rollout steps when exploration_bonus_mode=visited_nn.")
     p.add_argument("--recent_latent_window", type=int, default=128,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--revisit_penalty_weight", type=float, default=0.35,
@@ -1926,6 +1938,14 @@ def main():
         + ("+terminal_disp" if args.terminal_displacement_weight > 0.0 else "")
         + ("+safety_gate" if args.exploration_safety_gate_threshold is not None else "")
     )
+    visited_nn_desc = ""
+    if args.exploration_bonus_mode == "visited_nn":
+        visited_nn_desc = (
+            f", VisitK={args.visited_nn_k}, "
+            f"VisitMargin={args.visited_nn_margin:.3f}, "
+            f"VisitTail={args.visited_nn_tail_steps}, "
+            f"VisitBank={args.visited_bank_size}"
+        )
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
           f"Cmd={wm_meta['command_representation']}:{wm_meta['cmd_dim']}, "
@@ -1935,7 +1955,8 @@ def main():
           f"ExploreMode={args.exploration_bonus_mode}, "
           f"DispW={args.terminal_displacement_weight:.3f}, "
           f"GateTau={args.exploration_safety_gate_threshold if args.exploration_safety_gate_threshold is not None else 'off'}, "
-          f"GateK={args.exploration_safety_gate_sharpness:.3f}, "
+          f"GateK={args.exploration_safety_gate_sharpness:.3f}"
+          f"{visited_nn_desc}, "
           f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
@@ -2065,6 +2086,8 @@ def main():
                     exploration_safety_gate_sharpness=args.exploration_safety_gate_sharpness,
                     visited_rollout_bank=visited_rollout_bank,
                     visited_rollout_knn_k=args.visited_nn_k,
+                    visited_rollout_margin=args.visited_nn_margin,
+                    visited_rollout_tail_steps=args.visited_nn_tail_steps,
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
@@ -2337,6 +2360,8 @@ def main():
             "exploration_weight": planner_heads.exploration_weight,
             "exploration_bonus_mode": args.exploration_bonus_mode,
             "visited_nn_k": args.visited_nn_k,
+            "visited_nn_margin": args.visited_nn_margin,
+            "visited_nn_tail_steps": args.visited_nn_tail_steps,
             "visited_bank_size": args.visited_bank_size,
             "terminal_displacement_weight": args.terminal_displacement_weight,
             "exploration_safety_gate_threshold": args.exploration_safety_gate_threshold,
