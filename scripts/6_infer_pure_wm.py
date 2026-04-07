@@ -180,14 +180,20 @@ class PureCEMPlanner:
     def plan(
         self,
         z_start_raw: torch.Tensor,
+        z_start_proj: torch.Tensor | None = None,
         heads: PlannerHeads | None = None,
-        episodic_memory_proj: torch.Tensor | None = None,
-        episodic_novelty_weight: float = 0.0,
+        exploration_bonus_mode: str = "terminal",
+        terminal_displacement_weight: float = 0.0,
     ) -> tuple[torch.Tensor, float, dict[str, float]]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
             raise ValueError(f"Expected z_start_raw shape (1, D), got {tuple(z0.shape)}")
         z0_batch = z0.expand(self.n_candidates, -1)
+        z0_proj = None
+        if z_start_proj is not None:
+            z0_proj = z_start_proj.to(self.device, dtype=torch.float32)
+            if z0_proj.ndim != 2 or z0_proj.shape[0] != 1:
+                raise ValueError(f"Expected z_start_proj shape (1, D), got {tuple(z0_proj.shape)}")
 
         if self._warm_start is not None:
             mean = self._warm_start.clone()
@@ -228,27 +234,38 @@ class PureCEMPlanner:
                 and heads.exploration_weight > 0.0
             ):
                 n_cand, horizon, latent_dim = z_rollouts_proj.shape
-                bonus = heads.exploration(
-                    z_rollouts_proj.reshape(n_cand * horizon, latent_dim),
-                ).reshape(n_cand, horizon).sum(dim=-1)
+                if exploration_bonus_mode == "sum":
+                    bonus = heads.exploration(
+                        z_rollouts_proj.reshape(n_cand * horizon, latent_dim),
+                    ).reshape(n_cand, horizon).sum(dim=-1)
+                else:
+                    terminal_bonus = heads.exploration(z_rollouts_proj[:, -1, :])
+                    if exploration_bonus_mode == "terminal":
+                        bonus = terminal_bonus
+                    elif exploration_bonus_mode == "gain":
+                        if z0_proj is None:
+                            raise ValueError(
+                                "exploration_bonus_mode='gain' requires z_start_proj.",
+                            )
+                        start_bonus = heads.exploration(z0_proj).reshape(1).expand(n_cand)
+                        bonus = (terminal_bonus - start_bonus).clamp_min(0.0)
+                    else:
+                        raise ValueError(
+                            f"Unsupported exploration_bonus_mode={exploration_bonus_mode!r}",
+                        )
                 costs -= heads.exploration_weight * bonus
                 metrics["exploration_bonus"] = bonus
 
-            if (
-                episodic_memory_proj is not None
-                and episodic_memory_proj.numel() > 0
-                and episodic_novelty_weight > 0.0
-            ):
+            if terminal_displacement_weight > 0.0:
+                if z0_proj is None:
+                    raise ValueError(
+                        "terminal_displacement_weight > 0 requires z_start_proj.",
+                    )
                 final_proj = F.normalize(z_rollouts_proj[:, -1, :], dim=-1)
-                memory_proj = F.normalize(
-                    episodic_memory_proj.to(device=self.device, dtype=torch.float32),
-                    dim=-1,
-                )
-                sim_to_memory = final_proj @ memory_proj.transpose(0, 1)
-                max_sim = sim_to_memory.max(dim=1).values
-                episodic_bonus = (1.0 - max_sim).clamp_min(0.0)
-                costs -= episodic_novelty_weight * episodic_bonus
-                metrics["episodic_bonus"] = episodic_bonus
+                start_proj = F.normalize(z0_proj, dim=-1).expand(self.n_candidates, -1)
+                terminal_displacement = (1.0 - (final_proj * start_proj).sum(dim=-1)).clamp_min(0.0)
+                costs -= terminal_displacement_weight * terminal_displacement
+                metrics["terminal_displacement_bonus"] = terminal_displacement
 
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
@@ -322,10 +339,11 @@ def parse_args() -> argparse.Namespace:
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--exploration_weight", type=float, default=None,
                    help="Override learned RND exploration weight from the scorer checkpoint.")
-    p.add_argument("--episodic_novelty_weight", type=float, default=0.0,
-                   help="Extra pure-perception novelty bonus on the rollout terminal latent relative to visited episode latents.")
-    p.add_argument("--episodic_memory_size", type=int, default=1024,
-                   help="Maximum number of visited projected latents to retain for episodic novelty.")
+    p.add_argument("--exploration_bonus_mode", type=str, default="terminal",
+                   choices=["sum", "terminal", "gain"],
+                   help="How to score learned novelty over predicted rollout latents.")
+    p.add_argument("--terminal_displacement_weight", type=float, default=0.0,
+                   help="Optional bonus on predicted terminal latent displacement from the current observation.")
     p.add_argument("--rnd_online_lr", type=float, default=1e-3,
                    help="Online adaptation rate for the learned exploration bonus. Set to 0 to disable.")
     p.add_argument("--recent_latent_window", type=int, default=128,
@@ -1712,20 +1730,6 @@ def has_line_of_sight(a_xy, b_xy, obstacle_layout, step_size=0.03, margin=0.05):
             return False
     return True
 
-
-def append_episodic_memory(
-    memory: list[torch.Tensor],
-    z_proj: torch.Tensor,
-    max_size: int,
-) -> None:
-    """Append the current projected latent to the episodic novelty memory."""
-    if max_size <= 0:
-        return
-    memory.append(z_proj.squeeze(0).detach().to(dtype=torch.float32).clone())
-    if len(memory) > max_size:
-        del memory[: len(memory) - max_size]
-
-
 # ---- Main ---------------------------------------------------------------- #
 
 def main():
@@ -1834,9 +1838,8 @@ def main():
     if target_beacon:
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     objective_name = (
-        "safety+novelty+episodic"
-        if args.episodic_novelty_weight > 0.0
-        else "safety+novelty"
+        f"safety+novelty[{args.exploration_bonus_mode}]"
+        + ("+terminal_disp" if args.terminal_displacement_weight > 0.0 else "")
     )
     print(f"Planning: H={args.plan_horizon}, N={args.n_candidates}, "
           f"iters={args.cem_iters}, K={args.mpc_execute}, Macro={args.macro_action_repeat}, "
@@ -1844,7 +1847,8 @@ def main():
           f"Latent=proj, Objective={objective_name}, "
           f"GoalSucc={args.success_goal_sim_threshold:.2f}/{args.success_goal_raw_sim_threshold:.2f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
-          f"EpisW={args.episodic_novelty_weight:.3f}, "
+          f"ExploreMode={args.exploration_bonus_mode}, "
+          f"DispW={args.terminal_displacement_weight:.3f}, "
           f"ActionPen={args.action_penalty_weight:.4f}")
 
     t0 = time.time()
@@ -1872,8 +1876,6 @@ def main():
     coverage_tracker = make_coverage_tracker(obstacle_layout)
     last_logged_coverage_area_m2 = 0.0
     goal_activation_step: int | None = None
-    episodic_memory_proj: list[torch.Tensor] = []
-
     try:
         import genesis as gs
 
@@ -1950,11 +1952,6 @@ def main():
         path_xy.append(start_xy)
         oracle_path_xy.append(start_xy.copy())
         update_coverage_tracker(coverage_tracker, None, path_xy[-1])
-        append_episodic_memory(
-            episodic_memory_proj,
-            obs["z_proj"].to(planning_device),
-            args.episodic_memory_size,
-        )
 
         if target_claim_xy is not None:
             min_goal_dist_m = min(
@@ -1970,16 +1967,12 @@ def main():
 
             need_replan = plan_seq is None or plan_step_idx >= args.mpc_execute
             if need_replan:
-                episodic_memory_t = (
-                    torch.stack(episodic_memory_proj, dim=0)
-                    if episodic_memory_proj
-                    else None
-                )
                 plan_seq, cost, plan_metrics_last = planner.plan(
                     obs["z_raw"],
+                    z_start_proj=obs["z_proj"],
                     heads=planner_heads,
-                    episodic_memory_proj=episodic_memory_t,
-                    episodic_novelty_weight=args.episodic_novelty_weight,
+                    exploration_bonus_mode=args.exploration_bonus_mode,
+                    terminal_displacement_weight=args.terminal_displacement_weight,
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
@@ -2031,11 +2024,6 @@ def main():
                 frame_substitution_count += 1
             else:
                 last_clean_frame = obs["frame_hwc"].copy()
-                append_episodic_memory(
-                    episodic_memory_proj,
-                    obs["z_proj"].to(planning_device),
-                    args.episodic_memory_size,
-                )
                 if (
                     args.rnd_online_lr > 0.0
                     and planner_heads.exploration is not None
@@ -2123,8 +2111,8 @@ def main():
                     f"s={plan_metrics_last.get('safety_cost', 0.0):.3f} "
                     f"x={plan_metrics_last.get('exploration_bonus', 0.0):.3f}"
                 ]
-                if "episodic_bonus" in plan_metrics_last:
-                    progress_parts.append(f"e={plan_metrics_last['episodic_bonus']:.3f}")
+                if "terminal_displacement_bonus" in plan_metrics_last:
+                    progress_parts.append(f"d={plan_metrics_last['terminal_displacement_bonus']:.3f}")
                 progress_str = " ".join(progress_parts)
                 goal_str = "n/a" if dist_claim is None else f"{dist_claim:.2f}m"
                 if goal_sim_now is None:
@@ -2213,9 +2201,8 @@ def main():
             "macro_action_repeat": args.macro_action_repeat,
             "latent_space": "proj",
             "objective": (
-                "safety_plus_novelty_plus_episodic"
-                if args.episodic_novelty_weight > 0.0
-                else "safety_plus_novelty"
+                f"safety_plus_novelty_{args.exploration_bonus_mode}"
+                + ("_plus_terminal_displacement" if args.terminal_displacement_weight > 0.0 else "")
             ),
             "world_model_uses_proprio": bool(wm_meta["use_proprio"]),
             "world_model_cmd_dim": int(wm_meta["cmd_dim"]),
@@ -2232,8 +2219,8 @@ def main():
             "goal_head_present_ckpt": planner_heads.goal_head is not None,
             "uses_exploration": planner_heads.exploration is not None,
             "exploration_weight": planner_heads.exploration_weight,
-            "episodic_novelty_weight": args.episodic_novelty_weight,
-            "episodic_memory_size": args.episodic_memory_size,
+            "exploration_bonus_mode": args.exploration_bonus_mode,
+            "terminal_displacement_weight": args.terminal_displacement_weight,
             "rnd_online_lr": args.rnd_online_lr,
             "ignored_goal_weight_ckpt": planner_heads.goal_weight,
             "ignored_recent_latent_window": args.recent_latent_window,
