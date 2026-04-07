@@ -353,6 +353,8 @@ def extract_latents(args, device) -> str:
         seq_len=args.seq_len,
         temporal_stride=args.temporal_stride,
         action_block_size=args.action_block_size,
+        command_representation=encoder_meta["command_representation"],
+        command_latency=encoder_meta["command_latency"],
         window_stride=args.window_stride,
         batch_size=args.batch_size,
         require_no_done=False,
