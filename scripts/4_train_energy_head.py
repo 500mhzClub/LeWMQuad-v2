@@ -255,8 +255,8 @@ def load_frozen_encoder(args, device):
 # Phase 1: Extract latents + labels to disk
 # --------------------------------------------------------------------- #
 
-SHARD_SAMPLES = 1_000_000  # ~750 MB per shard at dim=192
-CACHE_VERSION = 5          # v5: temporal abstraction + encoder metadata validation
+SHARD_SAMPLES = 500_000    # v6 stores both encoder-view and rollout-view latents per shard
+CACHE_VERSION = 6          # v6: separate encoder-view and teacher-forced rollout-view caches
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -283,8 +283,17 @@ def progress_write(message: str, pbar=None) -> None:
 
 
 def extract_latents(args, device) -> str:
-    """Encode the full dataset once and cache (z_proj, safety_target,
-    beacon_identity, beacon_range) shards to disk."""
+    """Encode the full dataset once and cache two latent views.
+
+    Encoder view:
+      ``enc_projector(z_raw_t)`` for current-frame matching tasks such as
+      breadcrumb / goal supervision.
+
+    Rollout view:
+      ``pred_projector(predictor(z_raw_t, cmd_t))`` teacher-forced and aligned
+      to the next frame's labels. This matches the distribution consumed by the
+      planner's safety and exploration heads at inference.
+    """
     _, encoder_meta = resolve_encoder_config(args, device)
     action_block_size = (
         args.action_block_size if args.action_block_size is not None else args.temporal_stride
@@ -324,8 +333,12 @@ def extract_latents(args, device) -> str:
             and info.get("temporal_cfg") == expected_cfg
             and info.get("encoder_cfg") == expected_encoder_cfg
         ):
-            print(f"Latent cache found: {info['n_samples']:,} samples in "
-                  f"{info['n_shards']} shards (v{info.get('version', 1)})")
+            print(
+                "Latent cache found: "
+                f"enc={info.get('n_encoder_samples', info.get('n_samples', 0)):,} "
+                f"rollout={info.get('n_rollout_samples', 0):,} "
+                f"samples in {info['n_shards']} shards (v{info.get('version', 1)})"
+            )
             return cache_dir
         print("Cache version/config mismatch — re-extracting.")
 
@@ -358,32 +371,59 @@ def extract_latents(args, device) -> str:
         pin_memory=True, prefetch_factor=max(1, int(args.prefetch_factor)),
     )
 
-    z_buf: list[torch.Tensor] = []
-    st_buf: list[torch.Tensor] = []
-    bid_buf: list[torch.Tensor] = []
-    br_buf: list[torch.Tensor] = []
-    coll_buf: list[torch.Tensor] = []
-    buf_samples = 0
+    z_enc_buf: list[torch.Tensor] = []
+    bid_enc_buf: list[torch.Tensor] = []
+    br_enc_buf: list[torch.Tensor] = []
+    z_rollout_buf: list[torch.Tensor] = []
+    st_rollout_buf: list[torch.Tensor] = []
+    bid_rollout_buf: list[torch.Tensor] = []
+    br_rollout_buf: list[torch.Tensor] = []
+    coll_rollout_buf: list[torch.Tensor] = []
+    buf_encoder_samples = 0
+    buf_rollout_samples = 0
     shard_idx = 0
-    total_samples = 0
+    total_encoder_samples = 0
+    total_rollout_samples = 0
     pbar = None
 
     def flush_shard():
-        nonlocal z_buf, st_buf, bid_buf, br_buf, coll_buf, buf_samples, shard_idx, total_samples
-        if not z_buf:
+        nonlocal z_enc_buf, bid_enc_buf, br_enc_buf
+        nonlocal z_rollout_buf, st_rollout_buf, bid_rollout_buf, br_rollout_buf, coll_rollout_buf
+        nonlocal buf_encoder_samples, buf_rollout_samples
+        nonlocal shard_idx, total_encoder_samples, total_rollout_samples
+        if not z_enc_buf:
             return
         shard_path = os.path.join(cache_dir, f"shard_{shard_idx:04d}.pt")
         torch.save({
-            "z": torch.cat(z_buf),
-            "safety_target": torch.cat(st_buf),
-            "beacon_identity": torch.cat(bid_buf),
-            "beacon_range": torch.cat(br_buf),
-            "collisions": torch.cat(coll_buf),
+            "z_enc": torch.cat(z_enc_buf),
+            "beacon_identity_enc": torch.cat(bid_enc_buf),
+            "beacon_range_enc": torch.cat(br_enc_buf),
+            "z_rollout": torch.cat(z_rollout_buf) if z_rollout_buf else torch.empty((0, args.latent_dim)),
+            "safety_target_rollout": (
+                torch.cat(st_rollout_buf) if st_rollout_buf else torch.empty((0,), dtype=torch.float32)
+            ),
+            "beacon_identity_rollout": (
+                torch.cat(bid_rollout_buf) if bid_rollout_buf else torch.empty((0,), dtype=torch.long)
+            ),
+            "beacon_range_rollout": (
+                torch.cat(br_rollout_buf) if br_rollout_buf else torch.empty((0,), dtype=torch.float32)
+            ),
+            "collisions_rollout": (
+                torch.cat(coll_rollout_buf) if coll_rollout_buf else torch.empty((0,), dtype=torch.float32)
+            ),
         }, shard_path)
-        total_samples += buf_samples
-        progress_write(f"  Shard {shard_idx}: {buf_samples:,} samples -> {shard_path}", pbar)
-        z_buf, st_buf, bid_buf, br_buf, coll_buf = [], [], [], [], []
-        buf_samples = 0
+        total_encoder_samples += buf_encoder_samples
+        total_rollout_samples += buf_rollout_samples
+        progress_write(
+            f"  Shard {shard_idx}: enc={buf_encoder_samples:,} rollout={buf_rollout_samples:,} "
+            f"samples -> {shard_path}",
+            pbar,
+        )
+        z_enc_buf, bid_enc_buf, br_enc_buf = [], [], []
+        z_rollout_buf, st_rollout_buf = [], []
+        bid_rollout_buf, br_rollout_buf, coll_rollout_buf = [], [], []
+        buf_encoder_samples = 0
+        buf_rollout_samples = 0
         shard_idx += 1
 
     t0 = time.time()
@@ -401,55 +441,73 @@ def extract_latents(args, device) -> str:
 
             vision = vision.to(device, non_blocking=True).float().div_(255.0)
             proprio = proprio.to(device, non_blocking=True)
+            cmds = cmds.to(device, non_blocking=True).float()
 
             B, T = vision.shape[:2]
 
             with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
-                _, z_proj = encoder.encode_seq(vision, proprio)
+                z_raw, z_proj = encoder.encode_seq(vision, proprio)
+                z_pred_raw = encoder.predictor(z_raw, cmds)
+                z_pred_proj = encoder.pred_projector.forward_seq(z_pred_raw)
 
-            z_flat = z_proj.reshape(B * T, -1).float().cpu()
+            z_enc_flat = z_proj.reshape(B * T, -1).float().cpu()
 
-            # Flatten collisions for this batch
-            coll_flat = collisions.float().reshape(B * T)
-
-            # Safety target — mode selects proximity vs consequence
-            if args.safety_mode == "consequence":
-                safety_t = consequence_safety_target(
-                    clearance.float().reshape(B * T),
-                    traversability.reshape(B * T),
-                    coll_flat,
-                    traversability_horizon=10,
-                    contact_clearance=args.contact_clearance,
-                    w_contact=args.w_contact,
-                    w_mobility=args.w_mobility,
-                )
-            else:
-                safety_t = composite_safety_target(
-                    clearance.float(), traversability,
-                    clearance_clip=args.clearance_clip,
-                    traversability_horizon=10,
-                    w_safety=args.w_safety,
-                    w_mobility=args.w_mobility,
-                ).reshape(B * T)
-
-            # Beacon labels (flattened)
+            # Encoder-view beacon labels (flattened)
             if beacon_range is not None:
-                br_flat = beacon_range.float().reshape(B * T)
+                br_enc_flat = beacon_range.float().reshape(B * T)
             else:
-                br_flat = torch.full((B * T,), 999.0)
+                br_enc_flat = torch.full((B * T,), 999.0)
             if beacon_identity is not None:
-                bid_flat = beacon_identity.long().reshape(B * T)
+                bid_enc_flat = beacon_identity.long().reshape(B * T)
             else:
-                bid_flat = torch.full((B * T,), -1, dtype=torch.long)
+                bid_enc_flat = torch.full((B * T,), -1, dtype=torch.long)
 
-            z_buf.append(z_flat)
-            st_buf.append(safety_t)
-            bid_buf.append(bid_flat)
-            br_buf.append(br_flat)
-            coll_buf.append(coll_flat)
-            buf_samples += B * T
+            z_enc_buf.append(z_enc_flat)
+            bid_enc_buf.append(bid_enc_flat)
+            br_enc_buf.append(br_enc_flat)
+            buf_encoder_samples += B * T
 
-            if buf_samples >= SHARD_SAMPLES:
+            if T > 1:
+                z_rollout_flat = z_pred_proj[:, :-1, :].reshape(B * (T - 1), -1).float().cpu()
+                coll_rollout_flat = collisions.float()[:, 1:].reshape(B * (T - 1))
+
+                if args.safety_mode == "consequence":
+                    safety_rollout = consequence_safety_target(
+                        clearance.float()[:, 1:].reshape(B * (T - 1)),
+                        traversability[:, 1:].reshape(B * (T - 1)),
+                        coll_rollout_flat,
+                        traversability_horizon=10,
+                        contact_clearance=args.contact_clearance,
+                        w_contact=args.w_contact,
+                        w_mobility=args.w_mobility,
+                    )
+                else:
+                    safety_rollout = composite_safety_target(
+                        clearance.float()[:, 1:],
+                        traversability[:, 1:],
+                        clearance_clip=args.clearance_clip,
+                        traversability_horizon=10,
+                        w_safety=args.w_safety,
+                        w_mobility=args.w_mobility,
+                    ).reshape(B * (T - 1))
+
+                if beacon_range is not None:
+                    br_rollout_flat = beacon_range.float()[:, 1:].reshape(B * (T - 1))
+                else:
+                    br_rollout_flat = torch.full((B * (T - 1),), 999.0)
+                if beacon_identity is not None:
+                    bid_rollout_flat = beacon_identity.long()[:, 1:].reshape(B * (T - 1))
+                else:
+                    bid_rollout_flat = torch.full((B * (T - 1),), -1, dtype=torch.long)
+
+                z_rollout_buf.append(z_rollout_flat)
+                st_rollout_buf.append(safety_rollout)
+                bid_rollout_buf.append(bid_rollout_flat)
+                br_rollout_buf.append(br_rollout_flat)
+                coll_rollout_buf.append(coll_rollout_flat)
+                buf_rollout_samples += B * (T - 1)
+
+            if buf_encoder_samples >= SHARD_SAMPLES:
                 flush_shard()
 
     pbar = None
@@ -457,7 +515,9 @@ def extract_latents(args, device) -> str:
 
     elapsed = time.time() - t0
     torch.save({
-        "n_samples": total_samples,
+        "n_samples": total_encoder_samples,
+        "n_encoder_samples": total_encoder_samples,
+        "n_rollout_samples": total_rollout_samples,
         "n_shards": shard_idx,
         "latent_dim": args.latent_dim,
         "version": CACHE_VERSION,
@@ -477,9 +537,15 @@ def extract_latents(args, device) -> str:
             "action_block_size": int(action_block_size),
             "window_stride": int(window_stride),
         },
+        "latent_views": {
+            "encoder": "enc_projector(z_obs_t)",
+            "rollout": "pred_projector(predictor(z_obs_t, cmd_t)) aligned to labels[t+1]",
+        },
     }, manifest_path)
-    print(f"Extraction complete: {total_samples:,} samples, "
-          f"{shard_idx} shards, {elapsed:.0f}s")
+    print(
+        f"Extraction complete: enc={total_encoder_samples:,} rollout={total_rollout_samples:,} "
+        f"samples, {shard_idx} shards, {elapsed:.0f}s"
+    )
 
     del encoder
     torch.cuda.empty_cache()
@@ -487,25 +553,56 @@ def extract_latents(args, device) -> str:
 
 
 def load_cached_latents(cache_dir: str):
-    """Load all shards and return (z, safety_target, beacon_identity, beacon_range)."""
+    """Load all shards and return encoder-view and rollout-view latent banks."""
     manifest = torch.load(os.path.join(cache_dir, "manifest.pt"), map_location="cpu")
-    z_all, st_all, bid_all, br_all = [], [], [], []
+    z_enc_all, bid_enc_all, br_enc_all = [], [], []
+    z_rollout_all, st_rollout_all = [], []
+    bid_rollout_all, br_rollout_all, coll_rollout_all = [], [], []
     for i in range(manifest["n_shards"]):
         shard = torch.load(os.path.join(cache_dir, f"shard_{i:04d}.pt"), map_location="cpu")
-        z_all.append(shard["z"])
-        st_all.append(shard["safety_target"])
-        bid_all.append(shard["beacon_identity"])
-        br_all.append(shard["beacon_range"])
-        print(f"  Loaded shard {i}: {shard['z'].shape[0]:,} samples")
-    z = torch.cat(z_all)
-    st = torch.cat(st_all)
-    bid = torch.cat(bid_all)
-    br = torch.cat(br_all)
-    print(f"Total: {z.shape[0]:,} samples, z={z.shape}")
-    # Report collision stats if available in v3 shards
-    n_contact = (st > 0.9).sum().item()
-    print(f"  High-energy samples (>0.9): {n_contact:,} ({100*n_contact/len(st):.1f}%)")
-    return z, st, bid, br
+        z_enc_all.append(shard["z_enc"])
+        bid_enc_all.append(shard["beacon_identity_enc"])
+        br_enc_all.append(shard["beacon_range_enc"])
+        z_rollout_all.append(shard["z_rollout"])
+        st_rollout_all.append(shard["safety_target_rollout"])
+        bid_rollout_all.append(shard["beacon_identity_rollout"])
+        br_rollout_all.append(shard["beacon_range_rollout"])
+        coll_rollout_all.append(shard["collisions_rollout"])
+        print(
+            f"  Loaded shard {i}: enc={shard['z_enc'].shape[0]:,} "
+            f"rollout={shard['z_rollout'].shape[0]:,} samples"
+        )
+
+    enc_z = torch.cat(z_enc_all)
+    enc_bid = torch.cat(bid_enc_all)
+    enc_br = torch.cat(br_enc_all)
+    rollout_z = torch.cat(z_rollout_all)
+    rollout_st = torch.cat(st_rollout_all)
+    rollout_bid = torch.cat(bid_rollout_all)
+    rollout_br = torch.cat(br_rollout_all)
+    rollout_coll = torch.cat(coll_rollout_all)
+
+    print(f"Encoder view: {enc_z.shape[0]:,} samples, z={enc_z.shape}")
+    print(f"Rollout view: {rollout_z.shape[0]:,} samples, z={rollout_z.shape}")
+    n_contact = (rollout_st > 0.9).sum().item()
+    print(
+        f"  High-energy rollout samples (>0.9): {n_contact:,} "
+        f"({100*n_contact/max(1, len(rollout_st)):.1f}%)"
+    )
+    return {
+        "encoder": {
+            "z": enc_z,
+            "beacon_identity": enc_bid,
+            "beacon_range": enc_br,
+        },
+        "rollout": {
+            "z": rollout_z,
+            "safety_target": rollout_st,
+            "beacon_identity": rollout_bid,
+            "beacon_range": rollout_br,
+            "collisions": rollout_coll,
+        },
+    }
 
 
 def build_goal_latent_pools(
@@ -1126,28 +1223,37 @@ def train(args):
     if args.extract_only:
         return
 
-    # Load all cached latents
+    # Load cached encoder-view and rollout-view latent banks
     print("\nLoading cached latents...")
-    z_all, safety_target, beacon_id, beacon_range = load_cached_latents(cache_dir)
+    latent_views = load_cached_latents(cache_dir)
+    z_enc = latent_views["encoder"]["z"]
+    beacon_id_enc = latent_views["encoder"]["beacon_identity"]
+    beacon_range_enc = latent_views["encoder"]["beacon_range"]
+    z_rollout = latent_views["rollout"]["z"]
+    safety_target_rollout = latent_views["rollout"]["safety_target"]
+    print(
+        f"Using rollout-view latents for safety/exploration: {tuple(z_rollout.shape)} | "
+        f"encoder-view latents for goal/progress: {tuple(z_enc.shape)}"
+    )
 
     # Phase 2: safety head
-    safety_head = train_safety_head(args, z_all, safety_target, device)
+    safety_head = train_safety_head(args, z_rollout, safety_target_rollout, device)
 
     # Phase 3: goal head
     goal_head = None
     if not args.skip_goal:
-        goal_head = train_goal_head(args, z_all, beacon_id, beacon_range, device)
+        goal_head = train_goal_head(args, z_enc, beacon_id_enc, beacon_range_enc, device)
 
     # Phase 4: progress head
     progress_head = None
     if not args.skip_progress:
-        goal_pools = build_goal_latent_pools(z_all, beacon_id, beacon_range, args.beacon_clip)
+        goal_pools = build_goal_latent_pools(z_enc, beacon_id_enc, beacon_range_enc, args.beacon_clip)
         progress_head = train_progress_head(args, goal_pools, device)
 
     # Phase 5: exploration bonus
     exploration = None
     if not args.skip_exploration:
-        exploration = train_exploration(args, z_all, device)
+        exploration = train_exploration(args, z_rollout, device)
 
     # Save combined TrajectoryScorer checkpoint
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
@@ -1164,6 +1270,11 @@ def train(args):
         "dropout": args.dropout,
         "exploration_feature_dim": args.exploration_feature_dim,
         "safety_mode": args.safety_mode,
+        "safety_latent_source": "pred_projector_teacher_forced",
+        "exploration_latent_source": "pred_projector_teacher_forced",
+        "goal_latent_source": "enc_projector",
+        "progress_latent_source": "enc_projector",
+        "cache_version": CACHE_VERSION,
         "seq_len": args.seq_len,
         "temporal_stride": args.temporal_stride,
         "action_block_size": action_block_size,

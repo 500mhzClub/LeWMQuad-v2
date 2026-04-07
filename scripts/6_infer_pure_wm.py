@@ -658,6 +658,10 @@ def load_planner_heads(
         "action_block_size": ckpt.get("action_block_size"),
         "window_stride": ckpt.get("window_stride"),
         "use_proprio": ckpt.get("use_proprio"),
+        "safety_latent_source": ckpt.get("safety_latent_source"),
+        "exploration_latent_source": ckpt.get("exploration_latent_source"),
+        "goal_latent_source": ckpt.get("goal_latent_source"),
+        "progress_latent_source": ckpt.get("progress_latent_source"),
     }
     return heads, meta
 
@@ -1803,6 +1807,13 @@ def main():
             f"block={scorer_meta.get('action_block_size')}, "
             f"use_proprio={scorer_meta.get('use_proprio')})"
         )
+        if scorer_meta.get("safety_latent_source") or scorer_meta.get("exploration_latent_source"):
+            print(
+                "Scorer latent sources: "
+                f"safety={scorer_meta.get('safety_latent_source', 'unknown')} "
+                f"exploration={scorer_meta.get('exploration_latent_source', 'unknown')} "
+                f"goal={scorer_meta.get('goal_latent_source', 'unknown')}"
+            )
         if scorer_meta.get("has_goal_head", False):
             print("Ignoring goal head in scorer checkpoint; the active planner optimizes safety + novelty only.")
     if args.score_space != "proj":
