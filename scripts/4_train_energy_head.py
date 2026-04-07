@@ -212,6 +212,15 @@ def parse_args() -> argparse.Namespace:
                    help="Interpolation step for the pose-based escape/frontier target.")
     p.add_argument("--escape_frontier_weight", type=float, default=0.0,
                    help="Optional planner bonus weight for the escape/frontier head.")
+    # Autoregressive finetuning
+    p.add_argument("--ar_finetune_epochs", type=int, default=0,
+                   help="Epochs of autoregressive finetuning for safety and escape heads. "
+                        "0 disables. Runs after teacher-forced training, using multi-step "
+                        "predictor rollout latents instead of one-step teacher-forced latents.")
+    p.add_argument("--ar_finetune_lr", type=float, default=1e-4,
+                   help="Learning rate for autoregressive finetuning phase (lower than initial).")
+    p.add_argument("--ar_finetune_horizon", type=int, default=3,
+                   help="Number of autoregressive predictor steps to unroll for AR finetune latents.")
     # Held-out evaluation
     p.add_argument("--skip_eval", action="store_true",
                    help="Skip held-out episode evaluation for safety/place heads.")
@@ -3207,6 +3216,232 @@ def train(args):
                     if metrics is not None:
                         holdout_metrics["escape_frontier"] = metrics
 
+    # Phase 10: Autoregressive finetuning of safety and escape heads
+    if args.ar_finetune_epochs > 0 and safety_head is not None:
+        print("\n" + "=" * 60)
+        print("Phase 10: Autoregressive finetuning (safety + escape heads)")
+        print("=" * 60)
+        print(
+            f"  Generating {args.ar_finetune_horizon}-step AR rollout latents "
+            f"from cached encoder/command sequences..."
+        )
+
+        # Load frozen world model for AR rollout generation
+        ar_encoder = load_frozen_encoder(args, device)
+
+        # Re-stream the dataset to get (vision, cmds) sequences for AR rollout
+        _, ar_encoder_meta = resolve_encoder_config(args, device)
+        ar_action_block_size = (
+            args.action_block_size if args.action_block_size is not None
+            else args.temporal_stride
+        )
+        ar_window_stride = (
+            args.window_stride if args.window_stride is not None
+            else args.seq_len * args.temporal_stride
+        )
+        ar_dataset = StreamingJEPADataset(
+            data_dir=args.data_dir,
+            raw_data_dir=args.raw_data_dir,
+            seq_len=args.seq_len,
+            temporal_stride=args.temporal_stride,
+            action_block_size=ar_action_block_size,
+            command_representation=str(ar_encoder_meta["command_representation"]),
+            command_latency=int(ar_encoder_meta["command_latency"]),
+            window_stride=ar_window_stride,
+            batch_size=min(64, int(args.batch_size)),
+            require_no_done=False,
+            require_no_collision=False,
+            num_workers=max(1, int(args.num_workers)),
+            load_labels=True,
+        )
+        ar_dataloader = DataLoader(
+            ar_dataset, batch_size=None,
+            num_workers=max(1, int(args.num_workers)),
+            pin_memory=True,
+            prefetch_factor=max(1, int(args.prefetch_factor)),
+        )
+
+        # Generate AR rollout latents with safety targets
+        ar_z_buf: list[torch.Tensor] = []
+        ar_target_buf: list[torch.Tensor] = []
+        ar_z_now_buf: list[torch.Tensor] = []
+        ar_z_seq_buf: list[torch.Tensor] = []
+        max_ar_samples = 200_000
+        n_ar = 0
+        horizon = min(int(args.ar_finetune_horizon), args.seq_len - 1)
+        with torch.inference_mode():
+            for batch in ar_dataloader:
+                if n_ar >= max_ar_samples:
+                    break
+                vision, proprio, cmds, dones, collisions, labels = batch
+                clearance = labels.get("clearance")
+                traversability = labels.get("traversability")
+                episode_id = labels.get("episode_id")
+                if clearance is None or traversability is None:
+                    continue
+
+                vision = vision.to(device, non_blocking=True).float().div_(255.0)
+                proprio = proprio.to(device, non_blocking=True)
+                cmds = cmds.to(device, non_blocking=True).float()
+
+                B, T = vision.shape[:2]
+                if T < horizon + 1:
+                    continue
+
+                # Mask: only sequences without resets
+                if episode_id is not None:
+                    no_reset = (episode_id[:, :-1] == episode_id[:, 1:]).all(dim=1)
+                else:
+                    no_reset = ~dones[:, 1:].any(dim=1)
+                if not no_reset.any():
+                    continue
+                valid_idx = no_reset.nonzero(as_tuple=True)[0]
+
+                _ar_model = ar_encoder.module if hasattr(ar_encoder, "module") else ar_encoder
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    z_raw, z_proj = _ar_model.encode_seq(vision[valid_idx], proprio[valid_idx])
+
+                z_raw = z_raw.float()
+                z_proj = z_proj.float()
+                B_v = z_raw.shape[0]
+                cmds_v = cmds[valid_idx].float()
+
+                # Autoregressive rollout from frame 0
+                z_ar = z_raw[:, 0:1, :]
+                ar_preds_proj = []
+                for step in range(horizon):
+                    z_ctx = z_ar
+                    a_ctx = cmds_v[:, :step + 1, :]
+                    if z_ctx.shape[1] > args.seq_len:
+                        z_ctx = z_ctx[:, -args.seq_len:]
+                        a_ctx = a_ctx[:, -args.seq_len:]
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred_raw = _ar_model.predictor(z_ctx, a_ctx)
+                    z_next_raw = pred_raw[:, -1:, :].float()
+                    z_ar = torch.cat([z_ar, z_next_raw], dim=1)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        z_next_proj = _ar_model.pred_projector(z_next_raw.reshape(B_v, -1))
+                    ar_preds_proj.append(z_next_proj.float())
+
+                # Flatten AR latents for safety finetuning
+                ar_z_flat = torch.stack(ar_preds_proj, dim=1)  # (B_v, horizon, D)
+                cl_v = clearance[valid_idx].float()
+                tv_v = traversability[valid_idx]
+
+                for s in range(horizon):
+                    t = s + 1
+                    if args.safety_mode == "consequence":
+                        coll_v = collisions[valid_idx].float()
+                        st = consequence_safety_target(
+                            cl_v[:, t], tv_v[:, t], coll_v[:, t],
+                            traversability_horizon=10,
+                            contact_clearance=args.contact_clearance,
+                            w_contact=args.w_contact,
+                            w_mobility=args.w_mobility,
+                        )
+                    else:
+                        st = composite_safety_target(
+                            cl_v[:, t], tv_v[:, t],
+                            clearance_clip=args.clearance_clip,
+                            traversability_horizon=10,
+                            w_safety=args.w_safety,
+                            w_mobility=args.w_mobility,
+                        )
+                    ar_z_buf.append(ar_z_flat[:, s, :].cpu())
+                    ar_target_buf.append(st.cpu())
+
+                # For escape head: (z_now_proj, z_future_seq) pairs from AR rollout
+                if escape_frontier_head is not None and horizon >= 2:
+                    ar_z_now_buf.append(z_proj[:, 0, :].cpu())
+                    ar_z_seq_buf.append(ar_z_flat.cpu())
+
+                n_ar += B_v * horizon
+
+        del ar_encoder
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if ar_z_buf:
+            ar_z_all = torch.cat(ar_z_buf)
+            ar_target_all = torch.cat(ar_target_buf)
+            print(f"  AR safety samples: {ar_z_all.shape[0]:,}")
+
+            # Finetune safety head on AR latents
+            safety_head.train()
+            for p in safety_head.parameters():
+                p.requires_grad_(True)
+            ar_opt = torch.optim.AdamW(
+                safety_head.parameters(),
+                lr=float(args.ar_finetune_lr),
+                weight_decay=1e-4,
+            )
+            ar_ds = TensorDataset(ar_z_all, ar_target_all)
+            ar_dl = DataLoader(ar_ds, batch_size=min(4096, ar_z_all.shape[0]), shuffle=True)
+            for ar_ep in range(int(args.ar_finetune_epochs)):
+                ep_loss = 0.0
+                n_b = 0
+                for z_batch, t_batch in ar_dl:
+                    z_batch = z_batch.to(device)
+                    t_batch = t_batch.to(device)
+                    pred = safety_head(z_batch)
+                    loss = F.mse_loss(pred, t_batch)
+                    ar_opt.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(safety_head.parameters(), 1.0)
+                    ar_opt.step()
+                    ep_loss += loss.item()
+                    n_b += 1
+                print(f"    AR safety finetune epoch {ar_ep + 1}/{args.ar_finetune_epochs} | "
+                      f"loss={ep_loss / max(1, n_b):.4f}")
+            safety_head.eval()
+
+            # Finetune escape/frontier head on AR latents if available
+            if escape_frontier_head is not None and ar_z_now_buf:
+                ar_z_now_all = torch.cat(ar_z_now_buf)
+                ar_z_seq_all = torch.cat(ar_z_seq_buf)
+                print(f"  AR escape/frontier samples: {ar_z_now_all.shape[0]:,}")
+
+                # Use a simple proxy target: L2 distance from start to terminal
+                # in projected space (larger = more escape)
+                ar_escape_target = (
+                    ar_z_seq_all[:, -1, :] - ar_z_now_all
+                ).square().sum(dim=-1).sqrt()
+
+                escape_frontier_head.train()
+                for p in escape_frontier_head.parameters():
+                    p.requires_grad_(True)
+                ar_esc_opt = torch.optim.AdamW(
+                    escape_frontier_head.parameters(),
+                    lr=float(args.ar_finetune_lr),
+                    weight_decay=1e-4,
+                )
+                ar_esc_ds = TensorDataset(ar_z_now_all, ar_z_seq_all, ar_escape_target)
+                ar_esc_dl = DataLoader(
+                    ar_esc_ds,
+                    batch_size=min(4096, ar_z_now_all.shape[0]),
+                    shuffle=True,
+                )
+                for ar_ep in range(int(args.ar_finetune_epochs)):
+                    ep_loss = 0.0
+                    n_b = 0
+                    for z_now_b, z_seq_b, tgt_b in ar_esc_dl:
+                        z_now_b = z_now_b.to(device)
+                        z_seq_b = z_seq_b.to(device)
+                        tgt_b = tgt_b.to(device)
+                        pred = escape_frontier_head(z_now_b, z_seq_b)
+                        loss = F.mse_loss(pred, tgt_b)
+                        ar_esc_opt.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(escape_frontier_head.parameters(), 1.0)
+                        ar_esc_opt.step()
+                        ep_loss += loss.item()
+                        n_b += 1
+                    print(f"    AR escape finetune epoch {ar_ep + 1}/{args.ar_finetune_epochs} | "
+                          f"loss={ep_loss / max(1, n_b):.4f}")
+                escape_frontier_head.eval()
+        else:
+            print("  No AR samples generated — skipping autoregressive finetuning.")
+
     # Save combined TrajectoryScorer checkpoint
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
     scorer_data = {
@@ -3242,12 +3477,22 @@ def train(args):
         "place_embedding_dim": args.place_embedding_dim,
         "place_snippet_len": place_snippet_len,
         "safety_mode": args.safety_mode,
-        "safety_latent_source": "pred_projector_teacher_forced",
+        "ar_finetune_epochs": int(args.ar_finetune_epochs),
+        "ar_finetune_horizon": int(args.ar_finetune_horizon),
+        "safety_latent_source": (
+            "pred_projector_teacher_forced+ar_finetune"
+            if args.ar_finetune_epochs > 0
+            else "pred_projector_teacher_forced"
+        ),
         "exploration_latent_source": "pred_projector_teacher_forced",
         "place_latent_source": "pred_projector_teacher_forced_snippet",
         "displacement_latent_source": "enc_projector_to_pred_projector_teacher_forced",
         "coverage_gain_latent_source": "enc_projector_to_pred_projector_teacher_forced_snippet",
-        "escape_frontier_latent_source": "enc_projector_to_pred_projector_teacher_forced_snippet",
+        "escape_frontier_latent_source": (
+            "enc_projector_to_pred_projector_teacher_forced_snippet+ar_finetune"
+            if args.ar_finetune_epochs > 0 and escape_frontier_head is not None
+            else "enc_projector_to_pred_projector_teacher_forced_snippet"
+        ),
         "place_supervision": (
             "pose_xy_same_episode"
             if args.raw_data_dir is not None

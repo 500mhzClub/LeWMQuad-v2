@@ -1236,3 +1236,212 @@ The previous report correctly captured the final online symptom:
 But that symptom should now be interpreted as the downstream consequence of a
 misaligned data-model-planner stack, not as evidence that only one more
 sequence-level scalar head is missing.
+
+## Addendum: Second-Round Structural Fixes (2026-04-07)
+
+The following analysis re-evaluates the full stack from first principles with an
+updated success criterion: the system needs to **meaningfully explore novel safe
+trajectories** in unseen enclosed mazes until it reaches line-of-sight of a
+target beacon. It does not need to precision-navigate to a beacon from
+arbitrary distance through projected latent space alone.
+
+This changes which remaining gaps matter most.
+
+### Re-scoped success criterion
+
+The prior analysis implicitly weighted beacon-precision goal-reaching as a hard
+requirement. With the scoped criterion:
+
+- Safety head + primitive search + per-step replanning should produce reliable
+  wall-avoiding corridor traversal in unseen geometry
+- RND online adaptation + escape/frontier value should drive exploration away
+  from the spawn region into unvisited corridors
+- Keyframe memory routing should prevent the worst local-loop failures
+- Direct goal cost only needs to guide the final approach once the beacon is
+  already in sensor range, not across the full maze
+
+This makes three remaining gaps the primary concern:
+
+1. Scene diversity at training time
+2. Multi-step autoregressive prediction fidelity
+3. Teacher-forced/deployment distribution shift in the scoring heads
+
+### What was implemented
+
+#### 1. Multi-step autoregressive eval during world-model training
+
+`scripts/3_train_lewm.py` now runs a multi-step autoregressive prediction
+evaluation at the end of each epoch, in addition to the standard one-step eval.
+
+This measures prediction MSE at each step (1 through `seq_len - 1`) when the
+predictor consumes its own outputs rather than ground-truth encoder latents.
+Results are logged to `multistep_eval_metrics.csv` in the log directory.
+
+This is important because:
+
+- The planner's CEM ranking is based on multi-step autoregressive rollouts
+- One-step eval can look healthy while multi-step error compounds rapidly
+- If multi-step error at step 3 is much worse than step 1, the planner
+  horizon should be shortened or the training regime adjusted
+
+The key diagnostic: if step-3 MSE is more than 3x step-1 MSE on held-out
+scenes, the world model is not reliable enough for horizon-5 planning and
+either more data diversity or a shorter planner horizon is needed.
+
+#### 2. Autoregressive finetuning phase for planning heads
+
+`scripts/4_train_energy_head.py` now supports a Phase 10: autoregressive
+finetuning of the safety and escape/frontier heads.
+
+The idea:
+
+- After standard teacher-forced training (Phases 2-9), reload the frozen
+  world model
+- Re-stream the dataset, encoding real observations and then running the
+  predictor autoregressively for `ar_finetune_horizon` steps
+- Collect the resulting AR-rollout latents paired with ground-truth safety
+  labels from the corresponding future timesteps
+- Finetune the already-trained safety head on these noisier latents at a
+  reduced learning rate
+- Similarly finetune the escape/frontier head on AR rollout snippets
+
+This directly closes the teacher-forced/deployment gap identified in the
+report's finding #5. The heads learn the error characteristics of autoregressive
+prediction, not just the clean teacher-forced distribution.
+
+New CLI flags:
+
+- `--ar_finetune_epochs N` (default 0 = disabled; recommend 3 for serious runs)
+- `--ar_finetune_lr` (default 1e-4, lower than initial training)
+- `--ar_finetune_horizon` (default 3, should match or exceed planner horizon)
+
+The scorer checkpoint records whether AR finetuning was applied in its metadata.
+
+### Updated scene diversity recommendation
+
+The single most important non-code change is scene count. The earlier runbook
+already upgraded from `--chunks 5` to `--chunks 200`, but for the exploration
+task in unseen enclosed mazes, 200 chunks with `mixed` scene distribution yields
+only ~100 distinct enclosed-maze geometries.
+
+Updated recommendation:
+
+- **Smoke test**: `--chunks 5` (unchanged)
+- **Development iteration**: `--chunks 200` with `--scene_distribution enclosed`
+  (not `mixed`) to maximize enclosed-maze coverage per chunk
+- **Serious generalization claim**: `--chunks 500+` with
+  `--scene_distribution mixed` or a staged curriculum
+  (`--scene_distribution enclosed` for 400 chunks + `mixed` for 100)
+
+The bottleneck is distinct geometry count, not frame count. 500 chunks of 1000
+steps each is 500K frames across 500 unique maze layouts. That is a more
+defensible training set than 200 chunks across 100 mazes with 200K frames.
+
+### Updated Runbook
+
+The runbook from the prior section remains the authoritative operational guide.
+The following modifications apply:
+
+#### Step 2 (Serious Raw Data Collection) update
+
+```bash
+python3 scripts/1_physics_rollout.py \
+  --ckpt <ppo_ckpt> \
+  --steps 1000 \
+  --chunks 500 \
+  --scene_distribution enclosed \
+  --command_policy mixed \
+  --out_dir jepa_raw_data
+```
+
+Use `--scene_distribution enclosed` for the primary dataset when the deployment
+task is enclosed-maze exploration. This ensures every chunk contributes a unique
+enclosed-maze layout. A supplementary `mixed` collection of 100 chunks can be
+merged if composite-scene robustness is also desired.
+
+#### Step 6 (Train LeWM) addition
+
+After training, inspect `multistep_eval_metrics.csv`:
+
+```
+epoch, global_step, mse_step_1, mse_step_2, mse_step_3, n_seqs
+```
+
+If `mse_step_3 / mse_step_1 > 3.0` on held-out scenes, consider:
+
+- Increasing scene diversity (more chunks)
+- Reducing planner horizon from 5 to 3
+- Adding a small multi-step auxiliary loss to the training objective
+
+If the ratio is below 2.0, the world model is healthy for multi-step planning.
+
+#### Step 7 (Train Planning Heads) update
+
+```bash
+python3 scripts/4_train_energy_head.py \
+  --data_dir jepa_final_dataset \
+  --raw_data_dir jepa_raw_data \
+  --checkpoint lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
+  --device cuda \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --out_dir energy_head_checkpoints_keyframe_exec_stride5_block15_vision \
+  --log_dir energy_head_logs_keyframe_exec_stride5_block15_vision \
+  --safety_mode proximity \
+  --epochs 10 \
+  --skip_goal \
+  --skip_progress \
+  --exploration_epochs 5 \
+  --coverage_gain_weight 0.5 \
+  --escape_frontier_weight 1.0 \
+  --eval_split_group scene \
+  --exploration_weight 1.0 \
+  --ar_finetune_epochs 3 \
+  --ar_finetune_lr 1e-4 \
+  --ar_finetune_horizon 3
+```
+
+The `--ar_finetune_epochs 3` flag enables the autoregressive finetuning phase
+after the standard teacher-forced training. This is the recommended default for
+any serious run where the planner will operate over multi-step rollouts.
+
+#### Step 10 (Review) addition
+
+In addition to the existing review criteria, check:
+
+- `multistep_eval_metrics.csv` from world-model training — the step-3/step-1
+  MSE ratio is the best early indicator of whether the planner can rank
+  candidates reliably
+- The scorer checkpoint metadata now records `ar_finetune_epochs` and
+  `safety_latent_source` — confirm that AR finetuning was applied
+- Compare planner audit `near_tie_rate` between AR-finetuned and
+  teacher-forced-only scorer checkpoints if running ablations
+
+### What is still not implemented but would help further
+
+The following ideas are documented for future work, not blocked on:
+
+1. **Learned action prior**: Train a small categorical or VAE model on the
+   actual command-block distribution from training data, then have CEM search
+   in that learned latent space rather than over a hand-designed primitive
+   library. This would generalize better to novel maneuvers not in the fixed
+   primitive bank.
+
+2. **Recurrent state estimator**: Replace raw latent history windowing with a
+   learned GRU or similar over the latent sequence. This would give the planner
+   a properly compressed belief state rather than just the last N frames, and
+   would better handle the partial observability of egocentric RGB near
+   symmetric corridors.
+
+3. **Multi-step auxiliary training loss**: Add a 2-3 step autoregressive
+   prediction loss to the world-model training objective itself (not just eval).
+   This would directly optimize the predictor for the regime the planner
+   operates in, at the cost of slower training and potential instability with
+   the SIGReg regularizer.
+
+None of these are required for the exploration task to work, but each would
+improve robustness if the basic pipeline underperforms.

@@ -392,6 +392,12 @@ def train(args: argparse.Namespace) -> None:
                 "epoch", "global_step", "total_loss", "pred_loss",
                 "sigreg_loss", "z_proj_std",
             ])
+    multistep_csv_path = os.path.join(args.log_dir, "multistep_eval_metrics.csv")
+    if eval_dataloader is not None and not os.path.exists(multistep_csv_path):
+        with open(multistep_csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            step_headers = [f"mse_step_{s}" for s in range(1, args.seq_len)]
+            writer.writerow(["epoch", "global_step"] + step_headers + ["n_seqs"])
 
     def run_eval(epoch_idx: int) -> None:
         if eval_dataloader is None:
@@ -453,6 +459,96 @@ def train(args: argparse.Namespace) -> None:
             f"sig={metrics['sigreg_loss']:.4f} "
             f"z_std={metrics['z_proj_std']:.3f}"
         )
+        model.train()
+
+    def run_multistep_eval(epoch_idx: int) -> None:
+        """Autoregressive multi-step prediction error on held-out scenes.
+
+        Runs the predictor step-by-step using its own outputs (not ground-truth
+        encoder latents) and reports per-step MSE in projected space.  This
+        directly measures the regime the CEM planner operates in.
+        """
+        if eval_dataloader is None:
+            return
+        model.eval()
+        max_steps = args.seq_len - 1
+        step_mse_sums = [0.0] * max_steps
+        n_seqs = 0
+        with torch.inference_mode():
+            for batch in eval_dataloader:
+                if len(batch) == 6:
+                    vision, proprio, cmds, dones, collisions, labels = batch
+                else:
+                    vision, proprio, cmds, dones, collisions = batch
+                    labels = None
+
+                vision = vision.to(device, non_blocking=True).float().div_(255.0)
+                proprio = proprio.to(device, non_blocking=True)
+                cmds = cmds.to(device, non_blocking=True)
+
+                mask = build_transition_mask(dones, labels, device)
+
+                B, T = vision.shape[:2]
+                if T < 2:
+                    continue
+
+                # Unwrap torch.compile / DataParallel
+                _model = model
+                if hasattr(_model, "_orig_mod"):
+                    _model = _model._orig_mod
+                if hasattr(_model, "module"):
+                    _model = _model.module
+
+                with autocast(amp_device, dtype=torch.bfloat16):
+                    z_raw, z_proj = _model.encode_seq(vision, proprio)
+
+                z_proj_gt = z_proj.float()
+                z_raw_gt = z_raw.float()
+
+                # Autoregressive rollout from first frame
+                z_ar = z_raw_gt[:, 0:1, :]
+                for step in range(max_steps):
+                    t = step + 1
+                    if t >= T:
+                        break
+                    z_ctx = z_ar
+                    a_ctx = cmds[:, :t, :]
+                    if z_ctx.shape[1] > args.seq_len:
+                        z_ctx = z_ctx[:, -args.seq_len:]
+                        a_ctx = a_ctx[:, -args.seq_len:]
+                    with autocast(amp_device, dtype=torch.bfloat16):
+                        pred_raw = _model.predictor(z_ctx, a_ctx)
+                    z_next_raw = pred_raw[:, -1:, :].float()
+                    z_ar = torch.cat([z_ar, z_next_raw], dim=1)
+
+                    with autocast(amp_device, dtype=torch.bfloat16):
+                        z_next_proj = _model.pred_projector(z_next_raw.reshape(B, -1)).reshape(B, 1, -1)
+                    z_next_proj = z_next_proj.float()
+
+                    per_sample = (z_next_proj[:, 0] - z_proj_gt[:, t]).square().mean(dim=-1)
+                    if mask is not None and t - 1 < mask.shape[1]:
+                        valid = mask[:, :t].all(dim=1)
+                        n_valid = valid.float().sum().clamp(min=1.0)
+                        step_mse_sums[step] += float((per_sample * valid.float()).sum() / n_valid)
+                    else:
+                        step_mse_sums[step] += float(per_sample.mean())
+                    n_seqs += 1 if step == 0 else 0
+
+        if n_seqs == 0:
+            model.train()
+            return
+
+        n_batches = max(1, n_seqs)
+        with open(multistep_csv_path, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            row = [epoch_idx + 1, global_step]
+            row += [f"{step_mse_sums[s] / n_batches:.6f}" for s in range(max_steps)]
+            row.append(n_seqs)
+            writer.writerow(row)
+        step_strs = " ".join(
+            f"s{s+1}={step_mse_sums[s] / n_batches:.4f}" for s in range(max_steps)
+        )
+        print(f"Multi-step eval epoch {epoch_idx + 1} | {step_strs}")
         model.train()
 
     # ---- Training loop -----------------------------------------------
@@ -585,6 +681,7 @@ def train(args: argparse.Namespace) -> None:
             f"time={elapsed:.0f}s"
         )
         run_eval(epoch)
+        run_multistep_eval(epoch)
 
         epoch_ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch + 1}.pt")
         save_checkpoint(
