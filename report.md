@@ -909,16 +909,23 @@ python3 scripts/1_physics_rollout.py \
   --ckpt <ppo_ckpt> \
   --steps 1000 \
   --chunks 5 \
-  --scene_distribution mixed
+  --n_envs 64 \
+  --scene_distribution enclosed \
+  --command_policy mixed \
+  --out_dir jepa_raw_smoke
 
 python3 scripts/2_visual_renderer.py \
-  --raw_dir jepa_raw_data \
-  --out_dir jepa_final_dataset
+  --raw_dir jepa_raw_smoke \
+  --out_dir jepa_final_smoke \
+  --sim_backend vulkan \
+  --workers 4 \
+  --final_vision_compression gzip
 ```
 
 Then run one short epoch of LeWM and one short inference run just to catch
 shape, metadata, and path issues. Do not treat the `--chunks 5` run as a real
-training dataset.
+training dataset, but its rendered outputs can be merged into the full dataset
+later to avoid re-rendering.
 
 ### 2. Serious Raw Data Collection
 
@@ -929,17 +936,22 @@ teacher:
 python3 scripts/1_physics_rollout.py \
   --ckpt <ppo_ckpt> \
   --steps 1000 \
-  --chunks 200 \
-  --scene_distribution mixed \
+  --chunks 500 \
+  --n_envs 64 \
+  --scene_distribution enclosed \
   --command_policy mixed \
   --out_dir jepa_raw_data
 ```
 
 Important current assumptions:
 
-- `--chunks 200` is a reasonable serious starting point; `--chunks 5` is only
-  for smoke tests
-- `--scene_distribution mixed` injects enclosed mazes into the collection set
+- `--n_envs 64` is sufficient per chunk — scene diversity (chunk count) is the
+  bottleneck for generalization, not trajectories per scene. 64 envs provides
+  enough trajectory coverage per maze layout while keeping rendered dataset
+  size manageable (~70 GB for 500 chunks with gzip, vs ~4.5 TB at 1024 envs)
+- `--chunks 500` is the serious target; `--chunks 5` is only for smoke tests
+- `--scene_distribution enclosed` maximises enclosed-maze coverage per chunk
+  when the deployment task is enclosed-maze exploration
 - `--command_policy mixed` keeps open-loop diversity while adding privileged
   maze-teacher trajectories that actually reach dead ends, frontiers, and
   beacons
@@ -980,17 +992,90 @@ python3 scripts/demo_data_quality.py --ckpt <ppo_ckpt>
 
 ### 4. Render the Final Training Dataset
 
-Render the egocentric RGB dataset:
+Rendering egocentric RGB at 224×224 is the slowest step in the pipeline. On AMD
+GPUs the ROCm/HIP backend is extremely slow for rendering (~38 s/env) and the
+safety caps force `workers=1`. **Always use Vulkan** on AMD hardware — it is
+both faster per-env and allows multi-worker parallelism.
+
+Each chunk produces an independent `chunk_NNNN_rgb.h5` file. The renderer
+automatically skips chunks that already have a complete output file (unless
+`--force` is passed), so rendering is fully incremental: you can distribute
+chunks across machines, render in parallel, then merge the outputs.
+
+#### Single-machine render
 
 ```bash
 python3 scripts/2_visual_renderer.py \
   --raw_dir jepa_raw_data \
-  --out_dir jepa_final_dataset
+  --out_dir jepa_final_dataset \
+  --sim_backend vulkan \
+  --workers 4 \
+  --final_vision_compression gzip
 ```
 
-For a fresh render, the output dataset already includes recomputed
-geometry-derived labels, including obstacle-aware beacon visibility. You do not
-need a second relabel pass unless you are reusing an older rendered dataset.
+#### Multi-machine distributed render
+
+For large datasets (500+ chunks), split the raw chunks across machines to
+render in parallel. Each machine only needs the repo, dependencies, and its
+subset of `chunk_*.npz` files.
+
+**Step 1 — distribute raw chunks to render nodes:**
+
+```bash
+# From the primary machine, sync subsets to each render node.
+# Adjust chunk ranges per machine to balance the load.
+
+# Machine B (e.g. 2-GPU node):
+rsync -avP --include='chunk_00[0-1]*.npz' --exclude='chunk_*.npz' \
+  jepa_raw_data/ machineB:~/Workspace/LeWMQuad-v2/jepa_raw_data/
+
+# Machine C (if available):
+rsync -avP --include='chunk_002*.npz' --include='chunk_003*.npz' --exclude='chunk_*.npz' \
+  jepa_raw_data/ machineC:~/Workspace/LeWMQuad-v2/jepa_raw_data/
+```
+
+**Step 2 — render on each node:**
+
+```bash
+# On each render node:
+python3 scripts/2_visual_renderer.py \
+  --raw_dir jepa_raw_data \
+  --out_dir jepa_final_dataset \
+  --sim_backend vulkan \
+  --workers 4
+```
+
+Increase `--workers` if the node has multiple GPUs (e.g. `--workers 8` for a
+2-GPU machine). If Vulkan's default safety cap of 4 workers is too low, add
+`--unsafe_vulkan_parallelism` to override.
+
+**Step 3 — collect rendered outputs back to the primary machine:**
+
+```bash
+# From the primary machine:
+rsync -avP machineB:~/Workspace/LeWMQuad-v2/jepa_final_dataset/chunk_*_rgb.h5 \
+  jepa_final_dataset/
+
+rsync -avP machineC:~/Workspace/LeWMQuad-v2/jepa_final_dataset/chunk_*_rgb.h5 \
+  jepa_final_dataset/
+```
+
+All downstream scripts (training, coverage verification) read every
+`chunk_*_rgb.h5` in the output directory, so no manual stitching is needed.
+
+#### Rough time and size estimates (Vulkan, 224×224, ~11 s/env observed, AMD GPU)
+
+| Chunks | Envs/chunk | Total envs | ~Render time (4w) | ~Size (gzip) |
+|--------|------------|------------|--------------------|--------------|
+| 5      | 64         | 320        | ~1 hr              | ~1 GB        |
+| 500    | 64         | 32,000     | ~4 days (1 machine)| ~70 GB       |
+| 500    | 64 (×2 machines) | 32,000 | ~2.5 days        | ~70 GB       |
+
+Scene diversity (chunk count) matters far more than envs-per-scene for
+generalization. 64 envs per chunk provides enough trajectory coverage per
+maze while keeping storage tractable.
+
+#### Relabel-only mode
 
 If you are reusing existing vision and only want to rebuild labels:
 
@@ -1342,22 +1427,117 @@ defensible training set than 200 chunks across 100 mazes with 200K frames.
 The runbook from the prior section remains the authoritative operational guide.
 The following modifications apply:
 
-#### Step 2 (Serious Raw Data Collection) update
+#### Steps 2+4 (Distributed Data Collection and Rendering)
 
-```bash
-python3 scripts/1_physics_rollout.py \
-  --ckpt <ppo_ckpt> \
-  --steps 1000 \
-  --chunks 500 \
-  --scene_distribution enclosed \
-  --command_policy mixed \
-  --out_dir jepa_raw_data
-```
+The smoke test produces 5 chunks (chunk_0000–chunk_0004) with 1024 envs each.
+These are already rendered and will be included in the final dataset. The full
+run adds 495 more chunks at `--n_envs 64` to reach 500 total distinct scene
+layouts, distributed across available machines for rendering.
+
+Use `--n_envs 64` (not 1024) for the full dataset. Scene diversity (chunk
+count) is the bottleneck for generalization, not envs-per-scene — and 64 envs
+per chunk keeps rendering time tractable across the distributed pipeline.
 
 Use `--scene_distribution enclosed` for the primary dataset when the deployment
 task is enclosed-maze exploration. This ensures every chunk contributes a unique
-enclosed-maze layout. A supplementary `mixed` collection of 100 chunks can be
-merged if composite-scene robustness is also desired.
+enclosed-maze layout.
+
+**Naming convention**: the physics rollout script auto-numbers chunks from 0.
+To avoid overwriting smoke test chunks, use a separate `--out_dir` for each
+batch and merge afterwards, or run the full 500-chunk collection into a fresh
+directory and copy the 5 smoke-test rendered outputs into the final dataset
+(the renderer will skip them).
+
+**Step 1 — Physics rollout (primary machine only)**:
+
+The physics rollout is fast (~minutes per chunk on GPU). Run it on the primary
+machine, then distribute the raw chunks for rendering.
+
+```bash
+python3 scripts/1_physics_rollout.py \
+  --ckpt models/ppo/ckpt_20000.pt \
+  --steps 1000 \
+  --chunks 500 \
+  --n_envs 64 \
+  --scene_distribution enclosed \
+  --command_policy mixed \
+  --out_dir jepa_raw_full
+```
+
+**Step 2 — Distribute raw chunks to render nodes**:
+
+Split 500 chunks across 2 machines (primary + secondary 2-GPU node). The
+smoke test's 5 rendered chunks (from `jepa_final_smoke/`) will be copied into
+the final output — they do not need re-rendering.
+
+```bash
+# On secondary machine (2-GPU node with 6950XT + 9060XT):
+rsync -avP primary:~/Workspace/LeWMQuad-v2/jepa_raw_full/chunk_00{0,1,2,3,4}*.npz \
+  ~/Workspace/LeWMQuad-v2/jepa_raw_full/
+# This gives the secondary machine chunks 0000-0049, 0100-0149, 0200-0249,
+# 0300-0349, 0400-0499 — roughly 250 chunks.
+# Adjust the glob to balance ~250 chunks per machine.
+```
+
+A cleaner split by index ranges:
+
+```bash
+# Secondary machine — gets chunks 250-499:
+rsync -avP primary:~/Workspace/LeWMQuad-v2/jepa_raw_full/ \
+  ~/Workspace/LeWMQuad-v2/jepa_raw_full/ \
+  --include='chunk_0[2-4]*.npz' --exclude='chunk_*.npz'
+
+# Primary machine renders chunks 0000-0249 locally.
+```
+
+**Step 3 — Render on each machine in parallel**:
+
+```bash
+# Primary machine (chunks 0000-0249):
+python3 scripts/2_visual_renderer.py \
+  --raw_dir jepa_raw_full \
+  --out_dir jepa_final_full \
+  --sim_backend vulkan \
+  --workers 4
+
+# Secondary machine (chunks 0250-0499, 2 GPUs → 8 workers):
+python3 scripts/2_visual_renderer.py \
+  --raw_dir jepa_raw_full \
+  --out_dir jepa_final_full \
+  --sim_backend vulkan \
+  --workers 8 \
+  --unsafe_vulkan_parallelism
+```
+
+Each machine only renders chunks present in its `--raw_dir`.
+
+**Step 4 — Collect rendered outputs and merge with smoke test**:
+
+```bash
+# On primary machine:
+rsync -avP secondary:~/Workspace/LeWMQuad-v2/jepa_final_full/chunk_*_rgb.h5 \
+  jepa_final_full/
+
+# Copy smoke-test renders (already complete, 1024-env chunks):
+rsync -avP jepa_final_smoke/chunk_*_rgb.h5 jepa_final_full/
+```
+
+All downstream scripts read every `chunk_*_rgb.h5` in the directory. No manual
+stitching is needed. The smoke test chunks contribute additional training data
+at no extra render cost.
+
+**Time and size estimates (Vulkan, 224×224, AMD GPU, ~11 s/env observed)**:
+
+| Machine | GPUs | Workers | Chunks | Envs/chunk | Total envs | ~Time |
+|---------|------|---------|--------|------------|------------|-------|
+| Primary | 1    | 4       | 250    | 64         | 16,000     | ~12 hrs |
+| Secondary | 2  | 8       | 250    | 64         | 16,000     | ~6 hrs |
+| **Total** |    |         | **500** | **64**    | **32,000** | **~12 hrs** |
+
+Total rendered dataset size with gzip compression: **~70 GB**.
+
+The 5 smoke-test chunks (320 envs at 64/chunk) can be copied into the final
+dataset directory to avoid re-rendering.
 
 #### Step 6 (Train LeWM) addition
 
