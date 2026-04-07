@@ -1298,6 +1298,13 @@ def train_place_head(
         f"  Snippets: {n_snippets:,} | len={snippet_len} | "
         f"positive_radius={args.place_positive_radius} | negative_gap={args.place_negative_gap}"
     )
+    start_stride = max(1, int(args.temporal_stride))
+    positive_radius_raw = int(args.place_positive_radius) * start_stride
+    negative_gap_raw = int(args.place_negative_gap) * start_stride
+    print(
+        f"  Snippet-start stride={start_stride} raw steps "
+        f"(positive<= {positive_radius_raw}, negative>= {negative_gap_raw})"
+    )
 
     head = PlaceSnippetHead(
         latent_dim=args.latent_dim,
@@ -1333,6 +1340,7 @@ def train_place_head(
     for epoch in range(args.place_epochs):
         epoch_loss = 0.0
         epoch_n = 0
+        epoch_triplets = 0
         t0 = time.time()
         head.train()
 
@@ -1348,13 +1356,13 @@ def train_place_head(
                     step = int(start_cpu[idx].item())
                     same_ep = by_episode[ep]
                     same_steps = start_cpu[same_ep]
-                    delta = (same_steps - step).abs()
+                    delta_raw = (same_steps - step).abs()
 
-                    pos_candidates = same_ep[(delta > 0) & (delta <= int(args.place_positive_radius))]
+                    pos_candidates = same_ep[(delta_raw > 0) & (delta_raw <= positive_radius_raw)]
                     if pos_candidates.numel() == 0:
                         continue
 
-                    far_same = same_ep[delta >= int(args.place_negative_gap)]
+                    far_same = same_ep[delta_raw >= negative_gap_raw]
                     if far_same.numel() > 0 and torch.rand(()).item() < 0.5:
                         neg_candidate_pool = far_same
                     else:
@@ -1396,6 +1404,7 @@ def train_place_head(
                 loss_val = float(loss.item())
                 epoch_loss += loss_val
                 epoch_n += 1
+                epoch_triplets += len(valid_anchor)
 
                 with open(csv_path, mode="a", newline="") as f:
                     csv.writer(f).writerow([
@@ -1414,9 +1423,19 @@ def train_place_head(
                         d_an=f"{d_an.detach().mean().item():.3f}",
                     )
 
+        if epoch_n == 0:
+            raise RuntimeError(
+                "PlaceSnippetHead training found zero valid triplets. "
+                "This usually means the positive/negative radius is inconsistent "
+                "with the rollout snippet spacing."
+            )
         scheduler.step()
         avg = epoch_loss / max(1, epoch_n)
-        print(f"  Epoch {epoch + 1} | avg_loss={avg:.6f} | time={time.time() - t0:.0f}s")
+        avg_triplets = epoch_triplets / max(1, epoch_n)
+        print(
+            f"  Epoch {epoch + 1} | avg_loss={avg:.6f} | "
+            f"avg_triplets={avg_triplets:.1f} | time={time.time() - t0:.0f}s"
+        )
 
     torch.save(
         {"place_head_state_dict": head.state_dict(), "epoch": args.place_epochs},
