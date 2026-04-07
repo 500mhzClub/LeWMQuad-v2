@@ -54,6 +54,7 @@ from lewm.math_utils import quat_to_yaw, world_to_body_vec, yaw_to_quat
 from lewm.maze_utils import generate_enclosed_maze
 from lewm.models import (
     ActorCritic,
+    DisplacementHead,
     ExplorationBonus,
     GoalEnergyHead,
     LatentEnergyHead,
@@ -126,8 +127,10 @@ class PlannerHeads:
     goal_head: GoalEnergyHead | None = None
     exploration: ExplorationBonus | None = None
     place_head: PlaceSnippetHead | None = None
+    displacement_head: DisplacementHead | None = None
     goal_weight: float = 0.0
     exploration_weight: float = 0.0
+    displacement_weight: float = 0.0
     safety_weight: float = 1.0
 
 
@@ -358,6 +361,22 @@ class PureCEMPlanner:
                 costs -= terminal_displacement_weight * terminal_displacement
                 metrics["terminal_displacement_bonus"] = terminal_displacement
 
+            if heads is not None and heads.displacement_head is not None:
+                if z0_proj is None:
+                    if heads.displacement_weight > 0.0:
+                        raise ValueError(
+                            "displacement_head requires z_start_proj when displacement_weight > 0.",
+                        )
+                else:
+                    start_proj = z0_proj.expand(self.n_candidates, -1)
+                    predicted_displacement = heads.displacement_head(
+                        start_proj,
+                        z_rollouts_proj[:, -1, :],
+                    )
+                    metrics["predicted_displacement_m"] = predicted_displacement
+                    if heads.displacement_weight > 0.0:
+                        costs -= heads.displacement_weight * predicted_displacement
+
             if self.action_penalty_weight > 0.0:
                 act_penalty = samples.square().sum(dim=(1, 2))
                 costs += self.action_penalty_weight * act_penalty
@@ -466,6 +485,8 @@ def parse_args() -> argparse.Namespace:
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--exploration_weight", type=float, default=None,
                    help="Override learned RND exploration weight from the scorer checkpoint.")
+    p.add_argument("--displacement_weight", type=float, default=None,
+                   help="Override the learned displacement-head bonus weight from the scorer checkpoint.")
     p.add_argument("--exploration_bonus_mode", type=str, default="terminal",
                    choices=["sum", "terminal", "gain", "visited_nn"],
                    help="How to score novelty over predicted rollout latents.")
@@ -749,6 +770,7 @@ def load_planner_heads(
     exploration_dim = int(ckpt.get("exploration_feature_dim", 128))
     place_embedding_dim = int(ckpt.get("place_embedding_dim", 64))
     place_snippet_len = int(ckpt.get("place_snippet_len", 1))
+    displacement_weight = float(ckpt.get("displacement_weight", 0.0))
 
     if ckpt.get("safety_head") is not None:
         safety = LatentEnergyHead(latent_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout).to(device)
@@ -783,17 +805,30 @@ def load_planner_heads(
         place_head.eval()
         heads.place_head = place_head
 
+    if ckpt.get("displacement_head") is not None:
+        displacement_head = DisplacementHead(
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        ).to(device)
+        clean_load_state(displacement_head, ckpt["displacement_head"])
+        displacement_head.eval()
+        heads.displacement_head = displacement_head
+
     heads.goal_weight = float(ckpt.get("goal_weight", 0.0))
     heads.exploration_weight = float(ckpt.get("exploration_weight", 0.0))
+    heads.displacement_weight = displacement_weight
     heads.safety_weight = 1.0
     meta = {
         "has_safety_head": heads.safety_head is not None,
         "has_goal_head": heads.goal_head is not None,
         "has_exploration": heads.exploration is not None,
         "has_place_head": heads.place_head is not None,
+        "has_displacement_head": heads.displacement_head is not None,
         "has_progress_head_ckpt": ckpt.get("progress_head") is not None,
         "goal_weight": heads.goal_weight,
         "exploration_weight": heads.exploration_weight,
+        "displacement_weight": heads.displacement_weight,
         "safety_mode": ckpt.get("safety_mode"),
         "seq_len": ckpt.get("seq_len"),
         "temporal_stride": ckpt.get("temporal_stride"),
@@ -803,10 +838,14 @@ def load_planner_heads(
         "safety_latent_source": ckpt.get("safety_latent_source"),
         "exploration_latent_source": ckpt.get("exploration_latent_source"),
         "place_latent_source": ckpt.get("place_latent_source"),
+        "displacement_latent_source": ckpt.get("displacement_latent_source"),
         "goal_latent_source": ckpt.get("goal_latent_source"),
         "progress_latent_source": ckpt.get("progress_latent_source"),
         "place_snippet_len": ckpt.get("place_snippet_len"),
         "place_embedding_dim": ckpt.get("place_embedding_dim"),
+        "displacement_hops": ckpt.get("displacement_hops"),
+        "displacement_supervision": ckpt.get("displacement_supervision"),
+        "holdout_metrics": ckpt.get("holdout_metrics"),
     }
     return heads, meta
 
@@ -2025,6 +2064,8 @@ def main():
     )
     if args.exploration_weight is not None:
         planner_heads.exploration_weight = float(args.exploration_weight)
+    if args.displacement_weight is not None:
+        planner_heads.displacement_weight = float(args.displacement_weight)
     camera_cfg = ego_camera_config_from_args(args)
 
     print(
@@ -2059,6 +2100,7 @@ def main():
             f"goal={scorer_meta.get('has_goal_head', False)} "
             f"exploration={scorer_meta.get('has_exploration', False)} "
             f"place={scorer_meta.get('has_place_head', False)} "
+            f"displacement={scorer_meta.get('has_displacement_head', False)} "
             f"(seq={scorer_meta.get('seq_len')}, "
             f"stride={scorer_meta.get('temporal_stride')}, "
             f"block={scorer_meta.get('action_block_size')}, "
@@ -2068,16 +2110,20 @@ def main():
             scorer_meta.get("safety_latent_source")
             or scorer_meta.get("exploration_latent_source")
             or scorer_meta.get("place_latent_source")
+            or scorer_meta.get("displacement_latent_source")
         ):
             print(
                 "Scorer latent sources: "
                 f"safety={scorer_meta.get('safety_latent_source', 'unknown')} "
                 f"exploration={scorer_meta.get('exploration_latent_source', 'unknown')} "
                 f"place={scorer_meta.get('place_latent_source', 'unknown')} "
+                f"displacement={scorer_meta.get('displacement_latent_source', 'unknown')} "
                 f"goal={scorer_meta.get('goal_latent_source', 'unknown')}"
             )
         if scorer_meta.get("has_place_head", False) and scorer_meta.get("place_supervision") is not None:
             print(f"Place supervision: {scorer_meta.get('place_supervision')}")
+        if scorer_meta.get("has_displacement_head", False) and scorer_meta.get("displacement_supervision") is not None:
+            print(f"Displacement supervision: {scorer_meta.get('displacement_supervision')}")
         if scorer_meta.get("has_goal_head", False):
             print("Ignoring goal head in scorer checkpoint; the active planner optimizes safety + novelty only.")
     if args.score_space != "proj":
@@ -2130,6 +2176,7 @@ def main():
         print(f"Target: {target_beacon.identity} at ({target_beacon.pos[0]:.2f}, {target_beacon.pos[1]:.2f})")
     objective_name = (
         f"safety+novelty[{args.exploration_bonus_mode}]"
+        + ("+disp_head" if planner_heads.displacement_head is not None and planner_heads.displacement_weight > 0.0 else "")
         + ("+terminal_disp" if args.terminal_displacement_weight > 0.0 else "")
         + ("+safety_gate" if args.exploration_safety_gate_threshold is not None else "")
     )
@@ -2156,6 +2203,7 @@ def main():
           f"GoalSucc={args.success_goal_sim_threshold:.2f}/{args.success_goal_raw_sim_threshold:.2f}, "
           f"ExploreW={planner_heads.exploration_weight:.3f}, "
           f"ExploreMode={args.exploration_bonus_mode}, "
+          f"DispHeadW={planner_heads.displacement_weight:.3f}, "
           f"DispW={args.terminal_displacement_weight:.3f}, "
           f"GateTau={args.exploration_safety_gate_threshold if args.exploration_safety_gate_threshold is not None else 'off'}, "
           f"GateK={args.exploration_safety_gate_sharpness:.3f}"
@@ -2578,6 +2626,8 @@ def main():
                 ]
                 if "revisit_penalty" in plan_metrics_last:
                     progress_parts.append(f"r={plan_metrics_last['revisit_penalty']:.3f}")
+                if "predicted_displacement_m" in plan_metrics_last:
+                    progress_parts.append(f"disp={plan_metrics_last['predicted_displacement_m']:.3f}")
                 if "terminal_displacement_bonus" in plan_metrics_last:
                     progress_parts.append(f"d={plan_metrics_last['terminal_displacement_bonus']:.3f}")
                 if "exploration_safety_gate" in plan_metrics_last:
@@ -2719,6 +2769,7 @@ def main():
             "latent_space": "proj",
             "objective": (
                 f"safety_plus_novelty_{args.exploration_bonus_mode}"
+                + ("_plus_displacement_head" if planner_heads.displacement_head is not None and planner_heads.displacement_weight > 0.0 else "")
                 + ("_plus_terminal_displacement" if args.terminal_displacement_weight > 0.0 else "")
                 + ("_plus_safety_gated_novelty" if args.exploration_safety_gate_threshold is not None else "")
             ),
@@ -2737,6 +2788,8 @@ def main():
             "goal_head_present_ckpt": planner_heads.goal_head is not None,
             "uses_exploration": planner_heads.exploration is not None,
             "exploration_weight": planner_heads.exploration_weight,
+            "uses_displacement_head": planner_heads.displacement_head is not None,
+            "displacement_weight": planner_heads.displacement_weight,
             "exploration_bonus_mode": args.exploration_bonus_mode,
             "visited_nn_k": args.visited_nn_k,
             "visited_nn_margin": args.visited_nn_margin,
@@ -2746,6 +2799,7 @@ def main():
             "audit_plan": bool(args.audit_plan),
             "audit_every": args.audit_every,
             "audit_topk": args.audit_topk,
+            "displacement_weight_override": args.displacement_weight,
             "terminal_displacement_weight": args.terminal_displacement_weight,
             "exploration_safety_gate_threshold": args.exploration_safety_gate_threshold,
             "exploration_safety_gate_sharpness": args.exploration_safety_gate_sharpness,

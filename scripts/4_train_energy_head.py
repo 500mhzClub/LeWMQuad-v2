@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     # Data / encoder
     p.add_argument("--data_dir", type=str, default="jepa_final_dataset")
     p.add_argument("--raw_data_dir", type=str, default=None,
-                   help="Optional directory with raw chunk_*.npz rollouts for pose-supervised place training.")
+                   help="Optional directory with raw chunk_*.npz rollouts for pose-supervised place/displacement training.")
     p.add_argument("--checkpoint", type=str, required=True,
                    help="Path to trained LeWM checkpoint.")
     p.add_argument("--device", type=str, default="cuda")
@@ -994,6 +994,261 @@ def evaluate_place_head(
     return metrics
 
 
+def build_displacement_pairs(
+    z_enc: torch.Tensor,
+    enc_episode_id: torch.Tensor,
+    enc_obs_step: torch.Tensor,
+    enc_robot_xy: torch.Tensor,
+    z_rollout: torch.Tensor,
+    rollout_episode_id: torch.Tensor,
+    rollout_obs_step: torch.Tensor,
+    rollout_robot_xy: torch.Tensor,
+    displacement_hops: int,
+    temporal_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pair current encoder latents with future rollout latents plus XY targets.
+
+    The future rollout latent is aligned to the real observation at
+    ``obs_step + displacement_hops * temporal_stride``, which makes the target
+    directly comparable to planner terminal states scored in projected latent
+    space.
+    """
+    if displacement_hops <= 0:
+        raise ValueError(f"displacement_hops must be positive, got {displacement_hops}")
+
+    def _dedup_bank(
+        z_bank: torch.Tensor,
+        episode_id: torch.Tensor,
+        obs_step: torch.Tensor,
+        robot_xy: torch.Tensor,
+    ) -> dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]:
+        per_episode: dict[int, dict[int, tuple[torch.Tensor, int, torch.Tensor, int]]] = {}
+        for idx in range(int(z_bank.shape[0])):
+            ep = int(episode_id[idx].item())
+            step = int(obs_step[idx].item())
+            if ep < 0 or step < 0:
+                continue
+            xy = robot_xy[idx]
+            if xy.numel() != 2 or not torch.isfinite(xy).all():
+                continue
+            ep_map = per_episode.setdefault(ep, {})
+            if step not in ep_map:
+                ep_map[step] = (z_bank[idx].clone(), 1, xy.clone(), 1)
+            else:
+                z_accum, z_count, xy_accum, xy_count = ep_map[step]
+                ep_map[step] = (
+                    z_accum + z_bank[idx],
+                    z_count + 1,
+                    xy_accum + xy,
+                    xy_count + 1,
+                )
+
+        dedup: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        for ep, step_map in per_episode.items():
+            dedup[ep] = {
+                step: (
+                    z_accum / float(z_count),
+                    xy_accum / float(xy_count),
+                )
+                for step, (z_accum, z_count, xy_accum, xy_count) in step_map.items()
+            }
+        return dedup
+
+    current_bank = _dedup_bank(z_enc, enc_episode_id, enc_obs_step, enc_robot_xy)
+    future_bank = _dedup_bank(z_rollout, rollout_episode_id, rollout_obs_step, rollout_robot_xy)
+    raw_step_delta = int(displacement_hops) * int(temporal_stride)
+
+    z_now_pairs: list[torch.Tensor] = []
+    z_future_pairs: list[torch.Tensor] = []
+    target_disp_pairs: list[torch.Tensor] = []
+    for ep, cur_steps in current_bank.items():
+        fut_steps = future_bank.get(ep)
+        if not fut_steps:
+            continue
+        for cur_step, (z_now, xy_now) in cur_steps.items():
+            target_step = cur_step + raw_step_delta
+            if target_step not in fut_steps:
+                continue
+            z_future, xy_future = fut_steps[target_step]
+            disp_m = torch.linalg.vector_norm((xy_future - xy_now).to(dtype=torch.float32), ord=2)
+            z_now_pairs.append(z_now.to(dtype=torch.float32))
+            z_future_pairs.append(z_future.to(dtype=torch.float32))
+            target_disp_pairs.append(disp_m.reshape(1))
+
+    if not z_now_pairs:
+        raise ValueError(
+            "No valid encoder->future rollout displacement pairs were found. "
+            "Check that pose metadata exists and displacement_hops is compatible "
+            "with the cached temporal stride."
+        )
+
+    return (
+        torch.stack(z_now_pairs, dim=0),
+        torch.stack(z_future_pairs, dim=0),
+        torch.cat(target_disp_pairs, dim=0),
+    )
+
+
+def train_displacement_head(
+    args,
+    z_now_pairs: torch.Tensor,
+    z_future_pairs: torch.Tensor,
+    target_disp_pairs: torch.Tensor,
+    device,
+):
+    print("\n" + "=" * 60)
+    print("Phase 7: Training DisplacementHead (pose-supervised mobility)")
+    print("=" * 60)
+    print(
+        f"  Pairs: {int(target_disp_pairs.numel()):,} | "
+        f"hops={int(args.displacement_hops)} | "
+        f"target_mean={float(target_disp_pairs.mean().item()):.3f}m"
+    )
+
+    dataset = TensorDataset(
+        z_now_pairs.to(dtype=torch.float32),
+        z_future_pairs.to(dtype=torch.float32),
+        target_disp_pairs.to(dtype=torch.float32),
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.displacement_batch_size)),
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+    )
+    print(f"  {len(dataloader)} batches of {max(1, int(args.displacement_batch_size))}")
+
+    head = DisplacementHead(
+        latent_dim=args.latent_dim,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+    ).to(device)
+    head = torch.compile(head)
+    print(f"  Parameters: {sum(p.numel() for p in head.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=args.displacement_lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.displacement_epochs)
+
+    csv_path = os.path.join(args.log_dir, "displacement_head_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode="w", newline="") as f:
+            csv.writer(f).writerow(["step", "epoch", "loss", "pred_mean_m", "target_mean_m", "lr"])
+
+    global_step = 0
+    for epoch in range(args.displacement_epochs):
+        epoch_loss = 0.0
+        epoch_n = 0
+        t0 = time.time()
+        head.train()
+
+        with make_progress(args, dataloader, desc=f"  Disp {epoch + 1}/{args.displacement_epochs}") as pbar:
+            for z_now_batch, z_future_batch, target_batch in pbar:
+                z_now_batch = z_now_batch.to(device, non_blocking=True)
+                z_future_batch = z_future_batch.to(device, non_blocking=True)
+                target_batch = target_batch.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                pred = head(z_now_batch, z_future_batch)
+                loss = F.mse_loss(pred, target_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(head.parameters(), max_norm=args.grad_clip)
+                optimizer.step()
+
+                global_step += 1
+                loss_val = float(loss.item())
+                epoch_loss += loss_val
+                epoch_n += 1
+
+                with open(csv_path, mode="a", newline="") as f:
+                    csv.writer(f).writerow([
+                        global_step,
+                        epoch + 1,
+                        f"{loss_val:.6f}",
+                        f"{pred.detach().mean().item():.6f}",
+                        f"{target_batch.detach().mean().item():.6f}",
+                        f"{optimizer.param_groups[0]['lr']:.2e}",
+                    ])
+
+                if global_step % 5 == 0:
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        pred=f"{pred.detach().mean().item():.3f}",
+                        target=f"{target_batch.detach().mean().item():.3f}",
+                    )
+
+        scheduler.step()
+        avg = epoch_loss / max(1, epoch_n)
+        print(f"  Epoch {epoch + 1} | avg_loss={avg:.6f} | time={time.time() - t0:.0f}s")
+
+    torch.save(
+        {"displacement_head_state_dict": head.state_dict(), "epoch": args.displacement_epochs},
+        os.path.join(args.out_dir, "displacement_head.pt"),
+    )
+    print("  Displacement head training complete.")
+    return head
+
+
+def evaluate_displacement_head(
+    args,
+    head: nn.Module,
+    z_now_pairs: torch.Tensor,
+    z_future_pairs: torch.Tensor,
+    target_disp_pairs: torch.Tensor,
+    device,
+) -> dict[str, float] | None:
+    if target_disp_pairs.numel() == 0:
+        return None
+
+    dataset = TensorDataset(z_now_pairs, z_future_pairs, target_disp_pairs)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(args.eval_batch_size)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    preds_all: list[torch.Tensor] = []
+    target_all: list[torch.Tensor] = []
+    head.eval()
+    with torch.inference_mode():
+        for z_now_batch, z_future_batch, target_batch in dataloader:
+            z_now_batch = z_now_batch.to(device, non_blocking=True)
+            z_future_batch = z_future_batch.to(device, non_blocking=True)
+            pred = head(z_now_batch, z_future_batch).float().cpu()
+            preds_all.append(pred)
+            target_all.append(target_batch.float().cpu())
+
+    pred = torch.cat(preds_all)
+    target = torch.cat(target_all)
+    mse = float((pred - target).square().mean().item())
+    metrics = {
+        "mse": mse,
+        "rmse": math.sqrt(max(0.0, mse)),
+        "mae": float((pred - target).abs().mean().item()),
+        "pearson": pearson_corrcoef(pred, target),
+        "pred_mean_m": float(pred.mean().item()),
+        "target_mean_m": float(target.mean().item()),
+        "n_eval": int(target.numel()),
+    }
+    print(
+        "  Held-out displacement | "
+        f"n={metrics['n_eval']:,} "
+        f"rmse={metrics['rmse']:.4f}m "
+        f"mae={metrics['mae']:.4f}m "
+        f"pearson={metrics['pearson']:.3f} "
+        f"pred={metrics['pred_mean_m']:.3f}m "
+        f"target={metrics['target_mean_m']:.3f}m"
+    )
+    return metrics
+
+
 def build_goal_latent_pools(
     z_all: torch.Tensor,
     beacon_identity: torch.Tensor,
@@ -1899,6 +2154,9 @@ def train(args):
     z_enc = latent_views["encoder"]["z"]
     beacon_id_enc = latent_views["encoder"]["beacon_identity"]
     beacon_range_enc = latent_views["encoder"]["beacon_range"]
+    enc_episode_id = latent_views["encoder"]["episode_id"]
+    enc_obs_step = latent_views["encoder"]["obs_step"]
+    enc_robot_xy = latent_views["encoder"]["robot_xy"]
     z_rollout = latent_views["rollout"]["z"]
     safety_target_rollout = latent_views["rollout"]["safety_target"]
     rollout_collisions = latent_views["rollout"]["collisions"]
@@ -1916,6 +2174,14 @@ def train(args):
     rollout_collisions_eval = torch.empty((0,), dtype=torch.float32)
     z_rollout_eval = torch.empty((0, z_rollout.shape[-1]), dtype=z_rollout.dtype)
     safety_target_eval = torch.empty((0,), dtype=safety_target_rollout.dtype)
+    z_enc_train = z_enc
+    enc_episode_id_train = enc_episode_id
+    enc_obs_step_train = enc_obs_step
+    enc_robot_xy_train = enc_robot_xy
+    z_enc_eval = torch.empty((0, z_enc.shape[-1]), dtype=z_enc.dtype)
+    enc_episode_id_eval = torch.empty((0,), dtype=enc_episode_id.dtype)
+    enc_obs_step_eval = torch.empty((0,), dtype=enc_obs_step.dtype)
+    enc_robot_xy_eval = torch.empty((0, 2), dtype=enc_robot_xy.dtype)
     rollout_episode_id_train = rollout_episode_id
     rollout_obs_step_train = rollout_obs_step
     rollout_robot_xy_train = rollout_robot_xy
@@ -1943,6 +2209,21 @@ def train(args):
             rollout_episode_id_eval = rollout_episode_id[eval_mask]
             rollout_obs_step_eval = rollout_obs_step[eval_mask]
             rollout_robot_xy_eval = rollout_robot_xy[eval_mask]
+            eval_eps = torch.unique(rollout_episode_id_eval[rollout_episode_id_eval >= 0], sorted=True)
+            if eval_eps.numel() > 0:
+                enc_valid = enc_episode_id >= 0
+                enc_eval_mask = enc_valid & torch.isin(enc_episode_id, eval_eps)
+                enc_train_mask = enc_valid & (~enc_eval_mask)
+                if torch.any(enc_train_mask):
+                    z_enc_train = z_enc[enc_train_mask]
+                    enc_episode_id_train = enc_episode_id[enc_train_mask]
+                    enc_obs_step_train = enc_obs_step[enc_train_mask]
+                    enc_robot_xy_train = enc_robot_xy[enc_train_mask]
+                if torch.any(enc_eval_mask):
+                    z_enc_eval = z_enc[enc_eval_mask]
+                    enc_episode_id_eval = enc_episode_id[enc_eval_mask]
+                    enc_obs_step_eval = enc_obs_step[enc_eval_mask]
+                    enc_robot_xy_eval = enc_robot_xy[enc_eval_mask]
             print(
                 "Held-out eval split: "
                 f"episodes train/eval={split_info['n_train_episodes']}/{split_info['n_eval_episodes']} "
@@ -2025,6 +2306,60 @@ def train(args):
                 if metrics is not None:
                     holdout_metrics["place"] = metrics
 
+    # Phase 7: displacement head
+    displacement_head = None
+    if not args.skip_displacement:
+        try:
+            z_now_disp_train, z_future_disp_train, target_disp_train = build_displacement_pairs(
+                z_enc_train,
+                enc_episode_id_train,
+                enc_obs_step_train,
+                enc_robot_xy_train,
+                z_rollout_train,
+                rollout_episode_id_train,
+                rollout_obs_step_train,
+                rollout_robot_xy_train,
+                displacement_hops=int(args.displacement_hops),
+                temporal_stride=int(args.temporal_stride),
+            )
+        except ValueError as exc:
+            print(f"  Skipping displacement head: {exc}")
+        else:
+            displacement_head = train_displacement_head(
+                args,
+                z_now_disp_train,
+                z_future_disp_train,
+                target_disp_train,
+                device,
+            )
+            if z_enc_eval.numel() > 0 and z_rollout_eval.numel() > 0:
+                try:
+                    z_now_disp_eval, z_future_disp_eval, target_disp_eval = build_displacement_pairs(
+                        z_enc_eval,
+                        enc_episode_id_eval,
+                        enc_obs_step_eval,
+                        enc_robot_xy_eval,
+                        z_rollout_eval,
+                        rollout_episode_id_eval,
+                        rollout_obs_step_eval,
+                        rollout_robot_xy_eval,
+                        displacement_hops=int(args.displacement_hops),
+                        temporal_stride=int(args.temporal_stride),
+                    )
+                except ValueError:
+                    z_now_disp_eval = None
+                if z_now_disp_eval is not None:
+                    metrics = evaluate_displacement_head(
+                        args,
+                        displacement_head,
+                        z_now_disp_eval,
+                        z_future_disp_eval,
+                        target_disp_eval,
+                        device,
+                    )
+                    if metrics is not None:
+                        holdout_metrics["displacement"] = metrics
+
     # Save combined TrajectoryScorer checkpoint
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
     scorer_data = {
@@ -2033,9 +2368,12 @@ def train(args):
         "progress_head": progress_head.state_dict() if progress_head is not None else None,
         "exploration": exploration.state_dict() if exploration is not None else None,
         "place_head": place_head.state_dict() if place_head is not None else None,
+        "displacement_head": displacement_head.state_dict() if displacement_head is not None else None,
         "goal_weight": args.goal_weight,
         "progress_weight": args.progress_weight,
         "exploration_weight": args.exploration_weight,
+        "displacement_weight": args.displacement_weight,
+        "displacement_hops": args.displacement_hops,
         "latent_dim": args.latent_dim,
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
@@ -2046,10 +2384,16 @@ def train(args):
         "safety_latent_source": "pred_projector_teacher_forced",
         "exploration_latent_source": "pred_projector_teacher_forced",
         "place_latent_source": "pred_projector_teacher_forced_snippet",
+        "displacement_latent_source": "enc_projector_to_pred_projector_teacher_forced",
         "place_supervision": (
             "pose_xy_same_episode"
             if args.raw_data_dir is not None
             else "temporal_proxy"
+        ),
+        "displacement_supervision": (
+            "pose_xy_delta_same_episode"
+            if args.raw_data_dir is not None
+            else None
         ),
         "goal_latent_source": "enc_projector",
         "progress_latent_source": "enc_projector",
