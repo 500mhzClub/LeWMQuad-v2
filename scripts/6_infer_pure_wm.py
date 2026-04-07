@@ -247,19 +247,23 @@ class PureCEMPlanner:
                 if exploration_bonus_mode == "visited_nn":
                     tail_steps = min(max(1, int(visited_rollout_tail_steps)), horizon)
                     tail_z = z_rollouts_proj[:, -tail_steps:, :]
-                    tail_dist = visited_rollout_bank_novelty(
-                        tail_z.reshape(n_cand * tail_steps, latent_dim),
-                        visited_rollout_bank,
-                        k=visited_rollout_knn_k,
-                    ).reshape(n_cand, tail_steps)
+                    if tail_steps > 1:
+                        tail_dist = visited_rollout_snippet_novelty(
+                            tail_z,
+                            visited_rollout_bank,
+                            k=visited_rollout_knn_k,
+                        )
+                    else:
+                        tail_dist = visited_rollout_bank_novelty(
+                            tail_z[:, -1, :],
+                            visited_rollout_bank,
+                            k=visited_rollout_knn_k,
+                        )
                     tail_margin = tail_dist - float(visited_rollout_margin)
-                    tail_bonus = tail_margin.clamp_min(0.0)
-                    # Require the rollout tail to stay novel, not just the
-                    # final frame to spike on a slightly different local view.
-                    bonus = tail_bonus.min(dim=1).values
-                    metrics["visited_nn_distance"] = tail_dist.mean(dim=1)
+                    bonus = tail_margin.clamp_min(0.0)
+                    metrics["visited_nn_distance"] = tail_dist
                     if visited_revisit_penalty_weight > 0.0:
-                        revisit_penalty = (-tail_margin).clamp_min(0.0).mean(dim=1)
+                        revisit_penalty = (-tail_margin).clamp_min(0.0)
                         costs += visited_revisit_penalty_weight * revisit_penalty
                         metrics["revisit_penalty"] = revisit_penalty
                 elif exploration_bonus_mode == "sum":
@@ -992,6 +996,39 @@ def visited_rollout_bank_novelty(
     ).to(device=query_z.device, dtype=query_z.dtype)
     dists = (query_z.unsqueeze(1) - bank.unsqueeze(0)).square().mean(dim=-1)
     k_eff = min(max(1, int(k)), int(bank.shape[0]))
+    return torch.topk(dists, k=k_eff, largest=False, dim=1).values.mean(dim=1)
+
+
+@torch.no_grad()
+def visited_rollout_snippet_novelty(
+    query_seq: torch.Tensor,
+    visited_bank: list[torch.Tensor] | None,
+    k: int = 8,
+) -> torch.Tensor:
+    """Novelty from kNN distance against executed rollout snippets.
+
+    Args:
+        query_seq: (B, T, D) rollout tail snippets.
+        visited_bank: list of executed rollout latents, each (D,).
+        k: number of nearest snippets to average.
+
+    Returns:
+        (B,) mean squared distance to the k nearest executed snippets.
+    """
+    if not visited_bank:
+        return torch.zeros(query_seq.shape[0], device=query_seq.device, dtype=query_seq.dtype)
+
+    tail_steps = int(query_seq.shape[1])
+    if len(visited_bank) < tail_steps:
+        return torch.zeros(query_seq.shape[0], device=query_seq.device, dtype=query_seq.dtype)
+
+    bank = torch.stack(
+        [z.reshape(-1) for z in visited_bank],
+        dim=0,
+    ).to(device=query_seq.device, dtype=query_seq.dtype)
+    bank_seq = bank.unfold(0, tail_steps, 1).permute(0, 2, 1).contiguous()
+    dists = (query_seq.unsqueeze(1) - bank_seq.unsqueeze(0)).square().mean(dim=(2, 3))
+    k_eff = min(max(1, int(k)), int(bank_seq.shape[0]))
     return torch.topk(dists, k=k_eff, largest=False, dim=1).values.mean(dim=1)
 
 
