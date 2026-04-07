@@ -2309,7 +2309,7 @@ def main():
                         "mode": mode,
                         "state_before": {
                             "pos_xy": [float(obs["pos_np"][0]), float(obs["pos_np"][1])],
-                            "yaw_rad": float(obs["yaw"]),
+                            "yaw_rad": float(obs["yaw_rad"]),
                             "goal_dist_m": audit_start_goal_dist,
                             "coverage_area_m2": (
                                 None if audit_start_cov_area is None else float(audit_start_cov_area)
@@ -2434,7 +2434,7 @@ def main():
                 start_cov_area = start_state["coverage_area_m2"]
                 pending_plan_audit["actual_after_first_command"] = {
                     "pos_xy": [float(cur_xy[0]), float(cur_xy[1])],
-                    "yaw_rad": float(obs["yaw"]),
+                    "yaw_rad": float(obs["yaw_rad"]),
                     "xy_displacement_m": float(math.hypot(
                         cur_xy[0] - start_state["pos_xy"][0],
                         cur_xy[1] - start_state["pos_xy"][1],
