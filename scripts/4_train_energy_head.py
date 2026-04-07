@@ -42,6 +42,7 @@ if REPO_ROOT not in sys.path:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset, TensorDataset
