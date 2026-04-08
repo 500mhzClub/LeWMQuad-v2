@@ -270,6 +270,15 @@ def render_worker(args_tuple):
 
     N_subset = end_env - start_env
 
+    # Pin worker to a specific GPU via round-robin over available DRM render nodes.
+    drm_nodes = sorted(glob.glob("/dev/dri/renderD*"))
+    if len(drm_nodes) > 1:
+        gpu_idx = worker_id % len(drm_nodes)
+        os.environ["DRI_PRIME"] = str(gpu_idx)            # Mesa GL + Vulkan
+        os.environ["GPU_DEVICE_ORDINAL"] = str(gpu_idx)   # ROCm/HIP
+        os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_idx)  # HIP compute
+        print(f"[worker {worker_id}] Pinned to GPU {gpu_idx} ({drm_nodes[gpu_idx]})", flush=True)
+
     # Skip if already fully rendered
     if os.path.exists(tmp_file):
         try:
