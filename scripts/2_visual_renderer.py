@@ -152,6 +152,42 @@ def is_rocm_runtime() -> bool:
     return bool(getattr(getattr(torch, "version", None), "hip", None))
 
 
+def has_amd_drm_device() -> bool:
+    """Best-effort host check for an AMD GPU exposed through DRM/sysfs."""
+    vendor_paths = sorted(set(
+        glob.glob("/sys/class/drm/card*/device/vendor") +
+        glob.glob("/sys/class/drm/renderD*/device/vendor")
+    ))
+    for vendor_path in vendor_paths:
+        try:
+            with open(vendor_path, "r", encoding="utf-8") as f:
+                vendor = f.read().strip().lower()
+        except OSError:
+            continue
+        if vendor == "0x1002":
+            return True
+    return False
+
+
+def likely_hip_allocator_runtime() -> bool:
+    """Detect hosts where Genesis may still route allocations through HIP."""
+    if is_rocm_runtime():
+        return True
+    if has_amd_drm_device():
+        return True
+    for env_name in (
+        "ROCM_PATH",
+        "ROCM_HOME",
+        "HIP_PATH",
+        "HSA_PATH",
+        "ROCR_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+    ):
+        if os.getenv(env_name):
+            return True
+    return False
+
+
 def apply_visual_domain_randomization(rgb: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
     """Apply per-frame visual domain randomization to an (H, W, 3) uint8 image."""
     img = rgb.astype(np.float32) / 255.0
@@ -707,18 +743,19 @@ def main():
     effective_texture_variants = max(1, int(args.texture_variants_per_worker))
     backend_name = args.sim_backend.lower().strip()
     unsafe_parallelism = args.unsafe_backend_parallelism or args.unsafe_vulkan_parallelism
-    rocm_runtime = is_rocm_runtime()
+    hip_allocator_runtime = likely_hip_allocator_runtime()
 
     if backend_name != "cpu" and not unsafe_parallelism:
-        if rocm_runtime:
+        if hip_allocator_runtime:
             # Genesis scene.build() still allocates rigid/SDF buffers through HIP on
-            # ROCm, even when the requested backend is Vulkan. Mixed-GPU AMD hosts
-            # have proven especially fragile here, so serialize worker startup.
+            # some AMD/ROCm hosts, even when the requested backend is Vulkan.
+            # Mixed-GPU AMD machines have proven especially fragile here, so
+            # serialize worker startup whenever the host looks HIP-capable.
             capped_workers = min(effective_workers, HIP_SAFE_WORKER_LIMIT)
             capped_variants = min(effective_texture_variants, HIP_SAFE_TEXTURE_VARIANT_LIMIT)
             if (capped_workers, capped_variants) != (effective_workers, effective_texture_variants):
                 tqdm.write(
-                    f"ROCm/AMDGPU safety caps applied: workers {effective_workers}->{capped_workers}, "
+                    f"AMD/HIP safety caps applied: workers {effective_workers}->{capped_workers}, "
                     f"texture_variants {effective_texture_variants}->{capped_variants}. "
                     "Genesis may still touch the HIP allocator even with --sim_backend vulkan. "
                     "Use --unsafe_backend_parallelism to override."
@@ -876,14 +913,14 @@ def main():
                         except Exception:
                             pass
 
-                    should_retry_on_cpu = rocm_runtime and backend_name != "cpu" and not unsafe_parallelism
+                    should_retry_on_cpu = backend_name != "cpu" and not unsafe_parallelism
                     if should_retry_on_cpu:
                         cpu_retry_attempted = True
                         if envs_received:
                             pbar.update(-envs_received)
                         tqdm.write(
-                            f"{chunk_name}: backend={args.sim_backend} failed during worker startup "
-                            "on ROCm; retrying serially on CPU."
+                            f"{chunk_name}: backend={args.sim_backend} failed during worker startup; "
+                            "retrying serially on CPU."
                         )
                         pbar.set_description(f"{chunk_label}  cpu-retry...")
                         tasks, tmp_files = build_chunk_tasks(1, "cpu", 1)
