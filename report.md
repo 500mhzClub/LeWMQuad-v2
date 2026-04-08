@@ -1085,10 +1085,10 @@ python3 scripts/demo_data_quality.py --ckpt <ppo_ckpt>
 
 Rendering egocentric RGB at 224×224 is the slowest step in the pipeline. On AMD
 GPUs the ROCm/HIP backend is extremely slow for rendering (~38 s/env). Vulkan
-is still the preferred render backend on AMD hardware, but recent mixed-GPU
-ROCm hosts can still hit HIP allocator failures during `scene.build()`. The
-renderer now caps AMD/ROCm render jobs to `workers=1` by default and will retry
-a failed chunk on serial CPU before aborting. Only use
+is still the preferred render backend on AMD hardware, but some ROCm hosts can
+still hit HIP allocator failures during `scene.build()`. The renderer caps
+detected ROCm render jobs to `workers=1` by default and will retry a failed
+chunk on serial CPU before aborting. Only use
 `--unsafe_backend_parallelism` if multi-worker Vulkan is already known stable on
 that machine.
 
