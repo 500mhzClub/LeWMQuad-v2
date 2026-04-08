@@ -902,53 +902,144 @@ If you change those values, change them consistently in:
 
 ### 1. Optional Smoke Test
 
-Before the serious run, do one small end-to-end smoke test:
+Before the serious run, do one small end-to-end smoke test to catch shape,
+metadata, and path issues. Do not treat the `--chunks 5` run as a real
+training dataset, but its rendered outputs can be merged into the full dataset
+later to avoid re-rendering.
 
 ```bash
+# Physics rollout (~7 min, 5 chunks × 64 envs, ~16 MB each)
 python3 scripts/1_physics_rollout.py \
-  --ckpt <ppo_ckpt> \
+  --ckpt models/ppo/ckpt_20000.pt \
   --steps 1000 \
   --chunks 5 \
   --n_envs 64 \
   --scene_distribution enclosed \
   --command_policy mixed \
-  --out_dir jepa_raw_smoke
+  --out_dir /media/andrewknowles/Scratch/jepa_raw_smoke
 
+# Render (~1.5 hrs, 320 envs at ~16 s/env with 4 Vulkan workers)
 python3 scripts/2_visual_renderer.py \
-  --raw_dir jepa_raw_smoke \
-  --out_dir jepa_final_smoke \
+  --raw_dir /media/andrewknowles/Scratch/jepa_raw_smoke \
+  --out_dir /media/andrewknowles/Scratch/jepa_final_smoke \
   --sim_backend vulkan \
   --workers 4 \
   --final_vision_compression gzip
+
+# Repack gzip → uncompressed for fast training (~2.5 min)
+python3 scripts/repack_h5_vision.py \
+  --data_dir /media/andrewknowles/Scratch/jepa_final_smoke \
+  --compression none
+
+# Train LeWM (5 epochs, ~2.5 min/epoch = ~13 min)
+python3 scripts/3_train_lewm.py \
+  --data_dir /media/andrewknowles/Scratch/jepa_final_smoke \
+  --device cuda \
+  --epochs 5 \
+  --batch_size 128 \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --sigreg_lambda 0.09 \
+  --command_representation active_block \
+  --out_dir /media/andrewknowles/Scratch/lewm_smoke_ckpts \
+  --log_dir /media/andrewknowles/Scratch/lewm_smoke_logs
+
+# Train planning heads (~2 min)
+python3 scripts/4_train_energy_head.py \
+  --data_dir /media/andrewknowles/Scratch/jepa_final_smoke \
+  --raw_data_dir /media/andrewknowles/Scratch/jepa_raw_smoke \
+  --checkpoint /media/andrewknowles/Scratch/lewm_smoke_ckpts/epoch_5.pt \
+  --device cuda \
+  --seq_len 4 \
+  --temporal_stride 5 \
+  --action_block_size 5 \
+  --window_stride 5 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --out_dir /media/andrewknowles/Scratch/energy_smoke_ckpts \
+  --log_dir /media/andrewknowles/Scratch/energy_smoke_logs \
+  --safety_mode proximity \
+  --epochs 5 \
+  --skip_goal \
+  --skip_progress \
+  --exploration_epochs 3 \
+  --coverage_gain_weight 0.5 \
+  --escape_frontier_weight 1.0 \
+  --eval_split_group scene \
+  --exploration_weight 1.0 \
+  --ar_finetune_epochs 2 \
+  --ar_finetune_lr 1e-4 \
+  --ar_finetune_horizon 3
+
+# Inference sanity check
+python3 scripts/6_infer_pure_wm.py \
+  --ppo_ckpt models/ppo/ckpt_20000.pt \
+  --wm_ckpt /media/andrewknowles/Scratch/lewm_smoke_ckpts/epoch_5.pt \
+  --scorer_ckpt /media/andrewknowles/Scratch/energy_smoke_ckpts/trajectory_scorer.pt \
+  --seed 42 \
+  --steps 200 \
+  --macro_action_repeat 5 \
+  --mpc_execute 1 \
+  --cem_iters 10 \
+  --planner_action_space primitives \
+  --memory_router_mode keyframe \
+  --route_progress_weight 7.0 \
+  --rnd_online_lr 1e-3 \
+  --audit_plan \
+  --audit_every 1 \
+  --audit_topk 5 \
+  --out_dir /media/andrewknowles/Scratch/inference_smoke_s42
 ```
 
-Then run one short epoch of LeWM and one short inference run just to catch
-shape, metadata, and path issues. Do not treat the `--chunks 5` run as a real
-training dataset, but its rendered outputs can be merged into the full dataset
-later to avoid re-rendering.
+#### Smoke test observations (2026-04-07)
+
+The full smoke pipeline completed successfully on an RX 7900 XTX:
+
+- **Physics**: 5 chunks in 7 min. Maze sizes ranged from 4x4 to 7x6 with
+  12-28 obstacles. `safe_clearance=0.18` resolved all spawn-point failures
+  from earlier runs (original 0.40 was too large for enclosed maze corridors).
+- **Render**: 320 envs in 1h25m (~16 s/env, 4 Vulkan workers). Camera
+  depth-clipping was handled by retraction — zero frame substitutions. Some
+  envs near walls showed 100-260 depth-clipped frames out of 1000.
+- **Repack**: gzip→none in 2.5 min (6.2 GB → 9.6 GB per chunk, 48 GB total).
+  Without repacking, gzip decompression bottlenecked training at ~13 s/batch.
+- **LeWM training**: 5 epochs in 13 min at 2.9 it/s. Train loss 2.00→0.88.
+  Multi-step AR ratio s3/s1 = 1.12 at epoch 5 (well under 3.0 threshold).
+- **Head training**: All phases completed in ~2 min. Safety head held-out
+  collision AUC = 0.568. Place head R@1 = 0.948. Escape/frontier pearson =
+  0.469. Phase 10 AR finetuning ran on 173k safety and 57k escape samples.
+- **Inference**: Pipeline ran without errors on the smoke model.
 
 ### 2. Serious Raw Data Collection
 
 Collect a fresh rollout dataset with many chunk seeds and the mixed maze
-teacher:
+teacher (~11 hours for 500 chunks at ~80 s/chunk):
 
 ```bash
 python3 scripts/1_physics_rollout.py \
-  --ckpt <ppo_ckpt> \
+  --ckpt models/ppo/ckpt_20000.pt \
   --steps 1000 \
   --chunks 500 \
   --n_envs 64 \
   --scene_distribution enclosed \
   --command_policy mixed \
-  --out_dir jepa_raw_data
+  --out_dir /media/andrewknowles/Scratch/jepa_raw_full
 ```
+
+Each chunk is ~16 MB, so the full raw dataset is ~8 GB. Storage is not a
+concern at this stage.
 
 Important current assumptions:
 
 - `--n_envs 64` is sufficient per chunk — scene diversity (chunk count) is the
   bottleneck for generalization, not trajectories per scene. 64 envs provides
   enough trajectory coverage per maze layout while keeping rendered dataset
-  size manageable (~70 GB for 500 chunks with gzip, vs ~4.5 TB at 1024 envs)
+  size manageable (~70 GB gzip / ~480 GB uncompressed for 500 chunks, vs
+  ~4.5 TB at 1024 envs)
 - `--chunks 500` is the serious target; `--chunks 5` is only for smoke tests
 - `--scene_distribution enclosed` maximises enclosed-maze coverage per chunk
   when the deployment task is enclosed-maze exploration
@@ -964,12 +1055,12 @@ Run the dataset summary immediately after collection:
 
 ```bash
 python3 scripts/summarize_dataset_coverage.py \
-  --raw_dir jepa_raw_data \
+  --raw_dir /media/andrewknowles/Scratch/jepa_raw_full \
   --seq_len 4 \
   --temporal_stride 5 \
   --action_block_size 5 \
   --window_stride 5 \
-  --out reports/jepa_raw_data_coverage.json
+  --out reports/jepa_raw_full_coverage.json
 ```
 
 Read the report before moving on. At minimum, confirm that:
@@ -995,81 +1086,56 @@ python3 scripts/demo_data_quality.py --ckpt <ppo_ckpt>
 Rendering egocentric RGB at 224×224 is the slowest step in the pipeline. On AMD
 GPUs the ROCm/HIP backend is extremely slow for rendering (~38 s/env) and the
 safety caps force `workers=1`. **Always use Vulkan** on AMD hardware — it is
-both faster per-env and allows multi-worker parallelism.
+both faster per-env (~16 s/env observed) and allows multi-worker parallelism
+(4 workers by default).
 
 Each chunk produces an independent `chunk_NNNN_rgb.h5` file. The renderer
 automatically skips chunks that already have a complete output file (unless
-`--force` is passed), so rendering is fully incremental: you can distribute
-chunks across machines, render in parallel, then merge the outputs.
+`--force` is passed), so rendering is fully incremental and crash-safe.
 
-#### Single-machine render
+#### Render with gzip compression
+
+Render with `--final_vision_compression gzip` to keep on-disk size manageable
+(~140 MB/chunk gzip vs ~960 MB/chunk uncompressed). However, **gzip-compressed
+HDF5 is too slow for training** — the CPU decompression bottleneck causes
+~12 s/batch instead of ~0.3 s/batch. After rendering, repack to uncompressed
+before training (see Step 4b).
 
 ```bash
 python3 scripts/2_visual_renderer.py \
-  --raw_dir jepa_raw_data \
-  --out_dir jepa_final_dataset \
+  --raw_dir /media/andrewknowles/Scratch/jepa_raw_full \
+  --out_dir /media/andrewknowles/Scratch/jepa_final_full \
   --sim_backend vulkan \
   --workers 4 \
   --final_vision_compression gzip
 ```
 
-#### Multi-machine distributed render
-
-For large datasets (500+ chunks), split the raw chunks across machines to
-render in parallel. Each machine only needs the repo, dependencies, and its
-subset of `chunk_*.npz` files.
-
-**Step 1 — distribute raw chunks to render nodes:**
+#### 4b. Repack gzip to uncompressed for training
 
 ```bash
-# From the primary machine, sync subsets to each render node.
-# Adjust chunk ranges per machine to balance the load.
-
-# Machine B (e.g. 2-GPU node):
-rsync -avP --include='chunk_00[0-1]*.npz' --exclude='chunk_*.npz' \
-  jepa_raw_data/ machineB:~/Workspace/LeWMQuad-v2/jepa_raw_data/
-
-# Machine C (if available):
-rsync -avP --include='chunk_002*.npz' --include='chunk_003*.npz' --exclude='chunk_*.npz' \
-  jepa_raw_data/ machineC:~/Workspace/LeWMQuad-v2/jepa_raw_data/
+python3 scripts/repack_h5_vision.py \
+  --data_dir /media/andrewknowles/Scratch/jepa_final_full \
+  --compression none
 ```
 
-**Step 2 — render on each node:**
+This rewrites each HDF5 in-place (~30 s/chunk). The uncompressed dataset will
+be ~480 GB for 500 chunks. If disk is tight, use `--compression lzf` instead
+of `none` — lzf decompresses ~10x faster than gzip with ~70% compression.
 
-```bash
-# On each render node:
-python3 scripts/2_visual_renderer.py \
-  --raw_dir jepa_raw_data \
-  --out_dir jepa_final_dataset \
-  --sim_backend vulkan \
-  --workers 4
-```
+#### Time and size estimates (Vulkan, 4 workers, 224×224, AMD GPU)
 
-Increase `--workers` if the node has multiple GPUs (e.g. `--workers 8` for a
-2-GPU machine). If Vulkan's default safety cap of 4 workers is too low, add
-`--unsafe_vulkan_parallelism` to override.
+Observed benchmarks from smoke test (RX 7900 XTX):
 
-**Step 3 — collect rendered outputs back to the primary machine:**
+| Step | 5 chunks (smoke) | 500 chunks (full) |
+|------|-------------------|-------------------|
+| Physics rollout | ~7 min | ~11 hrs |
+| Render (gzip) | ~1.5 hrs | ~35 hrs |
+| Repack to none | ~2.5 min | ~4 hrs |
+| **Rendered size (gzip)** | ~1 GB | ~70 GB |
+| **Rendered size (none)** | ~48 GB | ~480 GB |
 
-```bash
-# From the primary machine:
-rsync -avP machineB:~/Workspace/LeWMQuad-v2/jepa_final_dataset/chunk_*_rgb.h5 \
-  jepa_final_dataset/
-
-rsync -avP machineC:~/Workspace/LeWMQuad-v2/jepa_final_dataset/chunk_*_rgb.h5 \
-  jepa_final_dataset/
-```
-
-All downstream scripts (training, coverage verification) read every
-`chunk_*_rgb.h5` in the output directory, so no manual stitching is needed.
-
-#### Rough time and size estimates (Vulkan, 224×224, ~11 s/env observed, AMD GPU)
-
-| Chunks | Envs/chunk | Total envs | ~Render time (4w) | ~Size (gzip) |
-|--------|------------|------------|--------------------|--------------|
-| 5      | 64         | 320        | ~1 hr              | ~1 GB        |
-| 500    | 64         | 32,000     | ~4 days (1 machine)| ~70 GB       |
-| 500    | 64 (×2 machines) | 32,000 | ~2.5 days        | ~70 GB       |
+Total single-machine wall time for full dataset (rollout + render + repack):
+**~2 days**.
 
 Scene diversity (chunk count) matters far more than envs-per-scene for
 generalization. 64 envs per chunk provides enough trajectory coverage per
@@ -1081,9 +1147,9 @@ If you are reusing existing vision and only want to rebuild labels:
 
 ```bash
 python3 scripts/2_visual_renderer.py \
-  --raw_dir jepa_raw_data \
-  --reuse_vision_from jepa_final_dataset_old \
-  --out_dir jepa_final_dataset \
+  --raw_dir /media/andrewknowles/Scratch/jepa_raw_full \
+  --reuse_vision_from /media/andrewknowles/Scratch/jepa_final_full_old \
+  --out_dir /media/andrewknowles/Scratch/jepa_final_full \
   --workers 1
 ```
 
@@ -1093,13 +1159,13 @@ Run the coverage summary again on both raw and rendered data:
 
 ```bash
 python3 scripts/summarize_dataset_coverage.py \
-  --raw_dir jepa_raw_data \
-  --rendered_dir jepa_final_dataset \
+  --raw_dir /media/andrewknowles/Scratch/jepa_raw_full \
+  --rendered_dir /media/andrewknowles/Scratch/jepa_final_full \
   --seq_len 4 \
   --temporal_stride 5 \
   --action_block_size 5 \
   --window_stride 5 \
-  --out reports/jepa_final_dataset_coverage.json
+  --out reports/jepa_final_full_coverage.json
 ```
 
 Use this second report to confirm:
@@ -1111,11 +1177,13 @@ Use this second report to confirm:
 
 ### 6. Train the Base LeWorldModel
 
-Train the pure-vision LeWM with the recommended temporal abstraction:
+Train the pure-vision LeWM with the recommended temporal abstraction. With 500
+chunks of uncompressed data, expect ~2.5 min/epoch at batch_size=128 (the
+dataset is ~10x the smoke test, so ~25 min/epoch, ~12.5 hrs for 30 epochs):
 
 ```bash
 python3 scripts/3_train_lewm.py \
-  --data_dir jepa_final_dataset \
+  --data_dir /media/andrewknowles/Scratch/jepa_final_full \
   --device cuda \
   --epochs 30 \
   --batch_size 128 \
@@ -1127,30 +1195,29 @@ python3 scripts/3_train_lewm.py \
   --prefetch_factor 2 \
   --sigreg_lambda 0.09 \
   --command_representation active_block \
-  --out_dir lewm_checkpoints_keyframe_exec_stride5_block15_vision \
-  --log_dir lewm_logs_keyframe_exec_stride5_block15_vision
+  --out_dir /media/andrewknowles/Scratch/lewm_full_ckpts \
+  --log_dir /media/andrewknowles/Scratch/lewm_full_logs
 ```
 
 Expected outcome:
 
 - scene-held-out evaluation runs by default
-- checkpoints are written under
-  `lewm_checkpoints_keyframe_exec_stride5_block15_vision`
+- checkpoints are written under `lewm_full_ckpts/`
 - the main artifact for downstream training is typically
-  `lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt`
+  `lewm_full_ckpts/epoch_30.pt`
 
 Do not proceed to head training until the run completes cleanly and the held-out
 scene loss looks stable rather than obviously diverging.
 
 ### 7. Train the Planning Heads
 
-Train the scorer stack on frozen LeWM latents:
+Train the scorer stack on frozen LeWM latents (~30 min with AR finetuning):
 
 ```bash
 python3 scripts/4_train_energy_head.py \
-  --data_dir jepa_final_dataset \
-  --raw_data_dir jepa_raw_data \
-  --checkpoint lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
+  --data_dir /media/andrewknowles/Scratch/jepa_final_full \
+  --raw_data_dir /media/andrewknowles/Scratch/jepa_raw_full \
+  --checkpoint /media/andrewknowles/Scratch/lewm_full_ckpts/epoch_30.pt \
   --device cuda \
   --seq_len 4 \
   --temporal_stride 5 \
@@ -1158,8 +1225,8 @@ python3 scripts/4_train_energy_head.py \
   --window_stride 5 \
   --num_workers 4 \
   --prefetch_factor 2 \
-  --out_dir energy_head_checkpoints_keyframe_exec_stride5_block15_vision \
-  --log_dir energy_head_logs_keyframe_exec_stride5_block15_vision \
+  --out_dir /media/andrewknowles/Scratch/energy_full_ckpts \
+  --log_dir /media/andrewknowles/Scratch/energy_full_logs \
   --safety_mode proximity \
   --epochs 10 \
   --skip_goal \
@@ -1168,14 +1235,21 @@ python3 scripts/4_train_energy_head.py \
   --coverage_gain_weight 0.5 \
   --escape_frontier_weight 1.0 \
   --eval_split_group scene \
-  --exploration_weight 1.0
+  --exploration_weight 1.0 \
+  --ar_finetune_epochs 3 \
+  --ar_finetune_lr 1e-4 \
+  --ar_finetune_horizon 3
 ```
 
 Expected output:
 
-- `energy_head_checkpoints_keyframe_exec_stride5_block15_vision/trajectory_scorer.pt`
+- `energy_full_ckpts/trajectory_scorer.pt`
 
-The script now reads encoder and temporal metadata from the LeWM checkpoint and
+The `--ar_finetune_epochs 3` flag enables the autoregressive finetuning phase
+(Phase 10) after the standard teacher-forced training. This closes the
+teacher-forced/deployment gap identified in finding #5.
+
+The script reads encoder and temporal metadata from the LeWM checkpoint and
 fails fast on mismatches. Keep that strictness.
 
 ### 8. Single-Seed Inference Sanity Check
@@ -1184,9 +1258,9 @@ Run one held-out maze first before launching a sweep:
 
 ```bash
 python3 scripts/6_infer_pure_wm.py \
-  --ppo_ckpt <ppo_ckpt> \
-  --wm_ckpt lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
-  --scorer_ckpt energy_head_checkpoints_keyframe_exec_stride5_block15_vision/trajectory_scorer.pt \
+  --ppo_ckpt models/ppo/ckpt_20000.pt \
+  --wm_ckpt /media/andrewknowles/Scratch/lewm_full_ckpts/epoch_30.pt \
+  --scorer_ckpt /media/andrewknowles/Scratch/energy_full_ckpts/trajectory_scorer.pt \
   --seed 42 \
   --steps 200 \
   --macro_action_repeat 5 \
@@ -1199,7 +1273,7 @@ python3 scripts/6_infer_pure_wm.py \
   --audit_plan \
   --audit_every 1 \
   --audit_topk 5 \
-  --out_dir inference_runs/perception_only_stride5_block15_vision_s42
+  --out_dir /media/andrewknowles/Scratch/inference_full_s42
 ```
 
 Current intended deployment assumptions:
@@ -1223,11 +1297,11 @@ Inspect the run directory before scaling up:
 Once the single-seed run looks sane, sweep multiple unseen mazes:
 
 ```bash
-for seed in 42 43 44; do
+for seed in 42 43 44 45 46; do
   python3 scripts/6_infer_pure_wm.py \
-    --ppo_ckpt <ppo_ckpt> \
-    --wm_ckpt lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
-    --scorer_ckpt energy_head_checkpoints_keyframe_exec_stride5_block15_vision/trajectory_scorer.pt \
+    --ppo_ckpt models/ppo/ckpt_20000.pt \
+    --wm_ckpt /media/andrewknowles/Scratch/lewm_full_ckpts/epoch_30.pt \
+    --scorer_ckpt /media/andrewknowles/Scratch/energy_full_ckpts/trajectory_scorer.pt \
     --seed "$seed" \
     --steps 200 \
     --macro_action_repeat 5 \
@@ -1240,7 +1314,7 @@ for seed in 42 43 44; do
     --audit_plan \
     --audit_every 1 \
     --audit_topk 5 \
-    --out_dir "inference_runs/perception_only_stride5_block15_vision_s${seed}"
+    --out_dir "/media/andrewknowles/Scratch/inference_full_s${seed}"
 done
 ```
 
@@ -1248,16 +1322,16 @@ Then aggregate end metrics:
 
 ```bash
 python3 scripts/7_aggregate_inference_runs.py \
-  --glob "inference_runs/perception_only_stride5_block15_vision_s*" \
-  --out inference_runs/perception_only_stride5_block15_vision_aggregate.json
+  --glob "/media/andrewknowles/Scratch/inference_full_s*" \
+  --out /media/andrewknowles/Scratch/inference_full_aggregate.json
 ```
 
 And aggregate planner audits:
 
 ```bash
 python3 scripts/aggregate_plan_audits.py \
-  --glob "inference_runs/perception_only_stride5_block15_vision_s*" \
-  --out inference_runs/perception_only_stride5_block15_vision_plan_audit_aggregate.json
+  --glob "/media/andrewknowles/Scratch/inference_full_s*" \
+  --out /media/andrewknowles/Scratch/inference_full_plan_audit.json
 ```
 
 ### 10. What To Review Before Calling The Run A Success
@@ -1422,124 +1496,13 @@ The bottleneck is distinct geometry count, not frame count. 500 chunks of 1000
 steps each is 500K frames across 500 unique maze layouts. That is a more
 defensible training set than 200 chunks across 100 mazes with 200K frames.
 
-### Updated Runbook
+### Updated Runbook Notes
 
-The runbook from the prior section remains the authoritative operational guide.
-The following modifications apply:
+The main runbook (Steps 1-10 above) is now the authoritative operational guide
+with all paths, flags, and timing estimates updated from the 2026-04-07 smoke
+test. The following additional notes apply:
 
-#### Steps 2+4 (Distributed Data Collection and Rendering)
-
-The smoke test produces 5 chunks (chunk_0000–chunk_0004) with 1024 envs each.
-These are already rendered and will be included in the final dataset. The full
-run adds 495 more chunks at `--n_envs 64` to reach 500 total distinct scene
-layouts, distributed across available machines for rendering.
-
-Use `--n_envs 64` (not 1024) for the full dataset. Scene diversity (chunk
-count) is the bottleneck for generalization, not envs-per-scene — and 64 envs
-per chunk keeps rendering time tractable across the distributed pipeline.
-
-Use `--scene_distribution enclosed` for the primary dataset when the deployment
-task is enclosed-maze exploration. This ensures every chunk contributes a unique
-enclosed-maze layout.
-
-**Naming convention**: the physics rollout script auto-numbers chunks from 0.
-To avoid overwriting smoke test chunks, use a separate `--out_dir` for each
-batch and merge afterwards, or run the full 500-chunk collection into a fresh
-directory and copy the 5 smoke-test rendered outputs into the final dataset
-(the renderer will skip them).
-
-**Step 1 — Physics rollout (primary machine only)**:
-
-The physics rollout is fast (~minutes per chunk on GPU). Run it on the primary
-machine, then distribute the raw chunks for rendering.
-
-```bash
-python3 scripts/1_physics_rollout.py \
-  --ckpt models/ppo/ckpt_20000.pt \
-  --steps 1000 \
-  --chunks 500 \
-  --n_envs 64 \
-  --scene_distribution enclosed \
-  --command_policy mixed \
-  --out_dir jepa_raw_full
-```
-
-**Step 2 — Distribute raw chunks to render nodes**:
-
-Split 500 chunks across 2 machines (primary + secondary 2-GPU node). The
-smoke test's 5 rendered chunks (from `jepa_final_smoke/`) will be copied into
-the final output — they do not need re-rendering.
-
-```bash
-# On secondary machine (2-GPU node with 6950XT + 9060XT):
-rsync -avP primary:~/Workspace/LeWMQuad-v2/jepa_raw_full/chunk_00{0,1,2,3,4}*.npz \
-  ~/Workspace/LeWMQuad-v2/jepa_raw_full/
-# This gives the secondary machine chunks 0000-0049, 0100-0149, 0200-0249,
-# 0300-0349, 0400-0499 — roughly 250 chunks.
-# Adjust the glob to balance ~250 chunks per machine.
-```
-
-A cleaner split by index ranges:
-
-```bash
-# Secondary machine — gets chunks 250-499:
-rsync -avP primary:~/Workspace/LeWMQuad-v2/jepa_raw_full/ \
-  ~/Workspace/LeWMQuad-v2/jepa_raw_full/ \
-  --include='chunk_0[2-4]*.npz' --exclude='chunk_*.npz'
-
-# Primary machine renders chunks 0000-0249 locally.
-```
-
-**Step 3 — Render on each machine in parallel**:
-
-```bash
-# Primary machine (chunks 0000-0249):
-python3 scripts/2_visual_renderer.py \
-  --raw_dir jepa_raw_full \
-  --out_dir jepa_final_full \
-  --sim_backend vulkan \
-  --workers 4
-
-# Secondary machine (chunks 0250-0499, 2 GPUs → 8 workers):
-python3 scripts/2_visual_renderer.py \
-  --raw_dir jepa_raw_full \
-  --out_dir jepa_final_full \
-  --sim_backend vulkan \
-  --workers 8 \
-  --unsafe_vulkan_parallelism
-```
-
-Each machine only renders chunks present in its `--raw_dir`.
-
-**Step 4 — Collect rendered outputs and merge with smoke test**:
-
-```bash
-# On primary machine:
-rsync -avP secondary:~/Workspace/LeWMQuad-v2/jepa_final_full/chunk_*_rgb.h5 \
-  jepa_final_full/
-
-# Copy smoke-test renders (already complete, 1024-env chunks):
-rsync -avP jepa_final_smoke/chunk_*_rgb.h5 jepa_final_full/
-```
-
-All downstream scripts read every `chunk_*_rgb.h5` in the directory. No manual
-stitching is needed. The smoke test chunks contribute additional training data
-at no extra render cost.
-
-**Time and size estimates (Vulkan, 224×224, AMD GPU, ~11 s/env observed)**:
-
-| Machine | GPUs | Workers | Chunks | Envs/chunk | Total envs | ~Time |
-|---------|------|---------|--------|------------|------------|-------|
-| Primary | 1    | 4       | 250    | 64         | 16,000     | ~12 hrs |
-| Secondary | 2  | 8       | 250    | 64         | 16,000     | ~6 hrs |
-| **Total** |    |         | **500** | **64**    | **32,000** | **~12 hrs** |
-
-Total rendered dataset size with gzip compression: **~70 GB**.
-
-The 5 smoke-test chunks (320 envs at 64/chunk) can be copied into the final
-dataset directory to avoid re-rendering.
-
-#### Step 6 (Train LeWM) addition
+#### Step 6 (Train LeWM) — multi-step diagnostic
 
 After training, inspect `multistep_eval_metrics.csv`:
 
@@ -1554,42 +1517,10 @@ If `mse_step_3 / mse_step_1 > 3.0` on held-out scenes, consider:
 - Adding a small multi-step auxiliary loss to the training objective
 
 If the ratio is below 2.0, the world model is healthy for multi-step planning.
+The smoke test achieved 1.12 at epoch 5 on only 5 scenes — expect better with
+500 scenes.
 
-#### Step 7 (Train Planning Heads) update
-
-```bash
-python3 scripts/4_train_energy_head.py \
-  --data_dir jepa_final_dataset \
-  --raw_data_dir jepa_raw_data \
-  --checkpoint lewm_checkpoints_keyframe_exec_stride5_block15_vision/epoch_30.pt \
-  --device cuda \
-  --seq_len 4 \
-  --temporal_stride 5 \
-  --action_block_size 5 \
-  --window_stride 5 \
-  --num_workers 4 \
-  --prefetch_factor 2 \
-  --out_dir energy_head_checkpoints_keyframe_exec_stride5_block15_vision \
-  --log_dir energy_head_logs_keyframe_exec_stride5_block15_vision \
-  --safety_mode proximity \
-  --epochs 10 \
-  --skip_goal \
-  --skip_progress \
-  --exploration_epochs 5 \
-  --coverage_gain_weight 0.5 \
-  --escape_frontier_weight 1.0 \
-  --eval_split_group scene \
-  --exploration_weight 1.0 \
-  --ar_finetune_epochs 3 \
-  --ar_finetune_lr 1e-4 \
-  --ar_finetune_horizon 3
-```
-
-The `--ar_finetune_epochs 3` flag enables the autoregressive finetuning phase
-after the standard teacher-forced training. This is the recommended default for
-any serious run where the planner will operate over multi-step rollouts.
-
-#### Step 10 (Review) addition
+#### Step 10 (Review) — additional criteria
 
 In addition to the existing review criteria, check:
 
@@ -1600,6 +1531,18 @@ In addition to the existing review criteria, check:
   `safety_latent_source` — confirm that AR finetuning was applied
 - Compare planner audit `near_tie_rate` between AR-finetuned and
   teacher-forced-only scorer checkpoints if running ablations
+
+#### Full pipeline wall-time budget (single machine, RX 7900 XTX)
+
+| Step | Time |
+|------|------|
+| 1. Physics rollout (500 chunks × 64 envs) | ~11 hrs |
+| 2. Render (32k envs, Vulkan, 4 workers, gzip) | ~35 hrs |
+| 3. Repack gzip → uncompressed | ~4 hrs |
+| 4. Train LeWM (30 epochs) | ~12 hrs |
+| 5. Train planning heads (10 epochs + AR finetune) | ~30 min |
+| 6. Inference (5 seeds) | ~15 min |
+| **Total** | **~3 days** |
 
 ### What is still not implemented but would help further
 
