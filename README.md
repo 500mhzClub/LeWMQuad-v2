@@ -115,6 +115,12 @@ Important:
 python3 scripts/2_visual_renderer.py --raw_dir jepa_raw_data --out_dir jepa_final_dataset
 ```
 
+On ROCm/AMD hosts, the renderer now treats parallel `scene.build()` as unsafe
+even with `--sim_backend vulkan`: it caps render workers to 1 by default and
+will retry a failed chunk on serial CPU if Genesis trips the HIP allocator
+during worker startup. Use `--unsafe_backend_parallelism` only on machines
+where multi-worker Vulkan is already known to be stable.
+
 For the current navigation stack, there is one important label update:
 
 - beacon visibility / identity / range for the planning heads should be

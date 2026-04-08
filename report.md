@@ -1084,10 +1084,13 @@ python3 scripts/demo_data_quality.py --ckpt <ppo_ckpt>
 ### 4. Render the Final Training Dataset
 
 Rendering egocentric RGB at 224×224 is the slowest step in the pipeline. On AMD
-GPUs the ROCm/HIP backend is extremely slow for rendering (~38 s/env) and the
-safety caps force `workers=1`. **Always use Vulkan** on AMD hardware — it is
-both faster per-env (~16 s/env observed) and allows multi-worker parallelism
-(4 workers by default).
+GPUs the ROCm/HIP backend is extremely slow for rendering (~38 s/env). Vulkan
+is still the preferred render backend on AMD hardware, but recent mixed-GPU
+ROCm hosts can still hit HIP allocator failures during `scene.build()`. The
+renderer now caps AMD/ROCm render jobs to `workers=1` by default and will retry
+a failed chunk on serial CPU before aborting. Only use
+`--unsafe_backend_parallelism` if multi-worker Vulkan is already known stable on
+that machine.
 
 Each chunk produces an independent `chunk_NNNN_rgb.h5` file. The renderer
 automatically skips chunks that already have a complete output file (unless
@@ -1122,9 +1125,11 @@ This rewrites each HDF5 in-place (~30 s/chunk). The uncompressed dataset will
 be ~480 GB for 500 chunks. If disk is tight, use `--compression lzf` instead
 of `none` — lzf decompresses ~10x faster than gzip with ~70% compression.
 
-#### Time and size estimates (Vulkan, 4 workers, 224×224, AMD GPU)
+#### Time and size estimates (reference run: Vulkan, 4 workers, 224×224, AMD GPU)
 
-Observed benchmarks from smoke test (RX 7900 XTX):
+Observed benchmarks from an earlier smoke test on a single RX 7900 XTX. Treat
+these as best-case reference numbers, not the current default on mixed-GPU
+ROCm hosts:
 
 | Step | 5 chunks (smoke) | 500 chunks (full) |
 |------|-------------------|-------------------|
