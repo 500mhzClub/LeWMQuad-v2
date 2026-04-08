@@ -103,7 +103,7 @@ def pick_backend(gs, backend_str: str):
         "amdgpu": ("amdgpu", "gpu", "vulkan", "cpu"),
         "amd": ("amdgpu", "gpu", "vulkan", "cpu"),
         "hip": ("amdgpu", "gpu", "vulkan", "cpu"),
-        "auto": ("vulkan", "amdgpu", "gpu", "cuda", "metal", "cpu"),
+        "auto": ("amdgpu", "vulkan", "gpu", "cuda", "metal", "cpu"),
     }
 
     candidates = explicit.get(backend_str, explicit["auto"])
@@ -145,12 +145,6 @@ def normalize_h5_compression(name: str | None) -> str | None:
     if name in {"gzip", "lzf"}:
         return name
     raise ValueError(f"Unsupported HDF5 compression '{name}'. Use one of: none, gzip, lzf.")
-
-
-def is_rocm_runtime() -> bool:
-    """Return True when the local PyTorch runtime is backed by ROCm/HIP."""
-    return bool(getattr(getattr(torch, "version", None), "hip", None))
-
 
 def apply_visual_domain_randomization(rgb: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
     """Apply per-frame visual domain randomization to an (H, W, 3) uint8 image."""
@@ -476,35 +470,6 @@ def render_worker(args_tuple):
     return tmp_file
 
 
-def run_render_processes(tasks: list[tuple], tmp_files: list[str], expected_envs: int, pbar) -> tuple[list[int], list[str], int]:
-    """Launch worker processes, update progress, and collect failure details."""
-    progress_queue = mp.Queue()
-    tasks_with_q = [(*task, progress_queue) for task in tasks]
-    processes = [mp.Process(target=render_worker, args=(task,)) for task in tasks_with_q]
-    for proc in processes:
-        proc.start()
-
-    envs_received = 0
-    try:
-        while envs_received < expected_envs:
-            try:
-                progress_queue.get(timeout=5)
-                pbar.update(1)
-                envs_received += 1
-            except queue.Empty:
-                if not any(proc.is_alive() for proc in processes):
-                    break
-    finally:
-        for proc in processes:
-            proc.join()
-        progress_queue.close()
-        progress_queue.join_thread()
-
-    failed = [proc.pid for proc in processes if proc.exitcode not in (0, None)]
-    missing_tmp = [tmp for tmp in tmp_files if not os.path.exists(tmp)]
-    return failed, missing_tmp, envs_received
-
-
 # --------------------------------------------------------------------------- #
 # Stitch worker outputs into one HDF5
 # --------------------------------------------------------------------------- #
@@ -707,33 +672,28 @@ def main():
     effective_texture_variants = max(1, int(args.texture_variants_per_worker))
     backend_name = args.sim_backend.lower().strip()
     unsafe_parallelism = args.unsafe_backend_parallelism or args.unsafe_vulkan_parallelism
-    rocm_runtime = is_rocm_runtime()
 
-    if backend_name != "cpu" and not unsafe_parallelism:
-        if rocm_runtime:
-            # Genesis scene.build() still allocates rigid/SDF buffers through HIP on
-            # some ROCm hosts, even when the requested backend is Vulkan.
-            capped_workers = min(effective_workers, HIP_SAFE_WORKER_LIMIT)
-            capped_variants = min(effective_texture_variants, HIP_SAFE_TEXTURE_VARIANT_LIMIT)
-            if (capped_workers, capped_variants) != (effective_workers, effective_texture_variants):
-                tqdm.write(
-                    f"ROCm/AMDGPU safety caps applied: workers {effective_workers}->{capped_workers}, "
-                    f"texture_variants {effective_texture_variants}->{capped_variants}. "
-                    "Genesis may still touch the HIP allocator even with --sim_backend vulkan. "
-                    "Use --unsafe_backend_parallelism to override."
-                )
-            effective_workers = capped_workers
-            effective_texture_variants = capped_variants
-        elif backend_name == "vulkan":
-            capped_workers = min(effective_workers, VULKAN_SAFE_WORKER_LIMIT)
-            capped_variants = min(effective_texture_variants, VULKAN_SAFE_TEXTURE_VARIANT_LIMIT)
-            if (capped_workers, capped_variants) != (effective_workers, effective_texture_variants):
-                tqdm.write(
-                    f"Vulkan safety caps applied: workers {effective_workers}->{capped_workers}, "
-                    f"texture_variants {effective_texture_variants}->{capped_variants}."
-                )
-            effective_workers = capped_workers
-            effective_texture_variants = capped_variants
+    if backend_name == "vulkan" and not unsafe_parallelism:
+        capped_workers = min(effective_workers, VULKAN_SAFE_WORKER_LIMIT)
+        capped_variants = min(effective_texture_variants, VULKAN_SAFE_TEXTURE_VARIANT_LIMIT)
+        if (capped_workers, capped_variants) != (effective_workers, effective_texture_variants):
+            tqdm.write(
+                f"Vulkan safety caps applied: workers {effective_workers}->{capped_workers}, "
+                f"texture_variants {effective_texture_variants}->{capped_variants}."
+            )
+        effective_workers = capped_workers
+        effective_texture_variants = capped_variants
+    elif getattr(torch.version, "hip", None) and backend_name in {"auto", "gpu", "amdgpu", "amd", "hip"} and not unsafe_parallelism:
+        capped_workers = min(effective_workers, HIP_SAFE_WORKER_LIMIT)
+        capped_variants = min(effective_texture_variants, HIP_SAFE_TEXTURE_VARIANT_LIMIT)
+        if (capped_workers, capped_variants) != (effective_workers, effective_texture_variants):
+            tqdm.write(
+                f"ROCm/AMDGPU safety caps applied: workers {effective_workers}->{capped_workers}, "
+                f"texture_variants {effective_texture_variants}->{capped_variants}. "
+                f"Use --unsafe_backend_parallelism to override."
+            )
+        effective_workers = capped_workers
+        effective_texture_variants = capped_variants
 
     raw_files = sorted(glob.glob(os.path.join(args.raw_dir, "chunk_*.npz")))
     if not raw_files:
@@ -841,32 +801,44 @@ def main():
             tmp_files = []
             source_vision_path = None
             if args.reuse_vision_from is None:
-                def build_chunk_tasks(worker_count: int, sim_backend: str, texture_variants: int) -> tuple[list[tuple], list[str]]:
-                    chunk_tasks = []
-                    chunk_tmp_files = []
-                    envs_per_worker = math.ceil(N / worker_count)
-                    for i in range(worker_count):
-                        start = i * envs_per_worker
-                        end = min(start + envs_per_worker, N)
-                        if start >= end:
+                envs_per_worker = math.ceil(N / effective_workers)
+                for i in range(effective_workers):
+                    start = i * envs_per_worker
+                    end = min(start + envs_per_worker, N)
+                    if start >= end:
+                        break
+                    tmp = os.path.join(args.out_dir, f"{chunk_name}_tmp_{i}.h5")
+                    tmp_files.append(tmp)
+                    tasks.append((
+                        i, file_path, start, end, tmp,
+                        args.sim_backend, texture_dir, obstacle_json, beacon_json,
+                        args.texture_count, effective_texture_variants,
+                        args.beacon_confuse_prob, args.img_res, tmp_vision_compression,
+                        args.skip_physics_step, camera_cfg,
+                    ))
+
+                progress_queue = mp.Queue()
+                tasks_with_q = [(*t, progress_queue) for t in tasks]
+
+                processes = [mp.Process(target=render_worker, args=(t,)) for t in tasks_with_q]
+                for p in processes:
+                    p.start()
+
+                envs_received = 0
+                while envs_received < N:
+                    try:
+                        progress_queue.get(timeout=5)
+                        pbar.update(1)
+                        envs_received += 1
+                    except queue.Empty:
+                        if not any(p.is_alive() for p in processes):
                             break
-                        tmp = os.path.join(args.out_dir, f"{chunk_name}_tmp_{i}.h5")
-                        chunk_tmp_files.append(tmp)
-                        chunk_tasks.append((
-                            i, file_path, start, end, tmp,
-                            sim_backend, texture_dir, obstacle_json, beacon_json,
-                            args.texture_count, texture_variants,
-                            args.beacon_confuse_prob, args.img_res, tmp_vision_compression,
-                            args.skip_physics_step, camera_cfg,
-                        ))
-                    return chunk_tasks, chunk_tmp_files
 
-                tasks, tmp_files = build_chunk_tasks(
-                    effective_workers, args.sim_backend, effective_texture_variants,
-                )
-                failed, missing_tmp, envs_received = run_render_processes(tasks, tmp_files, N, pbar)
+                for p in processes:
+                    p.join()
 
-                cpu_retry_attempted = False
+                failed = [p.pid for p in processes if p.exitcode not in (0, None)]
+                missing_tmp = [tmp for tmp in tmp_files if not os.path.exists(tmp)]
                 if failed or missing_tmp:
                     for tmp in tmp_files:
                         try:
@@ -874,36 +846,12 @@ def main():
                                 os.remove(tmp)
                         except Exception:
                             pass
-
-                    should_retry_on_cpu = backend_name != "cpu"
-                    if should_retry_on_cpu:
-                        cpu_retry_attempted = True
-                        if envs_received:
-                            pbar.update(-envs_received)
-                        tqdm.write(
-                            f"{chunk_name}: backend={args.sim_backend} failed during worker startup; "
-                            "retrying serially on CPU."
-                        )
-                        pbar.set_description(f"{chunk_label}  cpu-retry...")
-                        tasks, tmp_files = build_chunk_tasks(1, "cpu", 1)
-                        failed, missing_tmp, _ = run_render_processes(tasks, tmp_files, N, pbar)
-
-                    if failed or missing_tmp:
-                        for tmp in tmp_files:
-                            try:
-                                if os.path.exists(tmp):
-                                    os.remove(tmp)
-                            except Exception:
-                                pass
-                        retry_note = " automatic_cpu_retry=True," if cpu_retry_attempted else ""
-                        raise RuntimeError(
-                            "Render worker failure before stitching. "
-                            f"backend={args.sim_backend}, workers={effective_workers}, img_res={args.img_res}, "
-                            f"{retry_note} failed_pids={failed}, missing_tmp_files={len(missing_tmp)}. "
-                            "On AMD/ROCm this usually means Genesis hit the HIP allocator during scene.build; "
-                            "use --sim_backend cpu or only re-enable parallel Vulkan if it is known stable "
-                            "on this machine."
-                        )
+                    raise RuntimeError(
+                        "Render worker failure before stitching. "
+                        f"backend={args.sim_backend}, workers={effective_workers}, img_res={args.img_res}, "
+                        f"failed_pids={failed}, missing_tmp_files={len(missing_tmp)}. "
+                        "On AMD/ROCm, rerun with --workers 1 or use --sim_backend vulkan/cpu."
+                    )
             else:
                 source_vision_path = os.path.join(args.reuse_vision_from, f"{chunk_name}_rgb.h5")
                 if not os.path.isfile(source_vision_path):
