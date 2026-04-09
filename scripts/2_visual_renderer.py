@@ -73,23 +73,9 @@ JOINTS_ACTUATED = [
 DEFAULT_IMG_RES = 224
 DEFAULT_TEXTURE_COUNT = 27
 DEFAULT_TEXTURE_VARIANTS_PER_WORKER = 4
-def _count_discrete_gpus() -> int:
-    """Count DRM render nodes that have dedicated VRAM (excludes iGPUs)."""
-    count = 0
-    for node in sorted(glob.glob("/dev/dri/renderD*")):
-        try:
-            vram_path = f"/sys/class/drm/{os.path.basename(node)}/device/mem_info_vram_total"
-            with open(vram_path) as f:
-                if int(f.read().strip()) > 0:
-                    count += 1
-        except (OSError, ValueError):
-            pass
-    return count or 1
-
-_n_render_nodes = _count_discrete_gpus()
-VULKAN_SAFE_WORKER_LIMIT = 8 * _n_render_nodes
+VULKAN_SAFE_WORKER_LIMIT = 4
 VULKAN_SAFE_TEXTURE_VARIANT_LIMIT = 1
-HIP_SAFE_WORKER_LIMIT = 2 * _n_render_nodes
+HIP_SAFE_WORKER_LIMIT = 1
 HIP_SAFE_TEXTURE_VARIANT_LIMIT = 1
 
 # --------------------------------------------------------------------------- #
@@ -283,58 +269,6 @@ def render_worker(args_tuple):
      tmp_vision_compression, skip_physics_step, camera_cfg, progress_queue) = args_tuple
 
     N_subset = end_env - start_env
-
-    # Pin worker to a specific GPU via round-robin over discrete DRM render nodes.
-    # Filter out iGPUs by checking for dedicated VRAM (iGPUs use system memory).
-    all_drm_nodes = sorted(glob.glob("/dev/dri/renderD*"))
-    drm_nodes = []
-    for node in all_drm_nodes:
-        node_name = os.path.basename(node)
-        vram_path = f"/sys/class/drm/{node_name}/device/mem_info_vram_total"
-        try:
-            with open(vram_path) as f:
-                if int(f.read().strip()) > 0:
-                    drm_nodes.append(node)
-        except (OSError, ValueError):
-            pass  # no VRAM info = likely iGPU, skip
-    if not drm_nodes:
-        drm_nodes = all_drm_nodes  # fallback if filtering removed everything
-    n_gpus = len(drm_nodes)
-    if n_gpus > 1:
-        gpu_idx = worker_id % n_gpus
-        node_path = drm_nodes[gpu_idx]
-        # Read PCI slot from sysfs to build every known selector format.
-        pci_slot = None
-        vid_did = None
-        try:
-            node_name = os.path.basename(node_path)
-            dev_dir = f"/sys/class/drm/{node_name}/device"
-            with open(f"{dev_dir}/vendor") as f:
-                vid = f.read().strip()
-            with open(f"{dev_dir}/device") as f:
-                did = f.read().strip()
-            vid_did = f"{vid[2:]}:{did[2:]}!"
-            with open(f"{dev_dir}/uevent") as f:
-                for line in f:
-                    if line.startswith("PCI_SLOT_NAME="):
-                        pci_slot = line.strip().split("=", 1)[1]
-                        break
-        except OSError:
-            pass
-        # RADV: force specific physical device by vendor:device ID.
-        if vid_did:
-            os.environ["MESA_VK_DEVICE_SELECT"] = vid_did
-            os.environ["MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE"] = "1"
-        # DRI_PRIME with PCI slot is the most reliable Mesa selector.
-        if pci_slot:
-            os.environ["DRI_PRIME"] = f"pci-{pci_slot.replace(':', '_').replace('.', '_')}"
-        else:
-            os.environ["DRI_PRIME"] = str(gpu_idx)
-        os.environ["GPU_DEVICE_ORDINAL"] = str(gpu_idx)
-        os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_idx)
-        os.environ["ROCR_VISIBLE_DEVICES"] = str(gpu_idx)
-        print(f"[worker {worker_id}] Pinned to GPU {gpu_idx} ({node_path},"
-              f" pci={pci_slot}, vk={vid_did})", flush=True)
 
     # Skip if already fully rendered
     if os.path.exists(tmp_file):
