@@ -74,7 +74,7 @@ DEFAULT_IMG_RES = 224
 DEFAULT_TEXTURE_COUNT = 27
 DEFAULT_TEXTURE_VARIANTS_PER_WORKER = 4
 _n_render_nodes = len(sorted(glob.glob("/dev/dri/renderD*"))) or 1
-VULKAN_SAFE_WORKER_LIMIT = 4 * _n_render_nodes
+VULKAN_SAFE_WORKER_LIMIT = 8 * _n_render_nodes
 VULKAN_SAFE_TEXTURE_VARIANT_LIMIT = 1
 HIP_SAFE_WORKER_LIMIT = 2 * _n_render_nodes
 HIP_SAFE_TEXTURE_VARIANT_LIMIT = 1
@@ -277,27 +277,28 @@ def render_worker(args_tuple):
     if n_gpus > 1:
         gpu_idx = worker_id % n_gpus
         node_path = drm_nodes[gpu_idx]
-        # Read PCI bus ID from sysfs for MESA_VK_DEVICE_SELECT (most reliable).
-        pci_id = None
+        # Read vendor:device hex IDs from sysfs for MESA_VK_DEVICE_SELECT.
+        vid_did = None
         try:
             node_name = os.path.basename(node_path)
-            uevent = f"/sys/class/drm/{node_name}/device/uevent"
-            with open(uevent) as f:
-                for line in f:
-                    if line.startswith("PCI_SLOT_NAME="):
-                        # e.g. "0000:03:00.0" -> "pci:0000:03:00.0"
-                        pci_id = "pci:" + line.strip().split("=", 1)[1]
-                        break
+            dev_dir = f"/sys/class/drm/{node_name}/device"
+            with open(f"{dev_dir}/vendor") as f:
+                vid = f.read().strip()          # e.g. "0x1002"
+            with open(f"{dev_dir}/device") as f:
+                did = f.read().strip()          # e.g. "0x73bf"
+            # RADV format: "vid:did!" — the ! forces it as default device.
+            vid_did = f"{vid[2:]}:{did[2:]}!"
         except OSError:
             pass
-        os.environ["DRI_PRIME"] = str(gpu_idx)
-        if pci_id:
-            os.environ["MESA_VK_DEVICE_SELECT"] = pci_id
+        if vid_did:
+            os.environ["MESA_VK_DEVICE_SELECT"] = vid_did
+            os.environ["MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE"] = "1"
+        os.environ["DRI_PRIME"] = node_path
         os.environ["GPU_DEVICE_ORDINAL"] = str(gpu_idx)
         os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_idx)
         os.environ["ROCR_VISIBLE_DEVICES"] = str(gpu_idx)
         print(f"[worker {worker_id}] Pinned to GPU {gpu_idx} ({node_path}"
-              f"{', ' + pci_id if pci_id else ''})", flush=True)
+              f"{', vk_select=' + vid_did if vid_did else ''})", flush=True)
 
     # Skip if already fully rendered
     if os.path.exists(tmp_file):
