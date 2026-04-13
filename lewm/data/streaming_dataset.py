@@ -4,6 +4,7 @@ from __future__ import annotations
 import glob
 import math
 import os
+from collections import OrderedDict
 from typing import Iterator, List, Tuple
 
 import h5py
@@ -15,9 +16,10 @@ from torch.utils.data import IterableDataset
 class StreamingJEPADataset(IterableDataset):
     """Yields (vision, proprio, cmds, dones, collisions, labels) sequence tuples.
 
-    Streams directly from HDF5 files — no full-dataset RAM copy.  Sequence
-    indices are pre-built at init and sharded across all workers by index
-    (not by file), so all num_workers are active regardless of file count.
+    Streams vision directly from HDF5 and keeps a small worker-local LRU for
+    non-vision arrays. Sequence indices are pre-built at init and sharded
+    across all workers by index (not by file), so all num_workers are active
+    regardless of file count.
 
     The *labels* dict contains optional supervision signals added by the
     extended data pipeline: clearance, near_miss, traversability,
@@ -55,6 +57,7 @@ class StreamingJEPADataset(IterableDataset):
         "beacon_range":     (np.float32, 999.0),
         "cmd_pattern":      (np.int32,   0),
     }
+    SMALL_ARRAY_CACHE_SIZE = 2
 
     def __init__(
         self,
@@ -149,6 +152,36 @@ class StreamingJEPADataset(IterableDataset):
         if np.any(valid):
             active[valid] = cmd_source[src_idx[valid]]
         return active
+
+    def _get_small_arrays(
+        self,
+        fpath: str,
+        h5f: h5py.File,
+        cache: OrderedDict[str, dict[str, np.ndarray]],
+    ) -> dict[str, np.ndarray]:
+        """Read non-vision arrays once per file into a small worker-local LRU."""
+        arrays = cache.get(fpath)
+        if arrays is not None:
+            cache.move_to_end(fpath)
+            return arrays
+
+        arrays = {
+            "proprio": np.asarray(h5f["proprio"][:], dtype=np.float32),
+            "cmds": np.asarray(h5f["cmds"][:], dtype=np.float32),
+        }
+        if "dones" in h5f:
+            arrays["dones"] = np.asarray(h5f["dones"][:], dtype=np.bool_)
+        if "collisions" in h5f:
+            arrays["collisions"] = np.asarray(h5f["collisions"][:], dtype=np.bool_)
+        if self.load_labels:
+            for field, (dtype, _) in self.LABEL_FIELDS.items():
+                if field in h5f:
+                    arrays[field] = np.asarray(h5f[field][:], dtype=dtype)
+
+        cache[fpath] = arrays
+        while len(cache) > self.SMALL_ARRAY_CACHE_SIZE:
+            cache.popitem(last=False)
+        return arrays
 
     @staticmethod
     def _discover_files(data_dir: str) -> List[str]:
@@ -349,6 +382,7 @@ class StreamingJEPADataset(IterableDataset):
         )
 
         open_files: dict = {}
+        small_array_cache: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
         raw_arrays: dict = {}
         try:
             for b0 in range(0, len(indices), self.batch_size):
@@ -381,9 +415,11 @@ class StreamingJEPADataset(IterableDataset):
                     if fpath not in open_files:
                         open_files[fpath] = h5py.File(fpath, "r")
                     h5f = open_files[fpath]
+                    small_arrays = self._get_small_arrays(fpath, h5f, small_array_cache)
 
                     raw_end = t0 + self.raw_span
                     obs_idx = t0 + obs_offsets_template
+                    block_idx = t0 + block_gather
 
                     episode_meta = self._episode_metadata[fpath]
                     episode_ids[i] = episode_meta["episode_id"][env_idx, obs_idx]
@@ -391,33 +427,22 @@ class StreamingJEPADataset(IterableDataset):
                     obs_steps[i] = episode_meta["episode_step"][env_idx, obs_idx]
                     raw_steps[i] = obs_idx
 
-                    vis_slice = h5f["vision"][env_idx, t0:raw_end]
-                    prop_slice = h5f["proprio"][env_idx, t0:raw_end]
-                    vis[i] = vis_slice[obs_offsets_template]
-                    prop[i] = prop_slice[obs_offsets_template]
-
-                    cmds_slice = h5f["cmds"][env_idx, t0:raw_end]
-                    if self.command_representation == "mean_scaled":
-                        active_slice = None
-                        active_prefix_start = t0
+                    if self.temporal_stride == 1:
+                        vis[i] = h5f["vision"][env_idx, t0:t0 + self.seq_len]
+                        prop[i] = small_arrays["proprio"][env_idx, t0:t0 + self.seq_len]
                     else:
-                        active_prefix_start = max(0, t0 - self.command_latency)
-                        active_slice = h5f["cmds"][env_idx, active_prefix_start:raw_end]
+                        vis[i] = h5f["vision"][env_idx, obs_idx]
+                        prop[i] = small_arrays["proprio"][env_idx, obs_idx]
 
-                    dones_slice = (
-                        h5f["dones"][env_idx, t0:raw_end] if "dones" in h5f else None
-                    )
-                    collisions_slice = (
-                        h5f["collisions"][env_idx, t0:raw_end]
-                        if "collisions" in h5f else None
-                    )
+                    cmds_env = small_arrays["cmds"][env_idx]
+                    dones_data = small_arrays.get("dones")
+                    collisions_data = small_arrays.get("collisions")
 
                     if self.load_labels:
                         for field in self.LABEL_FIELDS:
-                            if field in h5f:
-                                label_arrays[field][i] = h5f[field][
-                                    env_idx, t0:raw_end
-                                ][obs_offsets_template]
+                            label_data = small_arrays.get(field)
+                            if label_data is not None:
+                                label_arrays[field][i] = label_data[env_idx, obs_idx]
 
                     if self.load_pose:
                         if fpath not in raw_arrays:
@@ -441,26 +466,28 @@ class StreamingJEPADataset(IterableDataset):
                             raw_arrays[fpath] = {"base_pos": base_pos, "yaw": yaw}
                             raw_npz.close()
                         pose_data = raw_arrays[fpath]
-                        robot_xy[i] = pose_data["base_pos"][
-                            env_idx, t0:raw_end, :2
-                        ][obs_offsets_template]
-                        robot_yaw[i] = pose_data["yaw"][env_idx, t0:raw_end][
-                            obs_offsets_template
-                        ]
+                        robot_xy[i] = pose_data["base_pos"][env_idx, obs_idx, :2]
+                        robot_yaw[i] = pose_data["yaw"][env_idx, obs_idx]
 
                     if self.command_representation == "mean_scaled":
-                        cmds[i] = cmds_slice[block_gather].mean(axis=1)
+                        cmds[i] = cmds_env[block_idx].mean(axis=1)
                     else:
-                        active_offset = t0 - active_prefix_start
-                        gathered = active_slice[active_offset + block_gather]
+                        active_prefix_start = max(0, t0 - self.command_latency)
+                        active_slice = self._reconstruct_active_commands(
+                            cmds_env[active_prefix_start:raw_end],
+                            active_prefix_start,
+                            t0,
+                            raw_end,
+                        )
+                        gathered = active_slice[block_gather]
                         if self.command_representation == "mean_active":
                             cmds[i] = gathered.mean(axis=1)
                         else:
                             cmds[i] = gathered.reshape(self.seq_len, -1)
-                    if dones_slice is not None:
-                        dones[i] = dones_slice[block_gather].any(axis=1)
-                    if collisions_slice is not None:
-                        collisions[i] = collisions_slice[block_gather].any(axis=1)
+                    if dones_data is not None:
+                        dones[i] = dones_data[env_idx, block_idx].any(axis=1)
+                    if collisions_data is not None:
+                        collisions[i] = collisions_data[env_idx, block_idx].any(axis=1)
 
                 # Build label dict of tensors
                 labels = {}
