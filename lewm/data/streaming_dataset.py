@@ -341,6 +341,12 @@ class StreamingJEPADataset(IterableDataset):
         obs_offsets_template = (
             np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
         )
+        # Precomputed gather matrix for per-step reductions over an
+        # action_block_size-long window.  Shape: (seq_len, action_block_size).
+        block_gather = (
+            obs_offsets_template[:, None]
+            + np.arange(self.action_block_size, dtype=np.int64)[None, :]
+        )
 
         open_files: dict = {}
         raw_arrays: dict = {}
@@ -442,25 +448,19 @@ class StreamingJEPADataset(IterableDataset):
                             obs_offsets_template
                         ]
 
-                    for step_idx, offset in enumerate(obs_offsets_template.tolist()):
-                        abs_start = offset
-                        abs_stop = abs_start + self.action_block_size
-                        if self.command_representation == "mean_scaled":
-                            cmds[i, step_idx] = cmds_slice[abs_start:abs_stop].mean(axis=0)
-                        elif self.command_representation == "mean_active":
-                            a_start = (t0 - active_prefix_start) + offset
-                            a_stop = a_start + self.action_block_size
-                            cmds[i, step_idx] = active_slice[a_start:a_stop].mean(axis=0)
+                    if self.command_representation == "mean_scaled":
+                        cmds[i] = cmds_slice[block_gather].mean(axis=1)
+                    else:
+                        active_offset = t0 - active_prefix_start
+                        gathered = active_slice[active_offset + block_gather]
+                        if self.command_representation == "mean_active":
+                            cmds[i] = gathered.mean(axis=1)
                         else:
-                            a_start = (t0 - active_prefix_start) + offset
-                            a_stop = a_start + self.action_block_size
-                            cmds[i, step_idx] = active_slice[a_start:a_stop].reshape(-1)
-                        if dones_slice is not None:
-                            dones[i, step_idx] = np.any(dones_slice[abs_start:abs_stop])
-                        if collisions_slice is not None:
-                            collisions[i, step_idx] = np.any(
-                                collisions_slice[abs_start:abs_stop]
-                            )
+                            cmds[i] = gathered.reshape(self.seq_len, -1)
+                    if dones_slice is not None:
+                        dones[i] = dones_slice[block_gather].any(axis=1)
+                    if collisions_slice is not None:
+                        collisions[i] = collisions_slice[block_gather].any(axis=1)
 
                 # Build label dict of tensors
                 labels = {}
