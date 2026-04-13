@@ -329,8 +329,8 @@ class StreamingJEPADataset(IterableDataset):
     def __iter__(self) -> Iterator:
         info = torch.utils.data.get_worker_info()
 
-        # Group by (file, env) then shuffle groups — avoids re-decompressing
-        # the same gzip HDF5 chunk for every random 4-frame read.
+        # Group by (file, env) then shuffle groups so consecutive batch entries
+        # share the same HDF5 env slice — lets us bulk-read once per env.
         rng = np.random.RandomState()
         indices = list(self._all_indices)
         indices = self._group_and_shuffle(indices, rng)
@@ -338,6 +338,10 @@ class StreamingJEPADataset(IterableDataset):
         # Shard by worker index (stride pattern keeps batches balanced)
         if info is not None:
             indices = indices[info.id :: info.num_workers]
+
+        obs_offsets_template = (
+            np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
+        )
 
         # Keep file handles open for the lifetime of this worker's iteration
         open_files: dict = {}
@@ -369,33 +373,60 @@ class StreamingJEPADataset(IterableDataset):
                     robot_xy = np.empty((B, self.seq_len, 2), dtype=np.float32)
                     robot_yaw = np.empty((B, self.seq_len), dtype=np.float32)
 
-                for i, (fpath, e, t0) in enumerate(batch_idx):
+                # Walk the batch in contiguous (fpath, env) runs and do ONE
+                # bulk h5py read per run, then numpy-slice per window.  This
+                # collapses ~14*B h5py calls into ~14*num_runs — typically
+                # 1-2 runs per 256-batch when windows are grouped by env.
+                group_start = 0
+                while group_start < B:
+                    fpath, env_idx, t0_first = batch_idx[group_start]
+                    group_end = group_start + 1
+                    while (
+                        group_end < B
+                        and batch_idx[group_end][0] == fpath
+                        and batch_idx[group_end][1] == env_idx
+                    ):
+                        group_end += 1
+
                     if fpath not in open_files:
                         open_files[fpath] = h5py.File(fpath, "r")
                     h5f = open_files[fpath]
-                    raw_end = t0 + self.raw_span
-                    obs_offsets = np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
-                    obs_idx = t0 + obs_offsets
-                    episode_meta = self._episode_metadata[fpath]
-                    episode_ids[i] = episode_meta["episode_id"][e, obs_idx]
-                    scene_ids[i].fill(self._scene_ids[fpath])
-                    obs_steps[i] = episode_meta["episode_step"][e, obs_idx]
-                    raw_steps[i] = obs_idx
 
-                    vis_chunk = h5f["vision"][e, t0:raw_end]
-                    prop_chunk = h5f["proprio"][e, t0:raw_end]
-                    cmds_chunk = h5f["cmds"][e, t0:raw_end]
-                    dones_chunk = h5f["dones"][e, t0:raw_end] if "dones" in h5f else None
-                    collisions_chunk = (
-                        h5f["collisions"][e, t0:raw_end] if "collisions" in h5f else None
+                    t0_last = batch_idx[group_end - 1][2]
+                    bulk_start = t0_first
+                    bulk_end = t0_last + self.raw_span
+
+                    vis_block = h5f["vision"][env_idx, bulk_start:bulk_end]
+                    prop_block = h5f["proprio"][env_idx, bulk_start:bulk_end]
+                    cmds_block = h5f["cmds"][env_idx, bulk_start:bulk_end]
+                    dones_block = (
+                        h5f["dones"][env_idx, bulk_start:bulk_end]
+                        if "dones" in h5f else None
                     )
-                    active_cmds_chunk = None
+                    collisions_block = (
+                        h5f["collisions"][env_idx, bulk_start:bulk_end]
+                        if "collisions" in h5f else None
+                    )
+                    active_cmds_block = None
+                    active_prefix_start = bulk_start
                     if self.command_representation != "mean_scaled":
-                        prefix_start = max(0, t0 - self.command_latency)
-                        cmd_source = h5f["cmds"][e, prefix_start:raw_end]
-                        active_cmds_chunk = self._reconstruct_active_commands(
-                            cmd_source, prefix_start, t0, raw_end,
-                        )
+                        active_prefix_start = max(0, bulk_start - self.command_latency)
+                        active_cmds_block = h5f["cmds"][
+                            env_idx, active_prefix_start:bulk_end
+                        ]
+
+                    label_blocks: dict = {}
+                    if self.load_labels:
+                        for field in self.LABEL_FIELDS:
+                            if field in h5f:
+                                label_blocks[field] = h5f[field][
+                                    env_idx, bulk_start:bulk_end
+                                ]
+
+                    episode_meta = self._episode_metadata[fpath]
+                    scene_id_val = self._scene_ids[fpath]
+
+                    pose_data = None
                     if self.load_pose:
                         if fpath not in raw_arrays:
                             raw_npz = np.load(self._raw_files[fpath], allow_pickle=True)
@@ -419,31 +450,59 @@ class StreamingJEPADataset(IterableDataset):
                             raw_npz.close()
                         pose_data = raw_arrays[fpath]
 
-                    vis[i] = vis_chunk[obs_offsets]
-                    prop[i] = prop_chunk[obs_offsets]
-                    if self.load_pose:
-                        robot_xy[i] = pose_data["base_pos"][e, t0:raw_end, :2][obs_offsets]
-                        robot_yaw[i] = pose_data["yaw"][e, t0:raw_end][obs_offsets]
+                    for i in range(group_start, group_end):
+                        _, _, t0 = batch_idx[i]
+                        raw_end = t0 + self.raw_span
+                        rel = t0 - bulk_start
+                        obs_rel = rel + obs_offsets_template
+                        obs_idx = t0 + obs_offsets_template
 
-                    for step_idx, offset in enumerate(obs_offsets.tolist()):
-                        block = slice(offset, offset + self.action_block_size)
-                        if self.command_representation == "mean_scaled":
-                            cmds[i, step_idx] = cmds_chunk[block].mean(axis=0)
-                        elif self.command_representation == "mean_active":
-                            cmds[i, step_idx] = active_cmds_chunk[block].mean(axis=0)
-                        else:
-                            cmds[i, step_idx] = active_cmds_chunk[block].reshape(-1)
-                        if dones_chunk is not None:
-                            dones[i, step_idx] = np.any(dones_chunk[block])
-                        if collisions_chunk is not None:
-                            collisions[i, step_idx] = np.any(collisions_chunk[block])
+                        episode_ids[i] = episode_meta["episode_id"][env_idx, obs_idx]
+                        scene_ids[i].fill(scene_id_val)
+                        obs_steps[i] = episode_meta["episode_step"][env_idx, obs_idx]
+                        raw_steps[i] = obs_idx
 
-                    # Load extended labels if available
-                    if self.load_labels:
-                        for field in self.LABEL_FIELDS:
-                            if field in h5f:
-                                label_chunk = h5f[field][e, t0:raw_end]
-                                label_arrays[field][i] = label_chunk[obs_offsets]
+                        vis[i] = vis_block[obs_rel]
+                        prop[i] = prop_block[obs_rel]
+                        if self.load_pose:
+                            robot_xy[i] = pose_data["base_pos"][
+                                env_idx, t0:raw_end, :2
+                            ][obs_offsets_template]
+                            robot_yaw[i] = pose_data["yaw"][env_idx, t0:raw_end][
+                                obs_offsets_template
+                            ]
+
+                        for step_idx, offset in enumerate(obs_offsets_template.tolist()):
+                            abs_start = rel + offset
+                            abs_stop = abs_start + self.action_block_size
+                            if self.command_representation == "mean_scaled":
+                                cmds[i, step_idx] = cmds_block[abs_start:abs_stop].mean(axis=0)
+                            elif self.command_representation == "mean_active":
+                                a_start = (t0 - active_prefix_start) + offset
+                                a_stop = a_start + self.action_block_size
+                                cmds[i, step_idx] = active_cmds_block[
+                                    a_start:a_stop
+                                ].mean(axis=0)
+                            else:
+                                a_start = (t0 - active_prefix_start) + offset
+                                a_stop = a_start + self.action_block_size
+                                cmds[i, step_idx] = active_cmds_block[
+                                    a_start:a_stop
+                                ].reshape(-1)
+                            if dones_block is not None:
+                                dones[i, step_idx] = np.any(
+                                    dones_block[abs_start:abs_stop]
+                                )
+                            if collisions_block is not None:
+                                collisions[i, step_idx] = np.any(
+                                    collisions_block[abs_start:abs_stop]
+                                )
+
+                        if self.load_labels:
+                            for field, block in label_blocks.items():
+                                label_arrays[field][i] = block[obs_rel]
+
+                    group_start = group_end
 
                 # Build label dict of tensors
                 labels = {}
