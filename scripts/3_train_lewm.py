@@ -231,6 +231,7 @@ def train(args: argparse.Namespace) -> None:
         require_no_done=False,
         require_no_collision=False,
         num_workers=num_workers,
+        load_labels=False,
     )
     dataset = StreamingJEPADataset(**dataset_kwargs)
     train_dataset = dataset
