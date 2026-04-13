@@ -427,12 +427,9 @@ class StreamingJEPADataset(IterableDataset):
                     obs_steps[i] = episode_meta["episode_step"][env_idx, obs_idx]
                     raw_steps[i] = obs_idx
 
-                    if self.temporal_stride == 1:
-                        vis[i] = h5f["vision"][env_idx, t0:t0 + self.seq_len]
-                        prop[i] = small_arrays["proprio"][env_idx, t0:t0 + self.seq_len]
-                    else:
-                        vis[i] = h5f["vision"][env_idx, obs_idx]
-                        prop[i] = small_arrays["proprio"][env_idx, obs_idx]
+                    vis_slice = h5f["vision"][env_idx, t0:raw_end]
+                    vis[i] = vis_slice[obs_offsets_template]
+                    prop[i] = small_arrays["proprio"][env_idx, obs_idx]
 
                     cmds_env = small_arrays["cmds"][env_idx]
                     dones_data = small_arrays.get("dones")
