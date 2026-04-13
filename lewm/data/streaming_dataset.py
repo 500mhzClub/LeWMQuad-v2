@@ -335,29 +335,28 @@ class StreamingJEPADataset(IterableDataset):
         return indices
 
     def __len__(self) -> int:
-        # Sum per-worker batch counts (each worker rounds up independently)
-        n = len(self._all_indices)
-        worker_sizes = [len(range(w, n, self._num_workers)) for w in range(self._num_workers)]
+        # Sum per-worker batch counts (each worker rounds up independently).
+        # This mirrors __iter__: worker sharding happens at (file, env) group
+        # granularity so workers do not duplicate chunk/cache reads.
+        group_sizes = [len(group) for group in self._group_indices(self._all_indices)]
+        worker_sizes = [
+            sum(group_sizes[w :: self._num_workers])
+            for w in range(self._num_workers)
+        ]
         return sum(math.ceil(s / self.batch_size) for s in worker_sizes)
 
     @staticmethod
-    def _group_and_shuffle(indices, rng):
-        """Group indices by (file, env) so reads within a group hit the same
-        HDF5 chunk (avoiding repeated gzip decompression), then shuffle the
-        group order for epoch-level randomness.  Indices within each group are
-        kept in ascending t0 order for sequential reads."""
+    def _group_indices(indices):
+        """Group indices by (file, env) and sort each group by raw start step."""
         from collections import defaultdict
         groups = defaultdict(list)
         for fpath, e, t0 in indices:
             groups[(fpath, e)].append((fpath, e, t0))
-        # Sort within each group by t0 for sequential access
-        group_list = [sorted(v, key=lambda x: x[2]) for v in groups.values()]
-        rng.shuffle(group_list)
-        # Flatten back
-        out = []
-        for g in group_list:
-            out.extend(g)
-        return out
+        return [sorted(v, key=lambda x: x[2]) for v in groups.values()]
+
+    @staticmethod
+    def _flatten_groups(groups):
+        return [idx for group in groups for idx in group]
 
     def __iter__(self) -> Iterator:
         info = torch.utils.data.get_worker_info()
@@ -365,11 +364,12 @@ class StreamingJEPADataset(IterableDataset):
         # Group by (file, env) so consecutive windows hit the same HDF5 chunk,
         # then shuffle group order for epoch-level randomness.
         rng = np.random.RandomState()
-        indices = list(self._all_indices)
-        indices = self._group_and_shuffle(indices, rng)
+        groups = self._group_indices(self._all_indices)
+        rng.shuffle(groups)
 
         if info is not None:
-            indices = indices[info.id :: info.num_workers]
+            groups = groups[info.id :: info.num_workers]
+        indices = self._flatten_groups(groups)
 
         obs_offsets_template = (
             np.arange(self.seq_len, dtype=np.int64) * self.temporal_stride
