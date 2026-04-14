@@ -714,7 +714,17 @@ def train(args: argparse.Namespace) -> None:
                     )
                     progress_write(f"  Checkpoint saved: {ckpt_path}", pbar)
                     import glob as _glob
-                    step_ckpts = sorted(_glob.glob(os.path.join(args.out_dir, "step_*.pt")))
+                    import re as _re
+                    # Sort numerically by step, not lexicographically —
+                    # lex sort would treat step_10000.pt < step_9000.pt and
+                    # delete the newest checkpoints on every save.
+                    def _step_num(p: str) -> int:
+                        m = _re.search(r"step_(\d+)\.pt$", p)
+                        return int(m.group(1)) if m else -1
+                    step_ckpts = sorted(
+                        _glob.glob(os.path.join(args.out_dir, "step_*.pt")),
+                        key=_step_num,
+                    )
                     for old in step_ckpts[:-3]:
                         os.remove(old)
 
