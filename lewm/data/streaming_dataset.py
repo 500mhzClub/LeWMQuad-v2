@@ -413,7 +413,21 @@ class StreamingJEPADataset(IterableDataset):
 
                 for i, (fpath, env_idx, t0) in enumerate(batch_idx):
                     if fpath not in open_files:
-                        open_files[fpath] = h5py.File(fpath, "r")
+                        # Vision is chunked (1, T, C, H, W) ~= 150 MB/chunk and
+                        # gzip-compressed. The default 1 MB chunk cache means
+                        # every per-sample slice re-decompresses the whole
+                        # chunk, which is the main source of long dataloader
+                        # stalls. A 512 MB rdcc holds the current env's chunk
+                        # (plus room for one more across group transitions),
+                        # so subsequent windows from the same group hit the
+                        # cache instead of re-running gzip.
+                        open_files[fpath] = h5py.File(
+                            fpath,
+                            "r",
+                            rdcc_nbytes=512 * 1024 * 1024,
+                            rdcc_nslots=1031,
+                            rdcc_w0=0.75,
+                        )
                     h5f = open_files[fpath]
                     small_arrays = self._get_small_arrays(fpath, h5f, small_array_cache)
 
