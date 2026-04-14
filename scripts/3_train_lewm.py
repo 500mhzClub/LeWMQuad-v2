@@ -356,7 +356,10 @@ def train(args: argparse.Namespace) -> None:
             if base.startswith("epoch_"):
                 start_epoch += 1
 
-    model = torch.compile(model)
+    # torch.compile disabled: on ROCm it was causing long stalls between
+    # kernel launches and leaving the GPU idle between bursts. Re-enable
+    # once upstream ROCm compile support is more mature.
+    # model = torch.compile(model)
 
     # ---- Optimizer (ALL parameters — end-to-end) ---------------------
     optimizer = torch.optim.AdamW(
@@ -385,6 +388,10 @@ def train(args: argparse.Namespace) -> None:
                 "step", "epoch", "total_loss", "pred_loss", "sigreg_loss",
                 "lr", "z_proj_std", "grad_norm",
             ])
+    # Keep the training metrics file open across the whole run so we avoid
+    # reopening it on every optimizer step (used to be a hot-loop syscall).
+    csv_file = open(csv_path, mode="a", newline="")
+    csv_writer = csv.writer(csv_file)
     eval_csv_path = os.path.join(args.log_dir, "eval_metrics.csv")
     if eval_dataloader is not None and not os.path.exists(eval_csv_path):
         with open(eval_csv_path, mode="w", newline="") as f:
@@ -553,6 +560,13 @@ def train(args: argparse.Namespace) -> None:
         model.train()
 
     # ---- Training loop -----------------------------------------------
+    # Metrics are staged on the GPU and only copied to CPU every
+    # LOG_FLUSH_EVERY steps. Each .item()/float() on a GPU tensor forces a
+    # CUDA sync, and doing that four+ times per step was serialising the
+    # pipeline and leaving the GPU idle between bursts.
+    LOG_FLUSH_EVERY = 10
+    pending_logs: list = []
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
 
@@ -585,9 +599,6 @@ def train(args: argparse.Namespace) -> None:
                     out = model(vision, proprio, cmds, mask=mask)
 
                 total_loss = out["loss"]
-                pred_loss_val = out["pred_loss"].item()
-                sigreg_loss_val = out["sigreg_loss"].item()
-                z_std = out["z_proj_std"].item()
 
                 # Warmup: linearly ramp LR from near-zero to args.lr over warmup_steps
                 if global_step < args.warmup_steps:
@@ -596,61 +607,97 @@ def train(args: argparse.Namespace) -> None:
                         pg["lr"] = warmup_lr
 
                 total_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=args.grad_clip,
-                ).item()
+                )
 
-                if not torch.isfinite(total_loss) or not math.isfinite(grad_norm):
-                    progress_write(
-                        "  WARNING: "
-                        f"non-finite loss={total_loss.item():.4f} or "
-                        f"grad_norm={grad_norm:.4f} at step {global_step}, "
-                        "skipping update.",
-                        pbar,
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+                # Neutralise rare non-finite grads in place so we can always
+                # step without a CPU sync. grad_clip already bounds magnitude;
+                # this just prevents NaN/Inf spikes from corrupting weights.
+                for p in model.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
                 optimizer.step()
 
                 # NOTE: No EMA update — that's the whole point of LeWM.
 
-                # ---- Collapse monitoring ---------------------------------
-                if z_std < 0.1:
-                    progress_write(
-                        f"  WARNING: z_proj_std={z_std:.4f} < 0.1; possible collapse.",
-                        pbar,
-                    )
-
-                # ---- Logging ---------------------------------------------
                 global_step += 1
                 current_lr = optimizer.param_groups[0]["lr"]
-                loss_val = total_loss.item()
-                epoch_loss_sum += loss_val
-                epoch_batches += 1
 
-                with open(csv_path, mode="a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        global_step,
-                        epoch + 1,
-                        f"{loss_val:.6f}",
-                        f"{pred_loss_val:.6f}",
-                        f"{sigreg_loss_val:.6f}",
-                        f"{current_lr:.2e}",
-                        f"{z_std:.6f}",
-                        f"{grad_norm:.4f}",
-                    ])
+                pending_logs.append((
+                    global_step,
+                    epoch + 1,
+                    total_loss.detach(),
+                    out["pred_loss"].detach(),
+                    out["sigreg_loss"].detach(),
+                    out["z_proj_std"].detach(),
+                    grad_norm_t.detach(),
+                    current_lr,
+                ))
 
-                if global_step % 5 == 0:
-                    pbar.set_postfix({
-                        "loss": f"{loss_val:.4f}",
-                        "pred": f"{pred_loss_val:.4f}",
-                        "sig": f"{sigreg_loss_val:.4f}",
-                        "z_std": f"{z_std:.3f}",
-                        "gnorm": f"{grad_norm:.3f}",
-                        "lr": f"{current_lr:.1e}",
-                    })
+                should_flush = (
+                    len(pending_logs) >= LOG_FLUSH_EVERY
+                    or global_step % args.save_every == 0
+                )
+
+                if should_flush:
+                    last_display = None
+                    for (step, ep, loss_t, pred_t, sig_t, z_std_t, gnorm_t, lr) in pending_logs:
+                        loss_val = float(loss_t)
+                        pred_loss_val = float(pred_t)
+                        sigreg_loss_val = float(sig_t)
+                        z_std_val = float(z_std_t)
+                        gnorm_val = float(gnorm_t)
+
+                        if not math.isfinite(loss_val) or not math.isfinite(gnorm_val):
+                            progress_write(
+                                "  WARNING: "
+                                f"non-finite loss={loss_val:.4f} or "
+                                f"grad_norm={gnorm_val:.4f} at step {step} "
+                                "(grads were sanitised, step was applied).",
+                                pbar,
+                            )
+                            continue
+
+                        if z_std_val < 0.1:
+                            progress_write(
+                                f"  WARNING: z_proj_std={z_std_val:.4f} < 0.1; possible collapse.",
+                                pbar,
+                            )
+
+                        epoch_loss_sum += loss_val
+                        epoch_batches += 1
+
+                        csv_writer.writerow([
+                            step,
+                            ep,
+                            f"{loss_val:.6f}",
+                            f"{pred_loss_val:.6f}",
+                            f"{sigreg_loss_val:.6f}",
+                            f"{lr:.2e}",
+                            f"{z_std_val:.6f}",
+                            f"{gnorm_val:.4f}",
+                        ])
+
+                        last_display = (
+                            loss_val, pred_loss_val, sigreg_loss_val,
+                            z_std_val, gnorm_val, lr,
+                        )
+
+                    csv_file.flush()
+                    pending_logs.clear()
+
+                    if last_display is not None:
+                        l, p, s, z, g, lr_v = last_display
+                        pbar.set_postfix({
+                            "loss": f"{l:.4f}",
+                            "pred": f"{p:.4f}",
+                            "sig": f"{s:.4f}",
+                            "z_std": f"{z:.3f}",
+                            "gnorm": f"{g:.3f}",
+                            "lr": f"{lr_v:.1e}",
+                        })
 
                 # ---- Intra-epoch checkpoint ------------------------------
                 if global_step % args.save_every == 0:
@@ -697,6 +744,7 @@ def train(args: argparse.Namespace) -> None:
         )
         print(f"  Epoch checkpoint saved: {epoch_ckpt_path}")
 
+    csv_file.close()
     print("Training complete.")
 
 
