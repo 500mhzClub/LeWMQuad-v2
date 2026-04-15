@@ -1760,3 +1760,124 @@ This fix is compatible with the rest of the report:
   the only operational note is that existing head caches should be
   invalidated by the `CACHE_VERSION` bump before re-training heads on top
   of a newly-trained WM checkpoint.
+
+---
+
+## Addendum: Dataloader Regression from the April 14 HDF5 Cache Change (2026-04-15)
+
+This addendum records a training-throughput regression that showed up on the
+remote machine immediately after a `git pull`, why the root cause was traced
+to the dataloader rather than ROCm state, and what was changed to recover the
+pre-pull behavior without discarding the useful part of the earlier loader
+optimization work.
+
+### The symptom pattern
+
+The relevant shell-history sequence on the remote host was:
+
+- history entry `3437` — training resumed from `epoch_11.pt` and ran fast
+  through epochs 12-17
+- history entry `3439` — `git pull`
+- history entry `3440` — training resumed from `epoch_17.pt` and became slow
+- history entry `3443` — machine reboot
+- history entry `3447` — the same resumed training run was still slow after
+  reboot
+
+That sequence matters because it rules out the easy explanations. The slowdown
+started exactly after code changed, and rebooting did not clear it. The bug was
+therefore not "ROCm got wedged" or "the shell env drifted"; it was a real code
+regression introduced by the pulled commits.
+
+### The regression
+
+The most suspicious loader-side change in the pulled range was commit
+`749648f` ("Fixing cleanup logic - becnhmark dataloader"). It changed
+`StreamingJEPADataset.__iter__()` so that each worker opened HDF5 files with:
+
+```python
+h5py.File(
+    fpath,
+    "r",
+    rdcc_nbytes=512 * 1024 * 1024,
+    rdcc_nslots=1031,
+    rdcc_w0=0.75,
+)
+```
+
+and then kept those file handles alive for the lifetime of the worker
+iteration.
+
+That is a reasonable optimization only when the training dataset's `vision`
+array is still **compressed** and the loader is repeatedly hitting the same
+large HDF5 chunk. In that case, a bigger raw-data chunk cache can avoid paying
+the decompression cost again and again.
+
+It is the wrong default once the rendered dataset has been repacked for
+training, which this report already recommends:
+
+- Step 4 explicitly notes that gzip-compressed HDF5 is too slow for training
+- Step 4b therefore recommends repacking the final rendered dataset before WM
+  training
+
+On an uncompressed or lightly compressed training set, the 512 MB per-file
+HDF5 raw-data cache does not buy the same decompression win. It mostly turns
+into memory pressure. Combined with many dataloader workers and many distinct
+chunk files touched across an epoch, that can degrade throughput badly even
+though the code change was intended as an optimization.
+
+### The fix
+
+The final patch was a **targeted revert of the unconditional cache expansion**,
+not a rollback of the whole dataloader rewrite.
+
+`lewm/data/streaming_dataset.py` now does three things:
+
+1. It inspects the `vision` dataset schema at init time and records both the
+   chunk size and whether `vision` is compressed.
+2. It uses a larger HDF5 raw-data chunk cache only when `vision` is actually
+   compressed. For uncompressed data it falls back to a normal `h5py.File(...,
+   "r")` open.
+3. It bounds the per-worker open HDF5 file cache to a small LRU instead of
+   keeping an effectively unbounded set of large-cache file handles open for
+   the whole iterator lifetime.
+
+In other words: the fix preserves the original intent of `749648f` for the
+compressed-dataset case, but reverts the part that was making the repacked
+training path slower.
+
+### Code changes applied
+
+1. **`lewm/data/streaming_dataset.py`**
+   - `_inspect_schema()` now records `vision` chunk bytes and compression
+     metadata in addition to the shape / proprio-dim checks.
+   - New `_open_h5_file()` helper chooses the HDF5 open strategy:
+     default open for uncompressed `vision`, bounded enlarged `rdcc` only for
+     compressed `vision`.
+   - `open_files` is now an `OrderedDict` LRU with a small
+     `OPEN_FILE_CACHE_SIZE`, so workers cannot accumulate a large set of
+     simultaneously-open HDF5 handles carrying oversized chunk caches.
+
+### Why this is a revert
+
+This change is best understood as a **partial revert of the April 14 cache
+policy**, not as a new feature:
+
+- the earlier code assumed "larger HDF5 chunk cache is always better"
+- the recovered behavior is "larger HDF5 chunk cache is only better when the
+  `vision` dataset is compressed and the cache is bounded"
+
+That distinction matters for future debugging. If a later experiment trains
+directly from gzip HDF5, the compressed-data fast path may still be helpful.
+If the run follows the recommended repack-before-train pipeline, the bounded /
+default-cache path is the correct one.
+
+### Consistency with the rest of the report
+
+This addendum does not change the earlier methodological conclusions. It only
+documents that one of the dataloader "optimizations" in the April 13-14 commit
+range regressed the actual recommended training regime:
+
+- it does **not** change the recommendation to repack rendered HDF5 before
+  training
+- it does **not** alter the world-model objective or planner diagnosis
+- it does **not** require any runbook change beyond using the fixed loader code
