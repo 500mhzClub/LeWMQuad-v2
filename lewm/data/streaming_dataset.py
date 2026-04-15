@@ -58,6 +58,9 @@ class StreamingJEPADataset(IterableDataset):
         "cmd_pattern":      (np.int32,   0),
     }
     SMALL_ARRAY_CACHE_SIZE = 2
+    OPEN_FILE_CACHE_SIZE = 2
+    MIN_VISION_RDCC_BYTES = 32 * 1024 * 1024
+    MAX_VISION_RDCC_BYTES = 256 * 1024 * 1024
 
     def __init__(
         self,
@@ -110,7 +113,12 @@ class StreamingJEPADataset(IterableDataset):
         self._num_workers = max(1, num_workers)
         self.load_labels = load_labels
         self.load_pose = bool(load_pose)
-        self.vision_shape, self.proprio_dim = self._inspect_schema()
+        (
+            self.vision_shape,
+            self.proprio_dim,
+            self._vision_chunk_bytes,
+            self._vision_compression,
+        ) = self._inspect_schema()
         self.raw_span = (self.seq_len - 1) * self.temporal_stride + self.action_block_size
         self._scene_ids = self._build_scene_ids()
         self.allowed_scene_ids = (
@@ -227,10 +235,19 @@ class StreamingJEPADataset(IterableDataset):
             )
         return mapping
 
-    def _inspect_schema(self) -> Tuple[Tuple[int, ...], int]:
+    def _inspect_schema(
+        self,
+    ) -> Tuple[Tuple[int, ...], int, int | None, str | None]:
         with h5py.File(self.files[0], "r") as h5f:
-            vision_shape = tuple(int(x) for x in h5f["vision"].shape[2:])
+            vision_ds = h5f["vision"]
+            vision_shape = tuple(int(x) for x in vision_ds.shape[2:])
             proprio_dim = int(h5f["proprio"].shape[-1])
+            vision_chunk_bytes = (
+                None
+                if vision_ds.chunks is None
+                else int(np.prod(vision_ds.chunks, dtype=np.int64) * vision_ds.dtype.itemsize)
+            )
+            vision_compression = vision_ds.compression
 
         for fpath in self.files[1:]:
             with h5py.File(fpath, "r") as h5f:
@@ -245,7 +262,26 @@ class StreamingJEPADataset(IterableDataset):
                         f"{int(h5f['proprio'].shape[-1])} != {proprio_dim}"
                     )
 
-        return vision_shape, proprio_dim
+        return vision_shape, proprio_dim, vision_chunk_bytes, vision_compression
+
+    def _open_h5_file(self, fpath: str) -> h5py.File:
+        # A large HDF5 raw-data chunk cache helps only for compressed vision
+        # datasets. On repacked/uncompressed training sets it mostly increases
+        # per-worker memory pressure, which can tank throughput.
+        if self._vision_compression is None or self._vision_chunk_bytes is None:
+            return h5py.File(fpath, "r")
+
+        rdcc_nbytes = min(
+            self.MAX_VISION_RDCC_BYTES,
+            max(self.MIN_VISION_RDCC_BYTES, self._vision_chunk_bytes * 2),
+        )
+        return h5py.File(
+            fpath,
+            "r",
+            rdcc_nbytes=int(rdcc_nbytes),
+            rdcc_nslots=1031,
+            rdcc_w0=0.75,
+        )
 
     def _build_episode_metadata(self) -> dict[str, dict[str, np.ndarray]]:
         """Precompute true reset-separated episode ids and per-episode steps.
@@ -381,7 +417,7 @@ class StreamingJEPADataset(IterableDataset):
             + np.arange(self.action_block_size, dtype=np.int64)[None, :]
         )
 
-        open_files: dict = {}
+        open_files: OrderedDict[str, h5py.File] = OrderedDict()
         small_array_cache: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
         raw_arrays: dict = {}
         try:
@@ -412,23 +448,15 @@ class StreamingJEPADataset(IterableDataset):
                     robot_yaw = np.empty((B, self.seq_len), dtype=np.float32)
 
                 for i, (fpath, env_idx, t0) in enumerate(batch_idx):
-                    if fpath not in open_files:
-                        # Vision is chunked (1, T, C, H, W) ~= 150 MB/chunk and
-                        # gzip-compressed. The default 1 MB chunk cache means
-                        # every per-sample slice re-decompresses the whole
-                        # chunk, which is the main source of long dataloader
-                        # stalls. A 512 MB rdcc holds the current env's chunk
-                        # (plus room for one more across group transitions),
-                        # so subsequent windows from the same group hit the
-                        # cache instead of re-running gzip.
-                        open_files[fpath] = h5py.File(
-                            fpath,
-                            "r",
-                            rdcc_nbytes=512 * 1024 * 1024,
-                            rdcc_nslots=1031,
-                            rdcc_w0=0.75,
-                        )
-                    h5f = open_files[fpath]
+                    h5f = open_files.get(fpath)
+                    if h5f is None:
+                        h5f = self._open_h5_file(fpath)
+                        open_files[fpath] = h5f
+                        while len(open_files) > self.OPEN_FILE_CACHE_SIZE:
+                            _, old_h5f = open_files.popitem(last=False)
+                            old_h5f.close()
+                    else:
+                        open_files.move_to_end(fpath)
                     small_arrays = self._get_small_arrays(fpath, h5f, small_array_cache)
 
                     raw_end = t0 + self.raw_span
