@@ -1573,3 +1573,190 @@ The following ideas are documented for future work, not blocked on:
 
 None of these are required for the exploration task to work, but each would
 improve robustness if the basic pipeline underperforms.
+
+---
+
+## Addendum: Projector-Space Mismatch at the Planner Cost Site (2026-04-15)
+
+This addendum records a subtle but real bug discovered while reviewing the
+BatchNorm eval-mode behavior of the two projectors, the fix that was applied,
+and the reasoning iteration (including a dead-end "unify everything" attempt
+that was reverted). It belongs alongside the earlier Remediation sections
+because it changes a load-bearing line of the planner cost computation even
+though it looks like a one-line fix.
+
+### The bug
+
+`LeWorldModel` carries **two** BatchNorm projectors:
+
+- `enc_projector` — applied to encoder outputs (image-derived features), both
+  in training and at the WM training loss site.
+- `pred_projector` — applied to predictor outputs (action-conditioned
+  rollouts), both in training and at the WM training loss site.
+
+BatchNorm in `eval()` mode uses frozen running mean/variance statistics
+accumulated during training. Because the two projectors see distinct input
+populations (pure-image features vs. action-conditioned rollout features),
+their running stats **drift apart** during training and end up in two
+different affine coordinate systems at inference.
+
+That drift is invisible as long as loss terms and costs stay on one side of
+the pipeline. It becomes a bug the moment a cost term takes the *difference*
+between an encoder-side embedding and a predictor-side embedding, because the
+two are no longer in the same space. In `scripts/6_infer_pure_wm.py`, the
+planner was doing exactly that:
+
+- `terminal_l2` — squared distance between a rollout's final latent
+  (`pred_projector` space) and the breadcrumb goal embedding (which was being
+  encoded through `enc_projector`).
+- `terminal_cosine` — same pairing, cosine variant.
+- `terminal_displacement` — difference between a rollout latent and the
+  current-state latent (again, encoder-side).
+- `goal_similarity_proj` audit metric — same cross-space comparison in the
+  logs.
+
+Each of these was silently evaluating a cost across two different affine
+frames, with the mismatch baked into the objective the CEM planner was
+optimising.
+
+### Why two projectors exist in the first place
+
+An initial theory was that the second projector is "tradition" inherited from
+JEPA-family methods and could be dropped at inference. That is wrong.
+
+BatchNorm's running statistics are only valid if the inputs at inference
+match the distribution seen during training. Encoder outputs and predictor
+outputs are genuinely different populations (one is purely visual, the other
+is visual + action-conditioned and has been transformed by a 6-layer
+transformer). Sharing a single projector across both populations would
+require a single BN to maintain running stats over a bimodal distribution,
+which defeats the point of BN and corrupts the normality assumption SIGReg
+is enforcing. The LeWM paper retains two projectors for the same reason: it
+is the only way to keep SIGReg-on-BN-projected-features well-defined on both
+sides of the predictor.
+
+Corollary: the fix cannot be "push encoder outputs through `pred_projector`
+so everything is in one space." That would feed a distinct population
+through `pred_projector`'s BN and break the very calibration that made the
+cost meaningful on the rollout side.
+
+### The fix: re-project at the cost site, not at the input boundary
+
+The correct fix is to accept the dual-projector design as paper-faithful and
+re-project only where direct-arithmetic cost terms require a single frame.
+The rule is:
+
+- **Heads** (displacement, goal, coverage_gain, escape_frontier, safety,
+  exploration, place) continue to consume whichever projector space they
+  were trained on. Cross-space heads learn the bridge during training.
+- **Direct-arithmetic cost terms** (`terminal_l2`, `terminal_cosine`,
+  `terminal_displacement`, `goal_similarity_proj` audit) are computed in
+  `pred_projector` space on both sides. The encoder-side operand
+  (current-state / breadcrumb goal) is re-projected through `pred_projector`
+  at the cost site.
+
+This keeps each projector's BN fed only by the input population it was
+calibrated for, while still letting the direct-arithmetic cost terms compare
+like-for-like.
+
+### Code changes applied
+
+1. **`lewm/models/lewm.py`** — new `pred_proj_from_raw(z_raw)` helper on
+   `LeWorldModel`. It is a thin wrapper around `self.pred_projector(z_raw)`
+   with a docstring documenting why it exists (the BN drift argument above).
+   It is the single chokepoint for "take a raw encoder latent and re-express
+   it in `pred_projector` space." It is called only at inference; the WM
+   training loop still routes `z_raw → enc_projector` for the loss, so
+   neither projector's BN stats are contaminated.
+
+2. **`scripts/6_infer_pure_wm.py`** —
+   - `observe()` now returns both `z_proj` (enc-space, fed to heads matching
+     their training contract) and `z_pred_proj` (pred-space, fed to the
+     direct-arithmetic cost terms). `z_pred_proj` is computed via
+     `world_model.pred_proj_from_raw(z_raw)`.
+   - `encode_breadcrumb()` still encodes through `enc_projector` (so the
+     encoder-side breadcrumb latent is available for goal-head consumers).
+     The pred-space breadcrumb reference is computed at the goal-encoding
+     site by passing the raw goal latent through `pred_proj_from_raw`, and
+     is stored alongside `z_breadcrumb_proj_ref` as
+     `z_breadcrumb_pred_proj_ref`.
+   - `Planner.plan()` gained `z_start_pred_proj` and `z_goal_pred_proj`
+     parameters. In `terminal_l2` / `terminal_cosine`, the goal-match batch
+     prefers `z_goal_pp` when provided and falls back to the enc-space
+     `z_goal_batch` only if it is not. In `terminal_displacement`, the
+     current-state operand uses `z_start_pp` when supplied, falling back to
+     `z0_proj`. The `head` branch is untouched: it continues to feed the
+     goal head `z_goal_batch` (enc-space), because that head was trained on
+     enc-space goals.
+   - The planner call site now passes
+     `z_start_pred_proj=obs["z_pred_proj"]` and
+     `z_goal_pred_proj=z_breadcrumb_pred_proj_ref.unsqueeze(0)`.
+   - Audit metrics that log `goal_similarity_proj` for both the committed
+     rollout and the first-command audit now use
+     `z_breadcrumb_pred_proj_ref` as the reference, so the logged number
+     lives in a single space.
+
+3. **`scripts/4_train_energy_head.py`** — **not changed in behaviour** but
+   `CACHE_VERSION` is now `12`. See the next section for why the bump is
+   there even though the file ended up back at the paper-faithful dual-view
+   convention.
+
+### Reasoning iteration: the unify-then-revert dead end
+
+An earlier attempt at this fix tried to unify everything through
+`pred_projector`: observe() would return only pred-space latents, the
+breadcrumb encoder would route through `pred_projector`, and head training
+in `scripts/4_train_energy_head.py` would extract both views from
+`pred_projector` so heads learned in a single space. That path was
+implemented end-to-end and then reverted once the obvious question surfaced:
+feeding encoder outputs through `pred_projector`'s BN at training time for
+the head trainer would contaminate the assumption that made `pred_projector`
+valid in the first place. The same contamination argument that justifies
+the fix applies to the fix itself if the fix is pushed to the input
+boundary instead of the cost-comparison site.
+
+The revert restored the paper-faithful dual-view convention in the head
+trainer:
+
+- Encoder view: `encoder.encode_seq(...) → z_proj` (enc_projector space).
+- Rollout view: `encoder.pred_projector.forward_seq(z_pred_raw)`
+  (pred_projector space).
+- `latent_views.encoder = "enc_projector(z_obs_t)"` in the manifest.
+- Cross-space heads (displacement, coverage_gain, escape_frontier, goal)
+  continue to learn the bridge between the two spaces from paired data.
+
+Because the cache file format was touched during the unify attempt, the
+`CACHE_VERSION` bump to 12 was kept to guarantee the stale caches written
+during the dead-end iteration cannot be reused. The version number is
+therefore a tracking artifact, not a signal of a behaviour change from
+`v10`: anyone reading the git diff should expect the extract logic at
+`v12` to match the paper-faithful convention that was in force at `v10`,
+not the unified convention that briefly existed at `v11`.
+
+### Minor follow-up: dead safety-energy helper
+
+While chasing the projector mismatch, `estimate_current_safety_energy` in
+`scripts/6_infer_pure_wm.py` was inspected because it looked like it might
+feed enc-space embeddings into `safety_head` (which is trained on
+pred-space). It turns out to be dead code — no call site references it —
+and both live `safety_head` usages correctly consume rollout (pred-space)
+inputs. No fix was applied; flagged here only so it can be deleted next
+time that file is touched for cleanup.
+
+### Consistency with earlier report positions
+
+This fix is compatible with the rest of the report:
+
+- It does **not** contradict the "paper-faithful world model" stance in the
+  Intended Method and Remediation sections. It reinforces it by documenting
+  why the dual-projector design has to be retained at inference and not
+  "simplified away."
+- It does **not** change the head training contract. The cross-space head
+  bridge documented in the earlier head-training remediation sections
+  remains the mechanism that lets encoder-side state talk to pred-side
+  rollouts through learned heads. This addendum only fixes the *direct*
+  (unlearned) cost terms that were silently bypassing that bridge.
+- It does **not** alter any of the runbook steps. Steps 0–10 still apply;
+  the only operational note is that existing head caches should be
+  invalidated by the `CACHE_VERSION` bump before re-training heads on top
+  of a newly-trained WM checkpoint.

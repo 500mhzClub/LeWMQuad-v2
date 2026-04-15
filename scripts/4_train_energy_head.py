@@ -350,7 +350,7 @@ def load_frozen_encoder(args, device):
 # --------------------------------------------------------------------- #
 
 SHARD_SAMPLES = 500_000
-CACHE_VERSION = 10         # v10: true reset-separated episode ids, scene ids, valid-rollout filtering
+CACHE_VERSION = 12         # v12: encoder view via enc_projector, rollout view via pred_projector (paper-faithful)
 
 
 def progress_enabled(args: argparse.Namespace) -> bool:
@@ -379,14 +379,20 @@ def progress_write(message: str, pbar=None) -> None:
 def extract_latents(args, device) -> str:
     """Encode the full dataset once and cache two latent views.
 
+    Each projector is fed the input population its BatchNorm was calibrated
+    for during world-model training:
+
     Encoder view:
-      ``enc_projector(z_raw_t)`` for current-frame matching tasks such as
-      breadcrumb / goal supervision.
+      ``enc_projector(z_raw_t)`` — current-frame embeddings through the
+      projector whose BN running stats were tuned to encoder outputs.
 
     Rollout view:
       ``pred_projector(predictor(z_raw_t, cmd_t))`` teacher-forced and aligned
-      to the next frame's labels. This matches the distribution consumed by the
-      planner's safety and exploration heads at inference.
+      to the next frame's labels — through the projector whose BN was tuned
+      to predictor outputs.
+
+    Heads that take inputs from both views (displacement, coverage_gain,
+    escape_frontier, goal) learn to bridge the two spaces during training.
     """
     _, encoder_meta = resolve_encoder_config(args, device)
     action_block_size = (

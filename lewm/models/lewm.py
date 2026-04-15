@@ -265,3 +265,14 @@ class LeWorldModel(nn.Module):
     ) -> torch.Tensor:
         """Return raw backbone embedding (for predictor input)."""
         return self.encoder(vis, prop)
+
+    def pred_proj_from_raw(self, z_raw: torch.Tensor) -> torch.Tensor:
+        """Project a raw latent through ``pred_projector``.
+
+        At inference time, ``enc_projector`` and ``pred_projector`` carry
+        independently-drifted BatchNorm running stats. Costs that compare
+        encoder-side embeddings (goals, current state) against rollout
+        outputs must live in the *same* projected space — call this on the
+        raw latent so the cost is computed in pred_projector space.
+        """
+        return self.pred_projector(z_raw)

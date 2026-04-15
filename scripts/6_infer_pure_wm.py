@@ -275,6 +275,8 @@ class PureCEMPlanner:
         z_start_raw: torch.Tensor,
         z_start_proj: torch.Tensor | None = None,
         z_goal_proj: torch.Tensor | None = None,
+        z_start_pred_proj: torch.Tensor | None = None,
+        z_goal_pred_proj: torch.Tensor | None = None,
         z_route_proj: torch.Tensor | None = None,
         z_history_raw: torch.Tensor | None = None,
         action_history: torch.Tensor | None = None,
@@ -308,6 +310,20 @@ class PureCEMPlanner:
             z_goal = z_goal_proj.to(self.device, dtype=torch.float32)
             if z_goal.ndim != 2 or z_goal.shape[0] != 1:
                 raise ValueError(f"Expected z_goal_proj shape (1, D), got {tuple(z_goal.shape)}")
+        z_start_pp = None
+        if z_start_pred_proj is not None:
+            z_start_pp = z_start_pred_proj.to(self.device, dtype=torch.float32)
+            if z_start_pp.ndim != 2 or z_start_pp.shape[0] != 1:
+                raise ValueError(
+                    f"Expected z_start_pred_proj shape (1, D), got {tuple(z_start_pp.shape)}"
+                )
+        z_goal_pp = None
+        if z_goal_pred_proj is not None:
+            z_goal_pp = z_goal_pred_proj.to(self.device, dtype=torch.float32)
+            if z_goal_pp.ndim != 2 or z_goal_pp.shape[0] != 1:
+                raise ValueError(
+                    f"Expected z_goal_pred_proj shape (1, D), got {tuple(z_goal_pp.shape)}"
+                )
         z_route = None
         if z_route_proj is not None:
             z_route = z_route_proj.to(self.device, dtype=torch.float32)
@@ -439,6 +455,15 @@ class PureCEMPlanner:
                 and goal_cost_mode != "off"
             ):
                 z_goal_batch = z_goal.expand(self.n_candidates, -1)
+                # For direct-comparison cost modes the goal must live in
+                # pred_projector space so it lines up with z_rollouts_proj.
+                # The goal_head was trained on enc_projector goals and keeps
+                # using z_goal_batch.
+                z_goal_match_batch = (
+                    z_goal_pp.expand(self.n_candidates, -1)
+                    if z_goal_pp is not None
+                    else z_goal_batch
+                )
                 if goal_cost_mode == "head":
                     if heads.goal_head is None:
                         raise ValueError("goal_cost_mode='head' requires a loaded goal_head.")
@@ -454,16 +479,16 @@ class PureCEMPlanner:
                 elif goal_cost_mode == "terminal_cosine":
                     terminal_goal_similarity = F.cosine_similarity(
                         F.normalize(z_rollouts_proj[:, -1, :], dim=-1),
-                        F.normalize(z_goal_batch, dim=-1),
+                        F.normalize(z_goal_match_batch, dim=-1),
                         dim=-1,
                     )
                     goal_cost = heads.goal_weight * (1.0 - terminal_goal_similarity).clamp_min(0.0)
                 elif goal_cost_mode == "terminal_l2":
-                    diff = z_rollouts_proj[:, -1, :] - z_goal_batch
+                    diff = z_rollouts_proj[:, -1, :] - z_goal_match_batch
                     goal_cost = heads.goal_weight * diff.square().mean(dim=-1)
                     terminal_goal_similarity = F.cosine_similarity(
                         F.normalize(z_rollouts_proj[:, -1, :], dim=-1),
-                        F.normalize(z_goal_batch, dim=-1),
+                        F.normalize(z_goal_match_batch, dim=-1),
                         dim=-1,
                     )
                 else:
@@ -576,12 +601,15 @@ class PureCEMPlanner:
                 metrics["exploration_bonus"] = effective_bonus
 
             if terminal_displacement_weight > 0.0:
-                if z0_proj is None:
+                # Compare in pred_projector space when available, since
+                # z_rollouts_proj is itself in that space.
+                start_for_displacement = z_start_pp if z_start_pp is not None else z0_proj
+                if start_for_displacement is None:
                     raise ValueError(
-                        "terminal_displacement_weight > 0 requires z_start_proj.",
+                        "terminal_displacement_weight > 0 requires z_start_proj or z_start_pred_proj.",
                     )
                 final_proj = F.normalize(z_rollouts_proj[:, -1, :], dim=-1)
-                start_proj = F.normalize(z0_proj, dim=-1).expand(self.n_candidates, -1)
+                start_proj = F.normalize(start_for_displacement, dim=-1).expand(self.n_candidates, -1)
                 terminal_displacement = (1.0 - (final_proj * start_proj).sum(dim=-1)).clamp_min(0.0)
                 costs -= terminal_displacement_weight * terminal_displacement
                 metrics["terminal_displacement_bonus"] = terminal_displacement
@@ -1502,12 +1530,17 @@ def observe(
     vision = torch.from_numpy(frame_chw).unsqueeze(0).to(planning_device).float().div_(255.0)
     proprio_enc = proprio.to(planning_device) if world_model.encoder.use_proprio else None
     z_raw, z_proj = world_model.encode(vision, proprio_enc)
+    # Pred-space view of the same observation, used by planner cost terms
+    # that compare directly against rollout latents (which live in
+    # pred_projector space). Heads keep consuming the enc-space z_proj.
+    z_pred_proj = world_model.pred_proj_from_raw(z_raw)
 
     return {
         "frame_hwc": frame_hwc,
         "frame_substituted": substituted,
         "z_raw": z_raw.detach(),
         "z_proj": z_proj.detach(),
+        "z_pred_proj": z_pred_proj.detach(),
         "proprio": proprio.detach(),
         "pos_np": pos_np,
         "quat_np": quat_np,
@@ -2772,6 +2805,7 @@ def main():
 
         z_breadcrumb_raw_ref = None
         z_breadcrumb_proj_ref = None
+        z_breadcrumb_pred_proj_ref = None
         if target_beacon is not None:
             z_breadcrumb_raw, z_breadcrumb_proj = encode_breadcrumb(
                 world_model, ego_scene, ego_robot, ego_act_dofs, ego_cam,
@@ -2780,9 +2814,13 @@ def main():
             )
             z_breadcrumb_raw_ref = z_breadcrumb_raw.detach().clone()
             z_breadcrumb_proj_ref = z_breadcrumb_proj.detach().clone()
+            z_breadcrumb_pred_proj_ref = world_model.pred_proj_from_raw(
+                z_breadcrumb_raw_ref.unsqueeze(0)
+            ).squeeze(0).detach().clone()
             print(
                 f"Goal latents encoded: ||z_raw||={float(z_breadcrumb_raw.norm()):.3f} "
-                f"||z_proj||={float(z_breadcrumb_proj.norm()):.3f}"
+                f"||z_proj||={float(z_breadcrumb_proj.norm()):.3f} "
+                f"||z_pred_proj||={float(z_breadcrumb_pred_proj_ref.norm()):.3f}"
             )
 
         reset_robot(physics_robot, physics_act_dofs, q0, spawn_xy, spawn_yaw, gs, torch)
@@ -3008,6 +3046,12 @@ def main():
                         if z_breadcrumb_proj_ref is None or args.goal_cost_mode == "off" or planner_heads.goal_weight <= 0.0
                         else z_breadcrumb_proj_ref.unsqueeze(0)
                     ),
+                    z_start_pred_proj=obs["z_pred_proj"],
+                    z_goal_pred_proj=(
+                        None
+                        if z_breadcrumb_pred_proj_ref is None or args.goal_cost_mode == "off" or planner_heads.goal_weight <= 0.0
+                        else z_breadcrumb_pred_proj_ref.unsqueeze(0)
+                    ),
                     z_route_proj=route_waypoint_proj,
                     z_history_raw=z_history_ctx,
                     action_history=action_history_ctx_t,
@@ -3048,10 +3092,10 @@ def main():
                         "proj_norm": float(audit_commit_rollout_proj[:, -1, :].squeeze(0).norm().item()),
                         "goal_similarity_proj": (
                             None
-                            if z_breadcrumb_proj_ref is None
+                            if z_breadcrumb_pred_proj_ref is None
                             else float(cosine_similarity_scalar(
                                 audit_commit_rollout_proj[:, -1, :].squeeze(0),
-                                z_breadcrumb_proj_ref,
+                                z_breadcrumb_pred_proj_ref,
                             ))
                         ),
                     }
@@ -3132,10 +3176,10 @@ def main():
                     "proj_norm": float(executed_rollout_proj.squeeze(0).norm().item()),
                     "goal_similarity_proj": (
                         None
-                        if z_breadcrumb_proj_ref is None
+                        if z_breadcrumb_pred_proj_ref is None
                         else float(cosine_similarity_scalar(
                             executed_rollout_proj.squeeze(0),
-                            z_breadcrumb_proj_ref,
+                            z_breadcrumb_pred_proj_ref,
                         ))
                     ),
                 }
