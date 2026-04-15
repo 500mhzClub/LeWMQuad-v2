@@ -475,6 +475,12 @@ def train(args: argparse.Namespace) -> None:
         Runs the predictor step-by-step using its own outputs (not ground-truth
         encoder latents) and reports per-step MSE in projected space.  This
         directly measures the regime the CEM planner operates in.
+
+        Both the AR rollout latents and the ground-truth targets are expressed
+        in ``pred_projector`` space.  Using ``enc_projector`` for the targets
+        would mix two BatchNorm affine frames under eval-mode running stats
+        and inflate the reported MSE (the same projector-frame drift that
+        corrupted the planner cost site prior to the 2026-04-15 fix).
         """
         if eval_dataloader is None:
             return
@@ -508,9 +514,12 @@ def train(args: argparse.Namespace) -> None:
                     _model = _model.module
 
                 with autocast(amp_device, dtype=torch.bfloat16):
-                    z_raw, z_proj = _model.encode_seq(vision, proprio)
+                    z_raw, _ = _model.encode_seq(vision, proprio)
+                    # Ground-truth targets in pred_projector space — same
+                    # frame the AR rollouts live in.
+                    z_proj_gt_bf = _model.pred_projector.forward_seq(z_raw)
 
-                z_proj_gt = z_proj.float()
+                z_proj_gt = z_proj_gt_bf.float()
                 z_raw_gt = z_raw.float()
 
                 # Autoregressive rollout from first frame
