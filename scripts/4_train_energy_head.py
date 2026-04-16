@@ -124,6 +124,10 @@ def parse_args() -> argparse.Namespace:
                    help="Weight for contact term (consequence mode).")
     p.add_argument("--contact_clearance", type=float, default=0.08,
                    help="Clearance below which counts as physical contact (m).")
+    p.add_argument("--skip_safety", action="store_true",
+                   help="Skip LatentEnergyHead (safety) training. Useful when "
+                        "resuming to retrain only a subset of heads while reusing "
+                        "the existing trajectory_scorer.pt bundle.")
     # Goal head
     p.add_argument("--skip_goal", action="store_true",
                    help="Skip GoalEnergyHead training.")
@@ -2160,30 +2164,45 @@ def train_safety_head(args, z_all, safety_target, device):
 class GoalPairedDataset(Dataset):
     """Builds (z_anchor, z_goal, target) triples on-the-fly.
 
+    Cross-space framing matches the planner's inference call:
+    ``goal_head.score_trajectory(z_rollouts_proj, z_goal_batch)`` is invoked with
+    the anchor side in ``pred_projector`` space (planner rollouts) and the goal
+    side in ``enc_projector`` space (breadcrumb image encoded by the encoder
+    pathway). Training paired the two BN-frame views from the same observation
+    in earlier versions, which silently mismatched the inference contract.
+
     For each sample:
       1. Pick a random target beacon identity from those present in the data.
-      2. Sample a z_goal from the pool of latents where that identity is visible.
+      2. Sample a z_goal from the encoder-view pool of latents where that
+         identity is visible (matches the breadcrumb encoder at inference).
       3. Compute target:
            - If anchor sees the same identity: target ∝ range (low = close).
            - Otherwise: target = 1 (high energy).
-
-    This teaches the GoalEnergyHead to discriminate which beacon
-    the breadcrumb refers to and to produce low energy only when
-    approaching that specific beacon.
     """
 
-    def __init__(self, z_all, beacon_identity, beacon_range, beacon_clip=5.0):
-        self.z = z_all
-        self.identity = beacon_identity.long()
-        self.range = beacon_range
+    def __init__(
+        self,
+        z_anchor,
+        anchor_identity,
+        anchor_range,
+        z_goal_pool,
+        goal_identity,
+        goal_range,
+        beacon_clip=5.0,
+    ):
+        self.z_anchor = z_anchor
+        self.z_goal_pool = z_goal_pool
+        self.identity = anchor_identity.long()
+        self.range = anchor_range
         self.beacon_clip = beacon_clip
 
-        # Build index: identity_id -> sample indices where that beacon is visible
+        # Build index: identity_id -> goal-pool indices where that beacon is
+        # visible in the encoder view.
         self.pools: dict[int, torch.Tensor] = {}
         pool_lists: dict[int, list[int]] = {}
-        for i in range(len(beacon_identity)):
-            bid = beacon_identity[i].item()
-            if bid >= 0 and beacon_range[i].item() < beacon_clip * 2:
+        for i in range(len(goal_identity)):
+            bid = int(goal_identity[i].item())
+            if bid >= 0 and float(goal_range[i].item()) < beacon_clip * 2:
                 pool_lists.setdefault(bid, []).append(i)
         for k, v in pool_lists.items():
             self.pools[k] = torch.tensor(v, dtype=torch.long)
@@ -2191,29 +2210,33 @@ class GoalPairedDataset(Dataset):
         self.valid_ids = list(self.pools.keys())
         if not self.valid_ids:
             raise ValueError(
-                "No beacon-visible samples found in the dataset. "
+                "No beacon-visible encoder-view samples found. "
                 "Cannot train GoalEnergyHead — use --skip_goal."
             )
-        print(f"    GoalPairedDataset: {len(self.valid_ids)} beacon identities, "
-              f"pools: {', '.join(f'{k}:{len(v)}' for k, v in pool_lists.items())}")
+        print(
+            f"    GoalPairedDataset: anchor={len(self.z_anchor):,} (rollout-view), "
+            f"goal_pool={len(self.z_goal_pool):,} (encoder-view), "
+            f"{len(self.valid_ids)} beacon identities, "
+            f"pools: {', '.join(f'{k}:{len(v)}' for k, v in pool_lists.items())}"
+        )
 
     def __len__(self):
-        return len(self.z)
+        return len(self.z_anchor)
 
     def __getitem__(self, idx):
-        z_anchor = self.z[idx]
+        z_anchor = self.z_anchor[idx]
 
         # Random target identity
         tid = self.valid_ids[torch.randint(len(self.valid_ids), (1,)).item()]
 
-        # Sample z_goal from that identity's pool
+        # Sample z_goal from that identity's encoder-view pool
         pool = self.pools[tid]
         goal_idx = pool[torch.randint(len(pool), (1,)).item()].item()
-        z_goal = self.z[goal_idx]
+        z_goal = self.z_goal_pool[goal_idx]
 
         # Target: low when anchor sees matching beacon, high otherwise
-        anchor_bid = self.identity[idx].item()
-        anchor_range = self.range[idx].item()
+        anchor_bid = int(self.identity[idx].item())
+        anchor_range = float(self.range[idx].item())
 
         if anchor_bid == tid and anchor_range < self.beacon_clip * 2:
             target = min(anchor_range / self.beacon_clip, 1.0)
@@ -2223,13 +2246,31 @@ class GoalPairedDataset(Dataset):
         return z_anchor, z_goal, torch.tensor(target, dtype=z_anchor.dtype)
 
 
-def train_goal_head(args, z_all, beacon_identity, beacon_range, device):
+def train_goal_head(
+    args,
+    z_anchor,
+    anchor_identity,
+    anchor_range,
+    z_goal_pool,
+    goal_identity,
+    goal_range,
+    device,
+):
     print("\n" + "=" * 60)
     print("Phase 3: Training GoalEnergyHead (beacon identity matching)")
+    print("  anchor: pred_projector (rollout view) | goal: enc_projector (encoder view)")
     print("=" * 60)
 
     try:
-        dataset = GoalPairedDataset(z_all, beacon_identity, beacon_range, args.beacon_clip)
+        dataset = GoalPairedDataset(
+            z_anchor,
+            anchor_identity,
+            anchor_range,
+            z_goal_pool,
+            goal_identity,
+            goal_range,
+            args.beacon_clip,
+        )
     except ValueError as e:
         print(f"  Skipping: {e}")
         return None
@@ -2887,6 +2928,8 @@ def train(args):
     rollout_episode_id = latent_views["rollout"]["episode_id"]
     rollout_obs_step = latent_views["rollout"]["obs_step"]
     rollout_robot_xy = latent_views["rollout"]["robot_xy"]
+    beacon_id_rollout = latent_views["rollout"]["beacon_identity"]
+    beacon_range_rollout = latent_views["rollout"]["beacon_range"]
     print(
         f"Using rollout-view latents for safety/exploration: {tuple(z_rollout.shape)} | "
         f"encoder-view latents for goal/progress: {tuple(z_enc.shape)}"
@@ -2903,6 +2946,8 @@ def train(args):
     enc_episode_id_train = enc_episode_id
     enc_obs_step_train = enc_obs_step
     enc_robot_xy_train = enc_robot_xy
+    beacon_id_enc_train = beacon_id_enc
+    beacon_range_enc_train = beacon_range_enc
     z_enc_eval = torch.empty((0, z_enc.shape[-1]), dtype=z_enc.dtype)
     enc_scene_id_eval = torch.empty((0,), dtype=enc_scene_id.dtype)
     enc_episode_id_eval = torch.empty((0,), dtype=enc_episode_id.dtype)
@@ -2912,6 +2957,8 @@ def train(args):
     rollout_episode_id_train = rollout_episode_id
     rollout_obs_step_train = rollout_obs_step
     rollout_robot_xy_train = rollout_robot_xy
+    beacon_id_rollout_train = beacon_id_rollout
+    beacon_range_rollout_train = beacon_range_rollout
     rollout_scene_id_eval = torch.empty((0,), dtype=rollout_scene_id.dtype)
     rollout_episode_id_eval = torch.empty((0,), dtype=rollout_episode_id.dtype)
     rollout_obs_step_eval = torch.empty((0,), dtype=rollout_obs_step.dtype)
@@ -2933,6 +2980,8 @@ def train(args):
             rollout_episode_id_train = rollout_episode_id[train_mask]
             rollout_obs_step_train = rollout_obs_step[train_mask]
             rollout_robot_xy_train = rollout_robot_xy[train_mask]
+            beacon_id_rollout_train = beacon_id_rollout[train_mask]
+            beacon_range_rollout_train = beacon_range_rollout[train_mask]
             z_rollout_eval = z_rollout[eval_mask]
             safety_target_eval = safety_target_rollout[eval_mask]
             rollout_collisions_eval = rollout_collisions[eval_mask]
@@ -2956,6 +3005,8 @@ def train(args):
                     enc_episode_id_train = enc_episode_id[enc_train_mask]
                     enc_obs_step_train = enc_obs_step[enc_train_mask]
                     enc_robot_xy_train = enc_robot_xy[enc_train_mask]
+                    beacon_id_enc_train = beacon_id_enc[enc_train_mask]
+                    beacon_range_enc_train = beacon_range_enc[enc_train_mask]
                 if torch.any(enc_eval_mask):
                     z_enc_eval = z_enc[enc_eval_mask]
                     enc_scene_id_eval = enc_scene_id[enc_eval_mask]
@@ -2969,23 +3020,36 @@ def train(args):
             )
 
     # Phase 2: safety head
-    safety_head = train_safety_head(args, z_rollout_train, safety_target_train, device)
-    if z_rollout_eval.numel() > 0:
-        metrics = evaluate_safety_head(
-            args,
-            safety_head,
-            z_rollout_eval,
-            safety_target_eval,
-            rollout_collisions_eval,
-            device,
-        )
-        if metrics is not None:
-            holdout_metrics["safety"] = metrics
+    safety_head = None
+    if not args.skip_safety:
+        safety_head = train_safety_head(args, z_rollout_train, safety_target_train, device)
+        if z_rollout_eval.numel() > 0:
+            metrics = evaluate_safety_head(
+                args,
+                safety_head,
+                z_rollout_eval,
+                safety_target_eval,
+                rollout_collisions_eval,
+                device,
+            )
+            if metrics is not None:
+                holdout_metrics["safety"] = metrics
 
-    # Phase 3: goal head
+    # Phase 3: goal head — anchor in pred_projector (rollout view) to match the
+    # planner's inference call, goal in enc_projector (encoder view) to match
+    # the breadcrumb encoder pathway.
     goal_head = None
     if not args.skip_goal:
-        goal_head = train_goal_head(args, z_enc, beacon_id_enc, beacon_range_enc, device)
+        goal_head = train_goal_head(
+            args,
+            z_rollout_train,
+            beacon_id_rollout_train,
+            beacon_range_rollout_train,
+            z_enc_train,
+            beacon_id_enc_train,
+            beacon_range_enc_train,
+            device,
+        )
 
     # Phase 4: progress head
     progress_head = None
@@ -3448,18 +3512,39 @@ def train(args):
         else:
             print("  No AR samples generated — skipping autoregressive finetuning.")
 
-    # Save combined TrajectoryScorer checkpoint
+    # Save combined TrajectoryScorer checkpoint. When a head is skipped this
+    # run, prefer the previously-trained state from any existing scorer bundle
+    # so partial re-runs (e.g. retraining only the goal head) don't silently
+    # drop the other heads.
     scorer_path = os.path.join(args.out_dir, "trajectory_scorer.pt")
+    prev_scorer = (
+        torch.load(scorer_path, map_location="cpu")
+        if os.path.exists(scorer_path)
+        else {}
+    )
+
+    def _merge_head(name: str, head_module, skipped: bool):
+        if not skipped and head_module is not None:
+            return head_module.state_dict()
+        prev = prev_scorer.get(name)
+        if prev is not None:
+            print(f"  Reusing {name} from existing trajectory_scorer.pt")
+        return prev
+
     scorer_data = {
-        "safety_head": safety_head.state_dict(),
-        "goal_head": goal_head.state_dict() if goal_head is not None else None,
-        "progress_head": progress_head.state_dict() if progress_head is not None else None,
-        "exploration": exploration.state_dict() if exploration is not None else None,
-        "place_head": place_head.state_dict() if place_head is not None else None,
-        "displacement_head": displacement_head.state_dict() if displacement_head is not None else None,
-        "coverage_gain_head": coverage_gain_head.state_dict() if coverage_gain_head is not None else None,
-        "escape_frontier_head": (
-            escape_frontier_head.state_dict() if escape_frontier_head is not None else None
+        "safety_head": _merge_head("safety_head", safety_head, args.skip_safety),
+        "goal_head": _merge_head("goal_head", goal_head, args.skip_goal),
+        "progress_head": _merge_head("progress_head", progress_head, args.skip_progress),
+        "exploration": _merge_head("exploration", exploration, args.skip_exploration),
+        "place_head": _merge_head("place_head", place_head, args.skip_place),
+        "displacement_head": _merge_head(
+            "displacement_head", displacement_head, args.skip_displacement
+        ),
+        "coverage_gain_head": _merge_head(
+            "coverage_gain_head", coverage_gain_head, args.skip_coverage_gain
+        ),
+        "escape_frontier_head": _merge_head(
+            "escape_frontier_head", escape_frontier_head, args.skip_escape_frontier
         ),
         "goal_weight": args.goal_weight,
         "progress_weight": args.progress_weight,
@@ -3519,11 +3604,11 @@ def train(args):
             if args.raw_data_dir is not None
             else None
         ),
-        "goal_latent_source": "enc_projector",
+        "goal_latent_source": "pred_projector_rollout_to_enc_projector_goal_cross_space",
         "progress_latent_source": "enc_projector",
         "cache_version": CACHE_VERSION,
         "eval_split_group": args.eval_split_group,
-        "holdout_metrics": holdout_metrics,
+        "holdout_metrics": {**(prev_scorer.get("holdout_metrics") or {}), **holdout_metrics},
         "seq_len": args.seq_len,
         "temporal_stride": args.temporal_stride,
         "action_block_size": action_block_size,

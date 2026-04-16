@@ -1881,3 +1881,230 @@ range regressed the actual recommended training regime:
   training
 - it does **not** alter the world-model objective or planner diagnosis
 - it does **not** require any runbook change beyond using the fixed loader code
+
+---
+
+## Addendum: Potential Explanations for the Observed WM Plateau (2026-04-16)
+
+By epoch 24 of the 30-epoch run the world model's held-out prediction quality
+settled at roughly s1 ≈ 0.20, s2 ≈ 0.29, s3 ≈ 0.41 in pred_projector space
+(per-dim MSE), corresponding to per-dim correlations of ~0.91 / ~0.87 / ~0.82
+across 1 / 2 / 3 action blocks of 5 raw frames each. Epochs 25–29 moved the
+absolute MSE numbers around by 2–6% but those movements tracked z_std drift
+almost exactly — scale-normalised correlation has been stationary since
+epoch 24.
+
+Training loss continued to decrease through epoch 29 (0.4088 → 0.4037), so
+the optimiser was still making progress on the training distribution; the
+plateau is **on the held-out distribution**, not in parameter space. The
+model's capacity for the held-out scenes has saturated while capacity for
+the training scenes has not.
+
+The items below are *potential avenues of explanation* for where the ceiling
+came from — hypotheses that are consistent with the observations and that
+would each predict a different fix if confirmed. None are individually
+proved by the data we have; they are candidates for targeted ablation, not
+recommended actions.
+
+1. **Training-distribution saturation on 146 scenes.** 18 M parameters and a
+   ViT-Tiny encoder have more capacity than 146 maze scenes can usefully
+   diversify. The observed shape — train loss still falling after held-out
+   metrics stopped moving — is the canonical signature of capacity-exceeds-
+   dataset-diversity, not model-too-small. If this is the dominant cause,
+   the same architecture trained on a ~5–10× larger scene bank would push
+   held-out s3 correlation above 0.82 without any other change.
+
+2. **Distribution shift between teacher-forced training and autoregressive
+   inference.** The training objective feeds the predictor clean encoder
+   outputs as context tokens; at inference (and in the multi-step eval) the
+   predictor consumes its own previous outputs from step 2 onwards. The
+   predictor has therefore never been optimised on inputs drawn from its
+   own output distribution, and the s2/s3 degradation is partly this
+   covariate shift rather than fundamental prediction error. A direct check
+   would be adding a 2–3 step AR loss term during training and seeing
+   whether s2/s3 tighten without s1 moving.
+
+3. **Egocentric visual aliasing as an irreducible noise floor.** Symmetric
+   corridors and repeated textures produce near-identical encoder outputs
+   from genuinely different world positions. The predictor cannot learn
+   dynamics that disambiguate these regardless of capacity, because the
+   input signal does not carry the information needed to break the tie.
+   Some fraction of the residual ~18% variance at s1 is likely this noise
+   floor rather than optimisation leftover. Architectural fixes (recurrent
+   state estimator, longer history window, explicit pose conditioning)
+   would be needed to push past it.
+
+4. **Temporal context limited to `seq_len = 4`.** The predictor attends to
+   at most 3 transitions of history per forward pass. Dynamics that depend
+   on longer context (hysteresis in the locomotion controller, long-range
+   wall-following features, temporary occlusion that resolves several
+   blocks later) cannot be captured. The plateau could partly be the
+   predictor's inability to reason over context it never sees, rather than
+   inability to reason over context it does see. A longer seq_len or a
+   recurrent belief-state encoder would test this.
+
+5. **Action-block representation aliases within-block control variation.**
+   `active_block` bundles 5 raw commands per token with latency 2, producing
+   `cmd_dim=15`. If the quadruped's locomotion controller produces
+   within-block dynamics that depend on sub-block command timing (e.g.,
+   the response to the 1st vs 5th command within a block differs), the
+   predictor cannot resolve them because both produce the same action
+   token. Some of the residual prediction error may be aliased within-
+   block variance rather than genuine prediction mistake. A finer-grained
+   action representation would test this.
+
+6. **BatchNorm train/eval distribution gap inflating the held-out
+   absolute metrics.** The training-time pred loss uses batch statistics;
+   the held-out pred loss uses frozen running stats, and the two
+   projectors have drifted apart independently (the phenomenon the
+   2026-04-15 planner fix already addresses at the cost site). The
+   held-out / train gap in pred loss (0.19 vs ~0.15) is partly the
+   predictor being genuinely worse on unseen scenes and partly a
+   normalisation-frame artifact that SIGReg can only partially correct.
+   The train/eval SIGReg gap (~2 vs ~20) is consistent with this:
+   held-out batches look substantially less isotropic under frozen BN
+   stats than they would under their own batch stats. The per-dim
+   correlation metric strips most of this out, which is why the
+   correlation figures are more stable across epochs than the raw MSE.
+
+7. **Cosine annealing finalised in a flat-but-not-deep basin.** The LR
+   schedule was set by epoch count, not by observed plateau. The run
+   entered the generalisation plateau at epoch 24 but LR kept annealing
+   to zero over the remaining 6 epochs, locking the optimiser into
+   wherever it happened to be. A different schedule — e.g. one LR drop
+   when held-out plateaus, followed by further training — might land
+   in a slightly better basin, or might just waste compute; without
+   running the experiment it is indistinguishable from the current
+   trajectory.
+
+8. **Eval-split contamination during epochs 1–12.** The training run
+   treated the "held-out" eval set as part of training for the first 12
+   epochs before the split was corrected. The high-LR phase of training
+   therefore saw — and partially memorised — data that was later used
+   for evaluation. It is possible the early memorisation phase steered
+   the optimiser into a basin that is suboptimal for the truly held-out
+   scenes. A clean-slate re-training on the corrected split from epoch 0
+   would be needed to rule this in or out; the current checkpoint
+   cannot distinguish it from hypothesis (1).
+
+9. **Projector bottleneck at `latent_dim = 192`.** SIGReg enforces
+   isotropy in a 192-dim BN-projected space. If the goal-relevant
+   features require more dimensions than the projector preserves under
+   isotropy pressure, the predictor hits a representation ceiling even
+   when the encoder itself has spare capacity. Ablation: train with
+   `latent_dim = 384` at reduced `sigreg_lambda` and compare both
+   correlation and head-training performance.
+
+10. **SIGReg pressure tuned for stability rather than tightness.**
+    `sigreg_lambda = 0.045` is below the paper's default (0.1). It was
+    chosen for training stability on this dataset. The residual
+    ~18% unexplained variance at s1 may partly be the regulariser
+    permitting prediction error in directions that are not heavily
+    penalised by the isotropy term, because the penalty is weak. A
+    lambda sweep against a constant evaluation suite would show
+    whether tightening lambda trades held-out prediction accuracy
+    against training stability in a useful direction, or whether
+    the current value is already near-optimal for this data.
+
+### What these hypotheses do not claim
+
+- None of the above claims the model is "broken" — the observed
+  correlations are in the usable range for CEM planning, and the
+  stability-and-isotropy properties the paper promises are holding.
+- None of these is individually required to be the dominant cause. In
+  practice the plateau is almost certainly a combination of (1), (2),
+  and (3), with the others contributing at the margins. Which
+  combination matters most is an open empirical question.
+- None of these should be read as a change to the runbook. The run is
+  finishing as-scheduled; these are notes on what to investigate
+  *after* evaluating planning performance on the final checkpoint,
+  if that performance motivates a follow-up training round.
+
+### Consistency with earlier report positions
+
+These hypotheses do not contradict the earlier "What Would Need To
+Change" list — they narrow the space of candidate causes by tying each
+hypothesis to a specific observation from the training trajectory
+(training-loss continuing to fall while held-out plateaus; z_std drift
+masquerading as MSE improvement; train/eval SIGReg gap; eval-split
+contamination history). The earlier list was "things that would move
+the ceiling if the ceiling is bounded by them." This list is "here are
+the specific reasons each of those things might be what's bounding the
+ceiling, based on what we actually observed."
+
+---
+
+## Addendum: Goal-Head Cross-Space Framing Fix (2026-04-16)
+
+A review of the eight planner heads against the dual-projector contract
+documented in the 2026-04-15 addendum surfaced one inconsistency.
+`GoalEnergyHead` was being trained as a single-space (encoder) head but
+called cross-space at inference: the planner passes
+`z_rollouts_proj` (predictor outputs in `pred_projector` space) as the
+anchor while the breadcrumb image, by deliberate design, stays in
+`enc_projector` space (so it shares the encoder pathway used to produce
+the goal embedding). Training had both `z_anchor` and `z_goal` drawn
+from the encoder view, so the head was learning an
+`(enc, enc) → energy` mapping but evaluated as `(pred, enc) → energy`.
+
+This is the same class of BN-frame mismatch the 2026-04-15 addendum
+fixed at the planner cost site, just one layer up: there it was the
+direct-arithmetic terms; here it is the learned head. The mismatch is
+bounded — it only affects the opt-in `goal_cost_mode="head"` planner
+path, since the default `terminal_cosine` / `terminal_l2` modes already
+re-project goals into `pred_projector` space and bypass the head — but
+it makes the head's calibration unreliable whenever it is used.
+
+### Fix
+
+Three changes in `scripts/4_train_energy_head.py`:
+
+1. **`GoalPairedDataset` accepts separate anchor and goal pools.** The
+   anchor side is sourced from the rollout-view (pred_projector) latents
+   already in the cache, with the rollout-view beacon labels. The goal
+   side is sourced from the encoder-view (enc_projector) latents, with
+   the encoder-view beacon labels. The (current-beacon-id, target-id)
+   target rule is unchanged.
+2. **`train_goal_head` takes both views explicitly.** The orchestrator
+   passes `z_rollout_train` / `beacon_id_rollout_train` /
+   `beacon_range_rollout_train` for the anchor and
+   `z_enc_train` / `beacon_id_enc_train` / `beacon_range_enc_train` for
+   the goal pool.
+3. **Manifest field updated.** `goal_latent_source` is now
+   `"pred_projector_rollout_to_enc_projector_goal_cross_space"`,
+   matching how displacement / coverage_gain / escape_frontier already
+   describe their cross-space framings. The line at the top of this
+   report listing goal alongside the other cross-space heads is now
+   accurate against the implementation; previously the list and the
+   implementation disagreed.
+
+The latent cache is unaffected — both views and both sets of beacon
+labels were already extracted (the cache has carried
+`beacon_identity_rollout` / `beacon_range_rollout` since v10). No
+re-extraction is required and `CACHE_VERSION` does not need to bump.
+
+### Resume tooling
+
+To support retraining a single head while reusing the existing
+`trajectory_scorer.pt` bundle:
+
+- Added `--skip_safety` (parity with `--skip_goal`, `--skip_progress`,
+  ...). Safety phase is now wrapped in `if not args.skip_safety`.
+- The scorer-save site now reads any pre-existing
+  `trajectory_scorer.pt` and falls back to the previously-stored
+  state-dict for any head that was skipped this run, instead of writing
+  `None`. Held-out metrics dictionaries are merged the same way.
+
+This means the goal head can be retrained against an already-trained
+bundle without touching the other heads or the latent cache. The
+operational note is the same as the 2026-04-15 fix: pre-existing head
+caches do not need to be invalidated, since this addendum changes how
+pairs are *constructed from* cached latents, not what is cached.
+
+### Consistency with earlier report positions
+
+This fix is internal to the head trainer; no inference-time code in
+`scripts/6_infer_pure_wm.py` changes. It does not alter the WM
+training contract, the planner cost-term contract, the runbook, or
+the dual-projector design rationale. It only brings the goal head's
+training framing into line with how it was already being called.
