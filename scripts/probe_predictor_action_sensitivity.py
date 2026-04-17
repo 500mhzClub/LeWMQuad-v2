@@ -87,17 +87,24 @@ def load_one_frame(h5_path: str, image_size: int, device: torch.device):
         if rgb_key is None:
             raise RuntimeError(f"No RGB dataset in {h5_path}; keys={sorted(f.keys())}")
         arr = f[rgb_key]
-        idx = min(500, arr.shape[0] - 1)
-        frame = np.asarray(arr[idx:idx+1])[0]   # (3, H, W) or (H, W, 3)
-        print(f"  Using frame {idx} from {rgb_key}, shape={frame.shape}")
+        total = int(arr.shape[0])
+        idx = min(500, total - 1)
+        frame = np.array(arr[idx], copy=True)   # force concrete single-frame slice
+        if frame.ndim == 4:  # some h5 quirk: slice returned (1, ...) — drop leading
+            frame = frame[0]
+        if frame.ndim == 5:  # defense against (1, 1, ...)
+            frame = frame.reshape(frame.shape[-3:])
+        print(f"  Using frame {idx}/{total} from {rgb_key}, shape={frame.shape}")
     if frame.ndim == 3 and frame.shape[0] != 3 and frame.shape[-1] == 3:
         frame = frame.transpose(2, 0, 1)
-    vis = torch.from_numpy(frame).unsqueeze(0).to(device).float().div_(255.0)
-    # center-crop / resize if needed (assume already image_size)
+    if frame.ndim != 3 or frame.shape[0] != 3:
+        raise RuntimeError(f"Expected (3, H, W) after squeeze, got {frame.shape}")
+    vis = torch.from_numpy(frame.copy()).unsqueeze(0).to(device).float().div_(255.0)
     if vis.shape[-1] != image_size or vis.shape[-2] != image_size:
         vis = torch.nn.functional.interpolate(
             vis, size=(image_size, image_size), mode="bilinear", align_corners=False
         )
+    print(f"  vis tensor shape: {tuple(vis.shape)}")
     return vis
 
 
