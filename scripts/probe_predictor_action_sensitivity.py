@@ -88,7 +88,7 @@ def load_one_frame(h5_path: str, image_size: int, device: torch.device):
             raise RuntimeError(f"No RGB dataset in {h5_path}; keys={sorted(f.keys())}")
         arr = f[rgb_key]
         idx = min(500, arr.shape[0] - 1)
-        frame = np.asarray(arr[idx])   # (3, H, W) or (H, W, 3)
+        frame = np.asarray(arr[idx:idx+1])[0]   # (3, H, W) or (H, W, 3)
         print(f"  Using frame {idx} from {rgb_key}, shape={frame.shape}")
     if frame.ndim == 3 and frame.shape[0] != 3 and frame.shape[-1] == 3:
         frame = frame.transpose(2, 0, 1)
@@ -135,9 +135,10 @@ def probe(model, vis, action_lib, device):
     vis_enc = vis if vis.ndim == 4 else vis.unsqueeze(0)
     # proprio placeholder (zeros)
     prop = None
-    if hasattr(model, "encoder") and hasattr(model.encoder, "prop_enc"):
+    prop_enc = getattr(getattr(model, "encoder", None), "prop_enc", None)
+    if prop_enc is not None:
         prop_dim = None
-        for p in model.encoder.prop_enc.parameters():
+        for p in prop_enc.parameters():
             if p.ndim >= 2:
                 prop_dim = p.shape[-1]
                 break
