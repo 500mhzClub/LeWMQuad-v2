@@ -74,11 +74,14 @@ def load_wm(ckpt_path: str, device: torch.device):
 def load_one_frame(h5_path: str, image_size: int, device: torch.device):
     with h5py.File(h5_path, "r") as f:
         # rgb is (N, 3, H, W) uint8 typically; probe a mid-episode frame
-        rgb_key = "rgb" if "rgb" in f else ("images" if "images" in f else None)
+        rgb_key = None
+        for candidate in ("vision", "rgb", "images", "image"):
+            if candidate in f:
+                rgb_key = candidate
+                break
         if rgb_key is None:
-            # Try to find any likely RGB dataset
             for k in f.keys():
-                if "rgb" in k.lower():
+                if any(s in k.lower() for s in ("rgb", "vision", "image")):
                     rgb_key = k
                     break
         if rgb_key is None:
