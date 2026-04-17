@@ -236,63 +236,60 @@ def probe_cem_elite_scale(model, vis, scorer_ckpt_path: str, horizon: int, devic
 
     N = 50
     torch.manual_seed(0)
-    vx_noise = torch.randn(N, horizon, block, device=device) * 0.015
-    yaw_noise = torch.randn(N, horizon, block, device=device) * 0.02
-    zeros = torch.zeros_like(vx_noise)
+    sigma_sweep = [
+        (0.015, 0.02,  "CEM elite (final)"),
+        (0.05,  0.10,  "CEM mid-iteration"),
+        (0.15,  0.40,  "CEM early iteration"),
+        (0.40,  1.20,  "CEM initial (init_std)"),
+    ]
 
-    noise = torch.stack([vx_noise, zeros, yaw_noise], dim=-1).reshape(N, horizon, cmd_dim)
-    plans = center_plan.unsqueeze(0) + noise
-    print(f"  Perturbations: vx sigma=0.015, yaw sigma=0.02 "
-          f"(matches CEM elite vx_spread ≈ 0.02)")
+    from lewm.models import LatentEnergyHead
+    scorer = None
+    head = None
+    if os.path.exists(scorer_ckpt_path):
+        scorer = torch.load(scorer_ckpt_path, map_location=device, weights_only=False)
+        state = scorer.get("safety_head")
+        if state is not None:
+            head = LatentEnergyHead(latent_dim=192, hidden_dim=512, dropout=0.0).to(device)
+            head.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in state.items()})
+            head.eval()
 
-    z_start_batch = z_raw.expand(N, -1).contiguous()
-    z_pred_proj = model.plan_rollout(z_start_batch, plans)  # (N, H, D)
-    z_terminal = z_pred_proj[:, -1, :]
+    print(f"\n  {'label':>24s} {'vx_sigma':>10s} {'yaw_sigma':>10s} "
+          f"{'z_ratio':>9s} {'s_std':>8s} {'s_mean':>8s} {'s_ratio':>9s}")
+    for vx_sig, yaw_sig, label in sigma_sweep:
+        vx_noise = torch.randn(N, horizon, block, device=device) * vx_sig
+        yaw_noise = torch.randn(N, horizon, block, device=device) * yaw_sig
+        zeros = torch.zeros_like(vx_noise)
+        noise = torch.stack([vx_noise, zeros, yaw_noise], dim=-1).reshape(N, horizon, cmd_dim)
+        plans = center_plan.unsqueeze(0) + noise
 
-    norms = z_terminal.norm(dim=-1)
-    diff = z_terminal.unsqueeze(0) - z_terminal.unsqueeze(1)
-    dist = diff.norm(dim=-1)
-    mask = ~torch.eye(N, dtype=torch.bool, device=dist.device)
-    pairwise = dist[mask]
-    print(f"  Predictor pairwise L2: "
-          f"mean={pairwise.mean().item():.4f} max={pairwise.max().item():.4f} "
-          f"ratio_mean={pairwise.mean().item()/norms.mean().item():.4f}")
+        z_start_batch = z_raw.expand(N, -1).contiguous()
+        z_pred_proj = model.plan_rollout(z_start_batch, plans)
+        z_terminal = z_pred_proj[:, -1, :]
+        norms = z_terminal.norm(dim=-1)
+        diff = z_terminal.unsqueeze(0) - z_terminal.unsqueeze(1)
+        dist = diff.norm(dim=-1)
+        mask = ~torch.eye(N, dtype=torch.bool, device=dist.device)
+        pairwise = dist[mask]
+        z_ratio = pairwise.mean().item() / max(norms.mean().item(), 1e-6)
 
-    # Now score via safety head — matches what the planner does
-    if not os.path.exists(scorer_ckpt_path):
-        print(f"\n  Skipping safety scoring: {scorer_ckpt_path} not found")
-        return
-    scorer = torch.load(scorer_ckpt_path, map_location=device, weights_only=False)
-    head = LatentEnergyHead(latent_dim=z_terminal.shape[-1], hidden_dim=512, dropout=0.0).to(device)
-    state = scorer.get("safety_head")
-    if state is None:
-        print(f"\n  Skipping safety scoring: no safety_head in {scorer_ckpt_path}")
-        return
-    head.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in state.items()})
-    head.eval()
+        if head is not None:
+            traj_cost = head(z_pred_proj).sum(dim=-1)
+            s_std = traj_cost.std().item()
+            s_mean = traj_cost.mean().item()
+            s_ratio = s_std / max(s_mean, 1e-6)
+        else:
+            s_std = s_mean = s_ratio = float("nan")
 
-    per_step = head(z_pred_proj)  # (N, H)
-    traj_cost = per_step.sum(dim=-1)  # (N,)
-    terminal_cost = head(z_terminal)  # (N,)
+        print(f"  {label:>24s} {vx_sig:>10.3f} {yaw_sig:>10.3f} "
+              f"{z_ratio:>9.4f} {s_std:>8.4f} {s_mean:>8.4f} {s_ratio:>9.5f}")
 
-    print(f"\n  Safety head terminal-score spread across {N} CEM-like candidates:")
-    print(f"    terminal mean={terminal_cost.mean().item():.4f} "
-          f"std={terminal_cost.std().item():.4f} "
-          f"min={terminal_cost.min().item():.4f} max={terminal_cost.max().item():.4f}")
-    print(f"    trajectory-sum mean={traj_cost.mean().item():.4f} "
-          f"std={traj_cost.std().item():.4f} "
-          f"min={traj_cost.min().item():.4f} max={traj_cost.max().item():.4f}")
-
-    std_ratio = traj_cost.std().item() / max(traj_cost.mean().item(), 1e-6)
-    print(f"    traj std / mean = {std_ratio:.5f}")
-    if std_ratio < 0.01:
-        print("\n  → Safety gradient is too small for CEM-scale action differences.")
-        print("    Predictor is fine, but the head is nearly flat on small deltas.")
-        print("    Fix: widen CEM min_std so elites stay diverse, OR retrain the head")
-        print("    with larger capacity / lower dropout / more epochs.")
-    else:
-        print("\n  → Head has usable gradient at CEM scale. Issue must be in "
-              "planner convergence or another cost term.")
+    print("\n  Interpretation:")
+    print("  - If s_ratio grows linearly with sigma → head is smooth but functional;")
+    print("    CEM collapses because elites self-select into flat band. Fix via")
+    print("    min_std floor or fewer iterations.")
+    print("  - If s_ratio stays tiny even at initial sigma → head is genuinely")
+    print("    flat over this latent manifold; needs retraining with more capacity.")
 
 
 def main():
