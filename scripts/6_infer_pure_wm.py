@@ -220,12 +220,20 @@ class PureCEMPlanner:
         action_penalty_weight: float = 0.001,
         primitive_bank: torch.Tensor | None = None,
         primitive_jitter_std: torch.Tensor | None = None,
+        command_representation: str = "mean_scaled",
+        command_block_size: int = 1,
+        macro_action_repeat: int = 1,
+        substep_dt: float = 0.04,
     ):
         self.world_model = world_model
         self.horizon = int(horizon)
         self.n_candidates = int(n_candidates)
         self.cem_iters = int(cem_iters)
         self.n_elite = max(1, int(round(self.n_candidates * elite_frac)))
+        self.command_representation = str(command_representation)
+        self.command_block_size = int(command_block_size)
+        self.macro_action_repeat = int(macro_action_repeat)
+        self.substep_dt = float(substep_dt)
         self.cmd_low = cmd_low.to(device=device, dtype=torch.float32)
         self.cmd_high = cmd_high.to(device=device, dtype=torch.float32)
         self.init_std = init_std.to(device=device, dtype=torch.float32)
@@ -269,6 +277,69 @@ class PureCEMPlanner:
         self._warm_start = None
         self._warm_start_indices = None
 
+    def _samples_to_substeps(self, samples: torch.Tensor) -> torch.Tensor:
+        """Unpack (N, H, cmd_dim) samples into (N, H*substeps, 3) body-frame [vx, vy, wz]."""
+        N, H, C = samples.shape
+        if self.command_representation == "active_block":
+            b = self.command_block_size
+            if C != b * 3:
+                raise ValueError(
+                    f"active_block cmd_dim={C} does not match block_size*3={b * 3}"
+                )
+            return samples.view(N, H, b, 3).reshape(N, H * b, 3)
+        if C != 3:
+            raise ValueError(f"mean_scaled expects cmd_dim=3, got {C}")
+        repeats = max(1, self.macro_action_repeat)
+        return samples.unsqueeze(2).expand(N, H, repeats, 3).reshape(N, H * repeats, 3)
+
+    def _kinematic_rollout_xy(
+        self,
+        substep_cmds: torch.Tensor,
+        pose_xy: torch.Tensor,
+        yaw: float,
+    ) -> torch.Tensor:
+        """Euler-integrate body-frame velocities into world XY poses.
+
+        substep_cmds: (N, T, 3). Returns (N, T, 2).
+        """
+        N, T, _ = substep_cmds.shape
+        dt = self.substep_dt
+        x = torch.full((N,), float(pose_xy[0]), device=substep_cmds.device, dtype=substep_cmds.dtype)
+        y = torch.full((N,), float(pose_xy[1]), device=substep_cmds.device, dtype=substep_cmds.dtype)
+        yaw_t = torch.full((N,), float(yaw), device=substep_cmds.device, dtype=substep_cmds.dtype)
+        out = torch.empty((N, T, 2), device=substep_cmds.device, dtype=substep_cmds.dtype)
+        for t in range(T):
+            vx = substep_cmds[:, t, 0]
+            vy = substep_cmds[:, t, 1]
+            wz = substep_cmds[:, t, 2]
+            cy = torch.cos(yaw_t)
+            sy = torch.sin(yaw_t)
+            x = x + (vx * cy - vy * sy) * dt
+            y = y + (vx * sy + vy * cy) * dt
+            yaw_t = yaw_t + wz * dt
+            out[:, t, 0] = x
+            out[:, t, 1] = y
+        return out
+
+    def _kinematic_penetration(
+        self,
+        xy: torch.Tensor,
+        obstacle_layout,
+        margin: float,
+    ) -> torch.Tensor:
+        """Max positive AABB penetration depth per point. Shape (M,) from (M, 2)."""
+        M = xy.shape[0]
+        max_pen = torch.zeros(M, device=xy.device, dtype=xy.dtype)
+        for obs in obstacle_layout.obstacles:
+            cx, cy = float(obs.pos[0]), float(obs.pos[1])
+            hx = 0.5 * float(obs.size[0]) + margin
+            hy = 0.5 * float(obs.size[1]) + margin
+            dx = hx - (xy[:, 0] - cx).abs()
+            dy = hy - (xy[:, 1] - cy).abs()
+            pen = torch.minimum(dx, dy).clamp_min(0.0)
+            max_pen = torch.maximum(max_pen, pen)
+        return max_pen
+
     @torch.no_grad()
     def plan(
         self,
@@ -295,6 +366,11 @@ class PureCEMPlanner:
         visited_revisit_penalty_weight: float = 0.0,
         return_diagnostics: bool = False,
         diagnostics_topk: int = 5,
+        current_pose_xy: tuple[float, float] | None = None,
+        current_yaw: float | None = None,
+        obstacle_layout=None,
+        kinematic_safety_weight: float = 0.0,
+        kinematic_safety_margin: float = 0.10,
     ) -> tuple[torch.Tensor, float, dict[str, float], dict[str, Any] | None]:
         z0 = z_start_raw.to(self.device, dtype=torch.float32)
         if z0.ndim != 2 or z0.shape[0] != 1:
@@ -675,6 +751,31 @@ class PureCEMPlanner:
                 costs += self.action_penalty_weight * act_penalty
                 metrics["action_penalty"] = act_penalty
 
+            if (
+                kinematic_safety_weight > 0.0
+                and obstacle_layout is not None
+                and current_pose_xy is not None
+                and current_yaw is not None
+            ):
+                substep_cmds = self._samples_to_substeps(samples)
+                pose_xy_t = torch.tensor(
+                    [float(current_pose_xy[0]), float(current_pose_xy[1])],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                xy_traj = self._kinematic_rollout_xy(
+                    substep_cmds, pose_xy_t, float(current_yaw),
+                )
+                N_cand, T = xy_traj.shape[0], xy_traj.shape[1]
+                flat_xy = xy_traj.reshape(N_cand * T, 2)
+                pen_flat = self._kinematic_penetration(
+                    flat_xy, obstacle_layout, float(kinematic_safety_margin),
+                )
+                pen = pen_flat.view(N_cand, T).max(dim=1).values
+                kin_cost = float(kinematic_safety_weight) * pen
+                costs += kin_cost
+                metrics["kinematic_safety_cost"] = kin_cost
+
             min_cost, min_idx = costs.min(dim=0)
             if min_cost.item() < best_cost:
                 best_cost = min_cost.item()
@@ -871,6 +972,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--recover_displacement_weight", type=float, default=2.5,
                    help="Legacy routing-era flag. Ignored by the active planner.")
     p.add_argument("--action_penalty_weight", type=float, default=0.001)
+    p.add_argument("--kinematic_safety_weight", type=float, default=5.0,
+                   help="Weight on simulator-geometry collision veto (hybrid planner). "
+                        "Set to 0 to disable and fall back to learned safety only.")
+    p.add_argument("--kinematic_safety_margin", type=float, default=0.10,
+                   help="Extra AABB inflation (metres) beyond the physics collision margin for the kinematic veto.")
+    p.add_argument("--kinematic_substep_dt", type=float, default=0.04,
+                   help="Seconds per PPO policy substep used when integrating candidate commands kinematically.")
     p.add_argument("--visited_bank_size", type=int, default=512,
                    help="Capacity of the executed rollout-latent bank used by visited_nn novelty.")
     p.add_argument("--audit_plan", action="store_true",
@@ -2850,6 +2958,10 @@ def main():
             action_penalty_weight=args.action_penalty_weight,
             primitive_bank=primitive_bank,
             primitive_jitter_std=primitive_jitter_std,
+            command_representation=str(wm_meta["command_representation"]),
+            command_block_size=int(wm_meta["command_block_size"]),
+            macro_action_repeat=int(args.macro_action_repeat),
+            substep_dt=float(args.kinematic_substep_dt),
         )
 
         prev_action = torch.zeros((1, 12), device=gs.device, dtype=torch.float32)
@@ -3072,6 +3184,11 @@ def main():
                     visited_revisit_penalty_weight=args.revisit_penalty_weight,
                     return_diagnostics=audit_this_plan,
                     diagnostics_topk=args.audit_topk,
+                    current_pose_xy=(float(obs["pos_np"][0]), float(obs["pos_np"][1])),
+                    current_yaw=float(obs["yaw_rad"]),
+                    obstacle_layout=obstacle_layout,
+                    kinematic_safety_weight=float(args.kinematic_safety_weight),
+                    kinematic_safety_margin=float(args.kinematic_safety_margin),
                 )
                 plan_step_idx = 0
                 costs_log.append(float(cost))
