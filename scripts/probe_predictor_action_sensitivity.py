@@ -207,6 +207,94 @@ def probe(model, vis, action_lib, device):
               "BN, CEM convergence).")
 
 
+@torch.no_grad()
+def probe_cem_elite_scale(model, vis, scorer_ckpt_path: str, horizon: int, device):
+    """Test whether CEM-sized perturbations produce any safety-head gradient."""
+    from lewm.models import LatentEnergyHead
+
+    print("\n" + "=" * 60)
+    print("CEM-scale probe: small action perturbations around a center plan")
+    print("=" * 60)
+
+    prop_enc = getattr(getattr(model, "encoder", None), "prop_enc", None)
+    prop = None
+    if prop_enc is not None:
+        for p in prop_enc.parameters():
+            if p.ndim >= 2:
+                prop = torch.zeros(1, p.shape[-1], device=device)
+                break
+
+    z_raw, _ = model.encode(vis, prop)
+    cmd_dim = int(model.predictor.action_embed.patch_embed.weight.shape[1])
+    block = cmd_dim // 3
+
+    def cmd_block(vx, vy, yaw):
+        return [vx, vy, yaw] * block
+
+    center_plan = torch.tensor([cmd_block(0.40, 0.0, 0.0)] * horizon,
+                               dtype=torch.float32, device=device)
+
+    N = 50
+    torch.manual_seed(0)
+    vx_noise = torch.randn(N, horizon, block, device=device) * 0.015
+    yaw_noise = torch.randn(N, horizon, block, device=device) * 0.02
+    zeros = torch.zeros_like(vx_noise)
+
+    noise = torch.stack([vx_noise, zeros, yaw_noise], dim=-1).reshape(N, horizon, cmd_dim)
+    plans = center_plan.unsqueeze(0) + noise
+    print(f"  Perturbations: vx sigma=0.015, yaw sigma=0.02 "
+          f"(matches CEM elite vx_spread ≈ 0.02)")
+
+    z_start_batch = z_raw.expand(N, -1).contiguous()
+    z_pred_proj = model.plan_rollout(z_start_batch, plans)  # (N, H, D)
+    z_terminal = z_pred_proj[:, -1, :]
+
+    norms = z_terminal.norm(dim=-1)
+    diff = z_terminal.unsqueeze(0) - z_terminal.unsqueeze(1)
+    dist = diff.norm(dim=-1)
+    mask = ~torch.eye(N, dtype=torch.bool, device=dist.device)
+    pairwise = dist[mask]
+    print(f"  Predictor pairwise L2: "
+          f"mean={pairwise.mean().item():.4f} max={pairwise.max().item():.4f} "
+          f"ratio_mean={pairwise.mean().item()/norms.mean().item():.4f}")
+
+    # Now score via safety head — matches what the planner does
+    if not os.path.exists(scorer_ckpt_path):
+        print(f"\n  Skipping safety scoring: {scorer_ckpt_path} not found")
+        return
+    scorer = torch.load(scorer_ckpt_path, map_location=device, weights_only=False)
+    head = LatentEnergyHead(latent_dim=z_terminal.shape[-1], hidden_dim=512, dropout=0.0).to(device)
+    state = scorer.get("safety_head")
+    if state is None:
+        print(f"\n  Skipping safety scoring: no safety_head in {scorer_ckpt_path}")
+        return
+    head.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in state.items()})
+    head.eval()
+
+    per_step = head(z_pred_proj)  # (N, H)
+    traj_cost = per_step.sum(dim=-1)  # (N,)
+    terminal_cost = head(z_terminal)  # (N,)
+
+    print(f"\n  Safety head terminal-score spread across {N} CEM-like candidates:")
+    print(f"    terminal mean={terminal_cost.mean().item():.4f} "
+          f"std={terminal_cost.std().item():.4f} "
+          f"min={terminal_cost.min().item():.4f} max={terminal_cost.max().item():.4f}")
+    print(f"    trajectory-sum mean={traj_cost.mean().item():.4f} "
+          f"std={traj_cost.std().item():.4f} "
+          f"min={traj_cost.min().item():.4f} max={traj_cost.max().item():.4f}")
+
+    std_ratio = traj_cost.std().item() / max(traj_cost.mean().item(), 1e-6)
+    print(f"    traj std / mean = {std_ratio:.5f}")
+    if std_ratio < 0.01:
+        print("\n  → Safety gradient is too small for CEM-scale action differences.")
+        print("    Predictor is fine, but the head is nearly flat on small deltas.")
+        print("    Fix: widen CEM min_std so elites stay diverse, OR retrain the head")
+        print("    with larger capacity / lower dropout / more epochs.")
+    else:
+        print("\n  → Head has usable gradient at CEM scale. Issue must be in "
+              "planner convergence or another cost term.")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--wm_ckpt", type=str, required=True)
@@ -214,6 +302,8 @@ def main():
                    help="Path to one HDF5 chunk (any chunk from the training set works)")
     p.add_argument("--horizon", type=int, default=5,
                    help="Plan horizon (macro steps) — match inference")
+    p.add_argument("--scorer_ckpt", type=str, default=None,
+                   help="Optional trajectory_scorer.pt to also probe safety head.")
     p.add_argument("--device", type=str, default="cuda")
     args = p.parse_args()
     device = torch.device(args.device)
@@ -229,6 +319,9 @@ def main():
           f"{action_lib.shape[1]} steps × {action_lib.shape[2]} dims")
 
     probe(model, vis, action_lib, device)
+
+    if args.scorer_ckpt:
+        probe_cem_elite_scale(model, vis, args.scorer_ckpt, args.horizon, device)
 
 
 if __name__ == "__main__":
